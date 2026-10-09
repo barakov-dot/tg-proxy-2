@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import re
 from collections import Counter
+from collections.abc import Mapping
 
 from tgpanel.domain.addresses import is_valid_loopback_ip
 from tgpanel.domain.models import DesiredState, UserStatus
@@ -34,13 +35,38 @@ def rendered_profile_count(state: DesiredState) -> int:
     return total if total else 1
 
 
-def compute_relay_limits(state: DesiredState, profile_count: int) -> dict[str, int]:
+# Upstream relay constants (internal/session/session.go, internal/config/config.go).
+RELAY_DEFAULT_STREAMS_PER_SESSION = 128
+RELAY_DEFAULT_PENDING_GLOBAL = 512 * 1024 * 1024
+RELAY_DEFAULT_PENDING_ITEMS_GLOBAL = 256 * 1024
+_CONTROL_RESERVE_EXTRA_ITEMS = 16
+_CONTROL_RESERVE_ITEMS_PER_STREAM = 3
+_QUEUE_ITEM_COST = 256
+_FRAME_HEADER_SIZE = 8
+_DATA_HEADROOM = 2  # keep at least as much room for data as the control reserve takes
+
+
+def control_reserve(streams_per_session: int) -> tuple[int, int]:
+    """(bytes, items) the relay reserves per session for control frames."""
+    items = _CONTROL_RESERVE_EXTRA_ITEMS + streams_per_session * _CONTROL_RESERVE_ITEMS_PER_STREAM
+    return items * (_QUEUE_ITEM_COST + _FRAME_HEADER_SIZE + 4), items
+
+
+def compute_relay_limits(
+    state: DesiredState,
+    profile_count: int,
+    existing: Mapping[str, object] | None = None,
+) -> dict[str, int]:
     """`limits` keys to write into config.json. Never contains per-profile limits.
 
     ``profile_count`` = number of profiles actually rendered (disabled users do not count).
+    ``existing`` = the current ``limits`` object of config.json: the relay refuses to start when
+    the per-session control reserve times ``max_sessions_global`` exhausts ``max_pending_global``
+    or ``max_pending_items_global``, so those two are raised (never lowered) when needed.
     """
+    existing = existing or {}
     sessions = state.relay_limits.max_sessions_global
-    return {
+    limits = {
         "max_profiles": compute_max_profiles(profile_count),
         "max_sessions_global": sessions,
         "new_sessions_burst": sessions,
@@ -48,6 +74,25 @@ def compute_relay_limits(state: DesiredState, profile_count: int) -> dict[str, i
         "new_bootstraps_burst": sessions,
         "max_streams_global": state.relay_limits.max_streams_global,
     }
+    streams = _int_or(existing.get("max_streams_per_session"), RELAY_DEFAULT_STREAMS_PER_SESSION)
+    reserve_bytes, reserve_items = control_reserve(streams)
+    cur_bytes = _int_or(existing.get("max_pending_global"), RELAY_DEFAULT_PENDING_GLOBAL)
+    cur_items = _int_or(
+        existing.get("max_pending_items_global"), RELAY_DEFAULT_PENDING_ITEMS_GLOBAL
+    )
+    need_bytes = _DATA_HEADROOM * reserve_bytes * sessions
+    need_items = _DATA_HEADROOM * reserve_items * sessions
+    if need_bytes > cur_bytes:
+        limits["max_pending_global"] = need_bytes
+    if need_items > cur_items:
+        limits["max_pending_items_global"] = need_items
+    return limits
+
+
+def _int_or(value: object, default: int) -> int:
+    return (
+        value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else default
+    )
 
 
 def _dups(values: list[str]) -> list[str]:

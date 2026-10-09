@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 
 from tgpanel.domain.invariants import compute_relay_limits
@@ -51,10 +52,22 @@ def render_all(state: DesiredState, existing_config: bytes, facts: MtproxyFacts)
 
     return RenderedFiles(
         profiles_json=profiles,
-        config_json=patch_config(existing_config, compute_relay_limits(state, profile_count)),
+        config_json=patch_config(
+            existing_config,
+            compute_relay_limits(state, profile_count, _existing_limits(existing_config)),
+        ),
         pool_envs=envs,
         pool_unit=render_pool_unit(facts),
         nft_file=render_nft(state),
         pools_to_run=tuple(envs),
         pools_to_stop=tuple(stop),
     )
+
+
+def _existing_limits(existing_config: bytes) -> dict[str, object]:
+    try:
+        data = json.loads(existing_config)
+    except ValueError:
+        return {}
+    limits = data.get("limits") if isinstance(data, dict) else None
+    return limits if isinstance(limits, dict) else {}

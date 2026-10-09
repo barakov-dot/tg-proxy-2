@@ -92,6 +92,8 @@ def test_relay_limits_keys_and_bursts() -> None:
         "max_bootstraps_global",
         "new_bootstraps_burst",
         "max_streams_global",
+        "max_pending_global",  # 2000 sessions exceed the upstream default pending budget
+        "max_pending_items_global",
     }
     assert limits["max_profiles"] == 32
     assert limits["max_sessions_global"] == 2000
@@ -140,3 +142,36 @@ def test_secrets_not_in_repr() -> None:
     state = make_state([u])
     assert u.secret not in repr(u)
     assert state.sentinel_secret not in repr(state)
+
+
+def _upstream_validate_budget(limits: dict[str, int], streams_per_session: int = 128) -> bool:
+    """Mirror of tproxy-server internal/session ValidateBudget (reserve vs global pending)."""
+    from tgpanel.domain.invariants import control_reserve
+
+    cost, items = control_reserve(streams_per_session)
+    sessions = limits["max_sessions_global"]
+    return (
+        cost <= limits.get("max_pending_global", 512 * 1024 * 1024) // sessions
+        and items <= limits.get("max_pending_items_global", 256 * 1024) // sessions
+    )
+
+
+def test_relay_budget_passes_upstream_validation_for_any_session_count() -> None:
+    for sessions in (128, 655, 1024, 4096):
+        state = make_state([make_user(1)], relay_limits=RelayLimits(sessions, 16384))
+        assert _upstream_validate_budget(compute_relay_limits(state, 1)), sessions
+
+
+def test_default_sessions_do_not_touch_pending_limits_but_1024_raises_items() -> None:
+    small = compute_relay_limits(make_state([make_user(1)], relay_limits=RelayLimits(128)), 1)
+    assert "max_pending_items_global" not in small
+    big = compute_relay_limits(make_state([make_user(1)], relay_limits=RelayLimits(1024)), 1)
+    assert big["max_pending_items_global"] >= 2 * 400 * 1024  # 16 + 3*128 items per session
+
+
+def test_existing_pending_limits_are_never_lowered_and_streams_per_session_is_respected() -> None:
+    state = make_state([make_user(1)], relay_limits=RelayLimits(1024))
+    existing = {"max_pending_items_global": 10_000_000, "max_streams_per_session": 256}
+    limits = compute_relay_limits(state, 1, existing)
+    assert "max_pending_items_global" not in limits  # already large enough
+    assert _upstream_validate_budget({**existing, **limits}, 256)
