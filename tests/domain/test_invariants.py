@@ -92,8 +92,7 @@ def test_relay_limits_keys_and_bursts() -> None:
         "max_bootstraps_global",
         "new_bootstraps_burst",
         "max_streams_global",
-        "max_pending_global",  # 2000 sessions exceed the upstream default pending budget
-        "max_pending_items_global",
+        "max_pending_items_global",  # 2000 sessions exceed the default item budget
     }
     assert limits["max_profiles"] == 32
     assert limits["max_sessions_global"] == 2000
