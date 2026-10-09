@@ -1,0 +1,15 @@
+{% extends 'base.html' %}
+{% block title %}{{ t.nav_backups }}{% endblock %}
+{% block content %}
+<h1>{{ t.nav_backups }}</h1>
+<form method="post" action="{{ url('/backups/create') }}"><input type="hidden" name="csrf_token" value="{{ csrf }}"><button type="submit" class="primary">{{ t.backup_create }}</button></form>
+<table><thead><tr><th>#</th><th>{{ t.col_time }}</th><th>{{ t.col_reason }}</th><th>{{ t.backup_size }}</th><th></th></tr></thead><tbody>
+{% for b in items %}
+<tr><td>{{ b.id }}</td><td>{{ fmt(b.created_at) }}</td><td>{{ b.reason }}</td><td>{{ human_bytes(b.size) }}</td>
+<td><a href="{{ url('/backups/' ~ b.id ~ '/download') }}">{{ t.download }}</a>
+<form method="post" action="{{ url('/backups/' ~ b.id ~ '/restore') }}" class="inline"><input type="hidden" name="csrf_token" value="{{ csrf }}">
+<input name="confirm" placeholder="{{ t.restore_word }}" autocomplete="off" class="short"> <button type="submit" class="danger">{{ t.restore }}</button></form></td></tr>
+{% else %}<tr><td colspan="5">{{ t.no_data }}</td></tr>{% endfor %}
+</tbody></table>
+<p class="hint">{{ t.restore_hint }}</p>
+{% endblock %}

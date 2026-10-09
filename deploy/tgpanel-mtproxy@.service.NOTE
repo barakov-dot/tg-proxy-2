@@ -1,0 +1,5 @@
+tgpanel-mtproxy@.service is NOT shipped here: it is rendered by the apply pipeline
+(tgpanel.render.pools.render_pool_unit) from the facts of the installed mtproxy.service
+(binary, user, --aes-pwd, proxy-multi.conf, NAT args) and written to /etc/systemd/system
+on every apply. Pool units carry After=/Wants=tgpanel-firewall.service so the port guard
+is loaded before a pool port opens. Do not copy a static unit over it.

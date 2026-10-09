@@ -1,0 +1,10 @@
+# Telegram data file refreshed by upstream's timer: restart our pools when it changes.
+[Unit]
+Description=Watch proxy-multi.conf and restart tgpanel MTProxy pools
+
+[Path]
+PathChanged=/etc/mtproxy/proxy-multi.conf
+Unit=tgpanel-mtproxy-refresh.service
+
+[Install]
+WantedBy=multi-user.target

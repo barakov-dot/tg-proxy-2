@@ -1,0 +1,9 @@
+{% extends 'base.html' %}
+{% block title %}{{ t.error_title }}{% endblock %}
+{% block content %}
+<section class="card narrow">
+<h1>{{ code }}</h1>
+<div class="alert err" role="alert">{{ message }}</div>
+<p><a href="{{ url('/') }}">{{ t.to_home }}</a></p>
+</section>
+{% endblock %}

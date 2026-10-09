@@ -1,0 +1,171 @@
+"""Creating users: single, batch by count, batch by list. Links appear only after apply."""
+
+from __future__ import annotations
+
+from datetime import UTC, datetime
+from typing import Any
+from zoneinfo import ZoneInfo
+
+from fastapi import APIRouter, Depends, Request, Response
+
+from tgpanel.apply.errors import OperationRejected
+from tgpanel.domain.expiry import Term, default_expiry
+from tgpanel.domain.models import CarrierMode
+from tgpanel.services.api import NewUser
+from tgpanel.services.errors import UserServiceError
+from tgpanel.web.routes.common import (
+    HttpError,
+    auth_of,
+    clean,
+    fraw,
+    fstr,
+    get_web,
+    load_form,
+    panel_tz,
+    render,
+    require_auth,
+)
+from tgpanel.web.texts import T
+
+router = APIRouter(dependencies=[Depends(require_auth)])
+
+MAX_BATCH = 200
+TERMS = ("default", *(t.value for t in Term))
+
+
+class FormError(Exception):
+    pass
+
+
+def parse_list(text: str) -> list[NewUser]:
+    """Lines ``name; telegram id; comment`` (comment may contain ';')."""
+    users: list[NewUser] = []
+    for lineno, line in enumerate(text.splitlines(), start=1):
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        parts = [p.strip() for p in line.split(";", 2)]
+        name = parts[0]
+        raw_id = parts[1] if len(parts) > 1 else ""
+        comment = parts[2] if len(parts) > 2 else ""
+        if not name:
+            raise FormError(T["create_line_noname"].format(n=lineno))
+        tg_id: int | None = None
+        if raw_id:
+            if not raw_id.isdigit() or len(raw_id) > 16:
+                raise FormError(T["create_line_badid"].format(n=lineno))
+            tg_id = int(raw_id)
+        users.append(NewUser(name=name, tg_id=tg_id, comment=comment))
+    return users
+
+
+def parse_term(form_term: str, date_raw: str, tz: ZoneInfo, now: datetime) -> datetime | None:
+    """``None`` = default term from the settings."""
+    if form_term not in TERMS:
+        raise FormError(T["bad_request"])
+    if form_term == "default":
+        return None
+    term = Term(form_term)
+    explicit: datetime | None = None
+    if term is Term.DATE:
+        try:
+            day = datetime.strptime(date_raw, "%Y-%m-%d")
+        except ValueError:
+            raise FormError(T["bad_date"]) from None
+        explicit = day.replace(hour=23, minute=59, second=59, tzinfo=tz).astimezone(UTC)
+    try:
+        return default_expiry(term, now, explicit)
+    except ValueError:
+        raise FormError(T["bad_date"]) from None
+
+
+def build_users(
+    form_mode: str, form: Any, expires: datetime | None, mode: CarrierMode | None
+) -> list[NewUser]:
+    if form_mode == "single":
+        name = fstr(form, "name")
+        if not name:
+            raise FormError(T["create_noname"])
+        raw_id = fstr(form, "tg_id")
+        if raw_id and (not raw_id.isdigit() or len(raw_id) > 16):
+            raise FormError(T["bad_number"])
+        users = [
+            NewUser(
+                name=name,
+                tg_id=int(raw_id) if raw_id else None,
+                comment=fraw(form, "comment").strip(),
+            )
+        ]
+    elif form_mode == "count":
+        prefix = fstr(form, "prefix")
+        raw_n = fstr(form, "count")
+        if not prefix:
+            raise FormError(T["create_noprefix"])
+        if not raw_n.isdigit() or not 1 <= int(raw_n) <= MAX_BATCH:
+            raise FormError(T["create_badcount"].format(limit=MAX_BATCH))
+        n = int(raw_n)
+        width = len(str(n))
+        comment = fraw(form, "comment").strip()
+        users = [NewUser(name=f"{prefix}-{i:0{width}d}", comment=comment) for i in range(1, n + 1)]
+    elif form_mode == "list":
+        users = parse_list(fraw(form, "list"))
+        if not users:
+            raise FormError(T["create_emptylist"])
+        if len(users) > MAX_BATCH:
+            raise FormError(T["create_badcount"].format(limit=MAX_BATCH))
+    else:
+        raise FormError(T["bad_request"])
+    return [
+        NewUser(u.name, u.tg_id, u.comment, expires_at=expires, carrier_mode=mode) for u in users
+    ]
+
+
+@router.get("/users/new")
+async def create_form(request: Request) -> Response:
+    return await render(request, "user_new.html", page="create", values={}, error=None, terms=TERMS)
+
+
+@router.post("/users/new")
+async def create_submit(request: Request) -> Response:
+    web = get_web(request)
+    auth = auth_of(request)
+    form = await load_form(request)
+    tz = await panel_tz(web)
+    values = {k: v for k, v in form.items() if isinstance(v, str) and k != "csrf_token"}
+
+    async def fail(message: str, status: int) -> Response:
+        return await render(
+            request,
+            "user_new.html",
+            status,
+            page="create",
+            values=values,
+            error=message,
+            terms=TERMS,
+        )
+
+    try:
+        expires = parse_term(fstr(form, "term"), fstr(form, "term_date"), tz, web.now())
+        carrier_raw = fstr(form, "carrier")
+        try:
+            mode = CarrierMode(carrier_raw) if carrier_raw else None
+        except ValueError:
+            raise FormError(T["bad_request"]) from None
+        new_users = build_users(fstr(form, "mode"), form, expires, mode)
+    except FormError as exc:
+        return await fail(str(exc), 422)
+    except HttpError as exc:
+        return await fail(exc.message, 422)
+
+    try:
+        result = await web.app.users.create(new_users, auth.actor)
+    except (UserServiceError, OperationRejected) as exc:
+        return await fail(clean(str(exc)), 409)
+    if not result.ok:
+        # nothing was created and no link exists: show the error, keep the form
+        return await fail(clean(result.error) or T["operation_failed"], 409)
+    created: list[Any] = []
+    for uid in result.user_ids:
+        user = await web.app.users.get(uid)
+        if user is not None:
+            created.append(user)
+    return await render(request, "user_created.html", page="create", created=created)

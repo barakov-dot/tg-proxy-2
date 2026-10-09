@@ -1,0 +1,21 @@
+{% extends 'base.html' %}
+{% block title %}{{ t.nav_requests }}{% endblock %}
+{% block content %}
+<h1>{{ t.nav_requests }}</h1>
+<h2>{{ t.requests_pending }}</h2>
+<table><thead><tr><th>#</th><th>Telegram ID</th><th>{{ t.col_tg_username }}</th><th>{{ t.col_name }}</th><th>{{ t.col_created_at }}</th><th></th></tr></thead><tbody>
+{% for r in pending %}
+<tr><td>{{ r.id }}</td><td>{{ r.tg_id }}</td><td>{{ ('@' ~ r.tg_username) if r.tg_username else '—' }}</td><td>{{ r.full_name }}</td><td>{{ fmt(r.created_at) }}</td>
+<td>
+<form method="post" action="{{ url('/requests/' ~ r.id ~ '/approve') }}" class="inline"><input type="hidden" name="csrf_token" value="{{ csrf }}">
+<select name="term"><option value="default">{{ t.term_default }}</option>{% for x in terms %}<option value="{{ x }}">{{ t['term_' ~ x] }}</option>{% endfor %}</select>
+<button type="submit" class="primary">{{ t.approve }}</button></form>
+<form method="post" action="{{ url('/requests/' ~ r.id ~ '/reject') }}" class="inline"><input type="hidden" name="csrf_token" value="{{ csrf }}"><button type="submit" class="danger">{{ t.reject }}</button></form>
+</td></tr>
+{% else %}<tr><td colspan="6">{{ t.no_data }}</td></tr>{% endfor %}
+</tbody></table>
+<h2>{{ t.requests_history }}</h2>
+<table><thead><tr><th>#</th><th>Telegram ID</th><th>{{ t.col_name }}</th><th>{{ t.col_status }}</th><th>{{ t.decided_by }}</th><th>{{ t.col_time }}</th></tr></thead><tbody>
+{% for r in decided %}<tr><td>{{ r.id }}</td><td>{{ r.tg_id }}</td><td>{{ r.full_name }}</td><td>{{ r.status }}</td><td>{{ r.decided_by or '—' }}</td><td>{{ fmt(r.decided_at) }}</td></tr>{% else %}<tr><td colspan="6">{{ t.no_data }}</td></tr>{% endfor %}
+</tbody></table>
+{% endblock %}

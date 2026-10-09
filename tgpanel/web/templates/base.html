@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow">
+<meta name="csrf-token" content="{{ csrf }}">
+<meta name="htmx-config" content='{"includeIndicatorStyles":false,"allowEval":false,"selfRequestsOnly":true,"responseHandling":[{"code":"204","swap":false},{"code":"[23]..","swap":true},{"code":"[45]..","swap":true,"error":true}]}'>
+<title>{% block title %}{{ t.app_name }}{% endblock %}</title>
+<link rel="stylesheet" href="{{ url('/static/app.css') }}">
+<script src="{{ url('/static/vendor/htmx.min.js') }}" defer></script>
+<script src="{{ url('/static/app.js') }}" defer></script>
+{% block head %}{% endblock %}
+</head>
+<body>
+{% if login %}
+<header class="top">
+  <strong class="brand">{{ t.app_name }}</strong>
+  <nav>
+    {% for key, path in [('dashboard','/'),('users','/users'),('create','/users/new'),('import','/import'),('requests','/requests'),('broadcast','/broadcast'),('settings','/settings'),('backups','/backups'),('audit','/audit')] %}
+    <a href="{{ url(path) }}"{% if page == key %} class="active" aria-current="page"{% endif %}>{{ t['nav_' ~ key] }}</a>
+    {% endfor %}
+  </nav>
+  <form method="post" action="{{ url('/logout') }}" class="inline">
+    <input type="hidden" name="csrf_token" value="{{ csrf }}">
+    <button type="submit" class="link">{{ t.logout }} ({{ login }})</button>
+  </form>
+</header>
+<div id="apply-banner">{% include '_banner.html' %}</div>
+{% endif %}
+<main>
+{% if flash %}<div class="alert {{ 'err' if flash.kind == 'err' else 'ok' }}" role="status">{{ flash.text }}</div>{% endif %}
+{% block content %}{% endblock %}
+</main>
+</body>
+</html>

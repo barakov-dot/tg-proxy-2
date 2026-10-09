@@ -1,0 +1,4 @@
+#!/bin/sh
+# tgpanel command line (installed to /usr/local/bin/tgpanel).
+cd /opt/tgpanel || exit 1
+PYTHONPATH=/opt/tgpanel exec /opt/tgpanel/.venv/bin/python -m tgpanel.cli "$@"

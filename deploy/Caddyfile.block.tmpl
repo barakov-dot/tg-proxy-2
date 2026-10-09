@@ -1,0 +1,13 @@
+# >>> tgpanel
+{{PANEL_DOMAIN}} {
+	encode zstd gzip
+	header Strict-Transport-Security "max-age=31536000"
+	@panel path /{{PANEL_PATH}}/*
+	handle @panel {
+		reverse_proxy 127.0.0.1:8090
+	}
+	handle {
+		respond 404
+	}
+}
+# <<< tgpanel

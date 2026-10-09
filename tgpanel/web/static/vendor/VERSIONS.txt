@@ -1,0 +1,8 @@
+Vendored frontend assets (official release builds, fetched from cdn.jsdelivr.net/npm, no CDN at runtime).
+
+htmx.org   2.0.4   htmx.min.js     sha256 e209dda5c8235479f3166defc7750e1dbcd5a5c1808b7792fc2e6733768fb447
+echarts    5.5.1   echarts.min.js  sha256 84270bd0cd5bdf60fefc26d00c2a391cb2e81f4d26a7a9ee16185a54773a3cf
+
+Sources:
+  https://cdn.jsdelivr.net/npm/htmx.org@2.0.4/dist/htmx.min.js
+  https://cdn.jsdelivr.net/npm/echarts@5.5.1/dist/echarts.min.js

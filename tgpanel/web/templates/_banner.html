@@ -1,0 +1,5 @@
+{% if banner and banner.applying %}
+<div class="alert warn" role="status" hx-get="{{ url('/apply/status') }}" hx-trigger="every 2s" hx-target="#apply-banner" hx-swap="innerHTML">{{ t.applying }}{% if banner.reason %} ({{ banner.reason }}){% endif %}</div>
+{% elif banner and banner.failure %}
+<div class="alert err" role="alert">{{ t.last_apply_failed }} #{{ banner.failure.id }}: {{ banner.failure.error }} <a href="{{ url('/audit?tab=apply') }}">{{ t.details }}</a></div>
+{% endif %}

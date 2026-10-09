@@ -1,0 +1,7 @@
+{% extends 'base.html' %}
+{% block title %}{{ t.broadcast_report }}{% endblock %}
+{% block content %}
+<h1>{{ t.broadcast_report }} #{{ r.broadcast_id }}</h1>
+{% include '_broadcast_report.html' %}
+<p><a href="{{ url('/broadcast') }}">‹ {{ t.nav_broadcast }}</a></p>
+{% endblock %}

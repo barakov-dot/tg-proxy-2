@@ -1,1 +1,1 @@
-"""scheduler layer."""
+"""In-process job scheduler."""

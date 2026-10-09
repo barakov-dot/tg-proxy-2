@@ -1,0 +1,7 @@
+<div class="reveal">
+{% if error %}<div class="alert err">{{ error }}</div>
+{% else %}
+<textarea readonly rows="8" class="wide">{{ text }}</textarea>
+<button type="button" data-copy-text>{{ t.copy }}</button> <button type="button" data-hide>{{ t.hide }}</button>
+{% endif %}
+</div>

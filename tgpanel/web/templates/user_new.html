@@ -1,0 +1,29 @@
+{% extends 'base.html' %}
+{% block title %}{{ t.nav_create }}{% endblock %}
+{% block content %}
+<h1>{{ t.nav_create }}</h1>
+{% if error %}<div class="alert err" role="alert">{{ error }}</div>{% endif %}
+<form method="post" action="{{ url('/users/new') }}" class="card">
+  <input type="hidden" name="csrf_token" value="{{ csrf }}">
+  {% set mode = values.get('mode', 'single') %}
+  <fieldset><legend>{{ t.create_mode }}</legend>
+    <label class="chk"><input type="radio" name="mode" value="single"{% if mode == 'single' %} checked{% endif %}> {{ t.create_single }}</label>
+    <label class="chk"><input type="radio" name="mode" value="count"{% if mode == 'count' %} checked{% endif %}> {{ t.create_count }}</label>
+    <label class="chk"><input type="radio" name="mode" value="list"{% if mode == 'list' %} checked{% endif %}> {{ t.create_list }}</label>
+  </fieldset>
+  <label>{{ t.col_name }} <input name="name" value="{{ values.get('name', '') }}" maxlength="100"></label>
+  <label>{{ t.col_tg_id }} <input name="tg_id" inputmode="numeric" value="{{ values.get('tg_id', '') }}"></label>
+  <label>{{ t.create_prefix }} <input name="prefix" value="{{ values.get('prefix', '') }}" maxlength="80"></label>
+  <label>{{ t.create_number }} <input name="count" type="number" min="1" max="200" value="{{ values.get('count', '') }}"></label>
+  <label>{{ t.col_comment }} <textarea name="comment" rows="2" maxlength="2000">{{ values.get('comment', '') }}</textarea></label>
+  <label>{{ t.create_list_label }} <textarea name="list" rows="6" class="wide">{{ values.get('list', '') }}</textarea></label>
+  <label>{{ t.term }}
+    <select name="term">{% for x in terms %}<option value="{{ x }}"{% if values.get('term', 'default') == x %} selected{% endif %}>{{ t['term_' ~ x] }}</option>{% endfor %}</select></label>
+  <label>{{ t.term_date_label }} <input type="date" name="term_date" value="{{ values.get('term_date', '') }}"></label>
+  <label>{{ t.carrier }}
+    <select name="carrier"><option value="">{{ t.carrier_default }}</option>
+      {% for m in ['https','https-lanes','websocket','websocket-lanes'] %}<option value="{{ m }}"{% if values.get('carrier') == m %} selected{% endif %}>{{ m }}</option>{% endfor %}</select></label>
+  <button type="submit" class="primary">{{ t.create_submit }}</button>
+  <p class="hint">{{ t.create_wait_hint }}</p>
+</form>
+{% endblock %}

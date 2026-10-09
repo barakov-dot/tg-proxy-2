@@ -1,0 +1,46 @@
+{% extends 'base.html' %}
+{% block title %}{{ t.nav_settings }}{% endblock %}
+{% block content %}
+<h1>{{ t.nav_settings }}</h1>
+<form method="post" action="{{ url('/settings') }}" class="card">
+  <input type="hidden" name="csrf_token" value="{{ csrf }}">
+  {% for f in fields %}
+  <label>{{ f.title }}{% if f.proxy %} <small>({{ t.settings_proxy_note }})</small>{% endif %}
+    {% if f.choices %}<select name="{{ f.key }}">{% for val, lab in f.choices %}<option value="{{ val }}"{% if f.value == val %} selected{% endif %}>{{ lab }}</option>{% endfor %}</select>
+    {% else %}<input name="{{ f.key }}" type="{{ f.type }}" value="{{ f.value }}">{% endif %}
+    {% if f.error %}<small class="bad" role="alert">{{ f.error }}</small>{% endif %}</label>
+  {% endfor %}
+  <button type="submit" class="primary">{{ t.save }}</button>
+</form>
+
+<section class="card"><h2>{{ t.settings_admins }}</h2>
+  <ul>{% for a in admins %}<li>{{ a }}
+    <form method="post" action="{{ url('/settings/admins') }}" class="inline"><input type="hidden" name="csrf_token" value="{{ csrf }}"><input type="hidden" name="action" value="remove"><input type="hidden" name="tg_id" value="{{ a }}"><button type="submit" class="danger">{{ t.remove }}</button></form></li>
+  {% else %}<li>{{ t.no_data }}</li>{% endfor %}</ul>
+  <form method="post" action="{{ url('/settings/admins') }}"><input type="hidden" name="csrf_token" value="{{ csrf }}"><input type="hidden" name="action" value="add">
+  <input name="tg_id" inputmode="numeric" placeholder="Telegram ID" required> <button type="submit">{{ t.add }}</button></form>
+</section>
+
+<section class="card"><h2>{{ t.settings_bot_token }}</h2>
+  <p>{{ t.token_set if token_set else t.token_unset }}</p>
+  <form method="post" action="{{ url('/settings/bot-token') }}" autocomplete="off"><input type="hidden" name="csrf_token" value="{{ csrf }}">
+  <input type="password" name="token" placeholder="{{ t.token_placeholder }}" autocomplete="new-password" required> <button type="submit">{{ t.save }}</button></form>
+  <p class="hint">{{ t.token_restart_hint }}</p>
+</section>
+
+<section class="card"><h2>{{ t.settings_templates }}</h2>
+  <form method="post" action="{{ url('/settings/templates') }}"><input type="hidden" name="csrf_token" value="{{ csrf }}">
+  {% for tp in templates %}<label>{{ tp.label }} <textarea name="{{ tp.key }}" rows="3" maxlength="3500" class="wide">{{ tp.value }}</textarea></label>{% endfor %}
+  <p class="hint">{{ t.broadcast_placeholders }}</p>
+  <button type="submit" class="primary">{{ t.save }}</button></form>
+</section>
+
+<section class="card"><h2>{{ t.settings_password }}</h2>
+  <form method="post" action="{{ url('/settings/password') }}" autocomplete="off"><input type="hidden" name="csrf_token" value="{{ csrf }}">
+  <label>{{ t.password_current }} <input type="password" name="current" autocomplete="current-password" required></label>
+  <label>{{ t.password_new }} <input type="password" name="new" autocomplete="new-password" required minlength="12"></label>
+  <label>{{ t.password_again }} <input type="password" name="again" autocomplete="new-password" required></label>
+  <button type="submit" class="primary">{{ t.password_change }}</button></form>
+  <form method="post" action="{{ url('/settings/logout-all') }}"><input type="hidden" name="csrf_token" value="{{ csrf }}"><button type="submit" class="danger">{{ t.logout_all }}</button></form>
+</section>
+{% endblock %}

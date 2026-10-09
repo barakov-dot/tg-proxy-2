@@ -1,0 +1,10 @@
+<div class="reveal">
+{% if error %}<div class="alert err">{{ error }}</div>
+{% else %}
+<p><strong>{{ t.link_https }}</strong><br><code>{{ https_link }}</code> <button type="button" data-copy="{{ https_link }}">{{ t.copy }}</button></p>
+<p><strong>{{ t.link_tg }}</strong><br><code>{{ tg_link }}</code> <button type="button" data-copy="{{ tg_link }}">{{ t.copy }}</button></p>
+<p><strong>{{ t.secret }}</strong><br><code>{{ secret }}</code></p>
+<div class="qr" aria-label="QR">{{ qr }}</div>
+<button type="button" data-hide>{{ t.hide }}</button>
+{% endif %}
+</div>

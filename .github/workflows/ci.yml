@@ -22,3 +22,28 @@ jobs:
         run: |
           files=$(git ls-files '*.sh')
           if [ -n "$files" ]; then shellcheck $files; fi
+  installer-containers:
+    # install.sh on a server WITHOUT the WEB proxy must exit 1 and change nothing (PLAN 10).
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        image: ["ubuntu:24.04", "debian:13"]
+    steps:
+      - uses: actions/checkout@v4
+      - name: installer refuses a server without the proxy
+        run: |
+          docker run --rm -v "$PWD:/src:ro" "${{ matrix.image }}" bash -ec '
+            apt-get update -qq && apt-get install -y -qq curl ca-certificates >/dev/null
+            snap() { find /etc /opt /usr/local /var/lib /var/backups -xdev -printf "%p %s %T@\n" 2>/dev/null | sort | sha256sum; }
+            before=$(snap)
+            set +e
+            bash /src/install.sh --panel-domain panel.example.com \
+              --bot-token 123456:abcdefghijklmnopqrstuvwxyzABCDEFGHI --admin-id 1 \
+              >/tmp/out.txt 2>&1
+            rc=$?
+            set -e
+            cat /tmp/out.txt
+            [ "$rc" = 1 ]
+            grep -q "WEB proxy не найден" /tmp/out.txt
+            [ "$before" = "$(snap)" ]
+          '

@@ -1,0 +1,43 @@
+# tgpanel: web panel + Telegram bot + scheduler + collector in one asyncio process.
+# Runs as root: it manages systemd units and nftables. Hardening below is limited to what is
+# compatible with that job (each choice is explained).
+[Unit]
+Description=tgpanel (web panel and Telegram bot for tproxy-server)
+After=network-online.target tproxy-server.service tgpanel-firewall.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/tgpanel
+EnvironmentFile=/etc/tgpanel/tgpanel.env
+ExecStart=/opt/tgpanel/.venv/bin/python -m tgpanel.main
+Restart=on-failure
+RestartSec=5
+
+# Never gain privileges through setuid binaries (we need none).
+NoNewPrivileges=true
+# /usr, /boot and /etc are read-only except for the paths listed in ReadWritePaths:
+# only files we are allowed to change (PLAN 12) are writable. "-" = skip if missing.
+ProtectSystem=strict
+ReadWritePaths=/etc/tgpanel /etc/tproxy-server /etc/mtproxy /etc/caddy /etc/systemd/system
+ReadWritePaths=/var/lib/tgpanel /var/backups/tgpanel /run
+# No need to see user home directories.
+ProtectHome=true
+# Private /tmp: temporary snapshots for backups are invisible to others.
+PrivateTmp=true
+# Kernel tunables/modules/control groups are not touched by the panel.
+# (Not set: ProtectKernelTunables would break nft/systemctl helpers in some setups.)
+ProtectKernelModules=true
+ProtectControlGroups=true
+ProtectClock=true
+LockPersonality=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+# Needed families: unix (systemd D-Bus, journald), inet (panel, Telegram, ACME probes), netlink (nft).
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+# Not set on purpose: PrivateDevices/CapabilityBoundingSet (nft + systemctl need root capabilities),
+# ProtectSystem=full alone (strict is stricter and enough with ReadWritePaths).
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

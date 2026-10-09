@@ -273,8 +273,9 @@ def render_pool_unit(facts: MtproxyFacts) -> bytes:
         "# Managed by tgpanel. Do not edit: regenerated on every apply.\n"
         "[Unit]\n"
         "Description=Telegram MTProxy pool %i (tgpanel)\n"
-        "After=network-online.target\n"
-        "Wants=network-online.target\n"
+        # the port guard (tgpanel-firewall) must be loaded before a pool port is opened
+        "After=network-online.target tgpanel-firewall.service\n"
+        "Wants=network-online.target tgpanel-firewall.service\n"
         "\n"
         "[Service]\n"
         "Type=simple\n"

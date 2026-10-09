@@ -1,0 +1,30 @@
+{% extends 'base.html' %}
+{% block title %}{{ t.nav_dashboard }}{% endblock %}
+{% block content %}
+<h1>{{ t.nav_dashboard }}</h1>
+{% if degraded %}<div class="alert warn">{{ t.dashboard_degraded }}</div>{% endif %}
+<div class="grid">
+  <div class="card"><h3>{{ t.dash_users }}</h3><p class="big">{{ v.users_total }}</p>
+    <p>{{ t.dash_active }}: {{ v.users_active }} · {{ t.dash_online }}: {{ v.online }}</p>
+    <p>{{ t.dash_disabled }}: {{ v.users_disabled }} · {{ t.dash_expired }}: {{ v.users_expired }}</p></div>
+  <div class="card"><h3>{{ t.dash_traffic_24h }}</h3>
+    <p>↑ {{ human_bytes(v.up_24h) }} · ↓ {{ human_bytes(v.down_24h) }}</p>
+    <h3>{{ t.dash_traffic_30d }}</h3>
+    <p>↑ {{ human_bytes(v.up_30d) }} · ↓ {{ human_bytes(v.down_30d) }}</p></div>
+  <div class="card"><h3>{{ t.dash_capacity }}</h3>
+    {% for p in v.pools %}
+    <p>{{ t.dash_pool }} {{ p.pool_id }} (:{{ p.port }}): {{ p.used }} / {{ p.capacity }} <meter min="0" max="{{ p.capacity }}" value="{{ p.used }}"></meter></p>
+    {% else %}<p>{{ t.no_data }}</p>{% endfor %}
+    <p>{{ t.dash_sessions }}: {{ v.sessions_live if v.sessions_live is not none else '—' }} / {{ v.max_sessions_global if v.max_sessions_global is not none else '—' }}</p>
+    <p>{{ t.dash_limit_hits }}: {{ v.limit_hits_total if v.limit_hits_total is not none else '—' }}</p></div>
+  <div class="card"><h3>{{ t.dash_health }}</h3>
+    <p>{{ t.dash_relay }}: {% if v.relay_ok is none %}—{% elif v.relay_ok %}<span class="good">{{ t.ok }}</span>{% else %}<span class="bad">{{ t.fail }}</span>{% endif %}</p>
+    {% for unit, active in v.services.items() %}
+    <p>{{ unit }}: {% if active %}<span class="good">{{ t.ok }}</span>{% else %}<span class="bad">{{ t.fail }}</span>{% endif %}</p>
+    {% endfor %}
+    {% if v.cert_days_left is not none %}<p>{{ t.dash_cert }}: {{ v.cert_days_left }} {{ t.days_short }}{% if v.cert_days_left < 14 %} <span class="bad">{{ t.dash_cert_warn }}</span>{% endif %}</p>{% endif %}</div>
+</div>
+<h2>{{ t.dash_recent_applies }}</h2>
+<table><thead><tr><th>#</th><th>{{ t.col_time }}</th><th>{{ t.col_reason }}</th><th>{{ t.col_status }}</th></tr></thead>
+<tbody>{% for r in runs %}<tr><td>{{ r.id }}</td><td>{{ fmt(r.started_at) }}</td><td>{{ r.reason }}</td><td>{{ r.status }}</td></tr>{% else %}<tr><td colspan="4">{{ t.no_data }}</td></tr>{% endfor %}</tbody></table>
+{% endblock %}

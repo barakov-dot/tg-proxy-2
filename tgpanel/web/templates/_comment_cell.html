@@ -1,0 +1,5 @@
+<span class="comment-cell">
+<input name="inline_comment" value="{{ u.comment }}" maxlength="2000" class="inline-comment{% if error %} invalid{% endif %}"
+  hx-post="{{ url('/users/' ~ u.id ~ '/comment') }}" hx-trigger="change" hx-target="closest .comment-cell" hx-swap="outerHTML" aria-label="{{ t.col_comment }}">
+{% if error %}<small class="bad">{{ error }}</small>{% elif saved %}<small class="good">{{ t.saved }}</small>{% endif %}
+</span>

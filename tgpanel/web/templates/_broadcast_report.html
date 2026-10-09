@@ -1,0 +1,5 @@
+<div id="broadcast-report"{% if r.status == 'running' %} hx-get="{{ url('/broadcast/' ~ r.broadcast_id ~ '/report') }}" hx-trigger="every 3s" hx-swap="outerHTML"{% endif %}>
+<p>{{ t.col_status }}: {{ r.status }} · {{ t.report_total }}: {{ r.total }} · {{ t.report_sent }}: {{ r.sent }} · {{ t.report_failed }}: {{ r.failed }} · {{ t.broadcast_skipped }}: {{ r.skipped }}</p>
+<table><thead><tr><th>ID</th><th>Telegram ID</th><th>{{ t.report_result }}</th><th>{{ t.col_details }}</th></tr></thead><tbody>
+{% for i in r.items %}<tr><td>{{ i.user_id if i.user_id is not none else '—' }}</td><td>{{ i.tg_id if i.tg_id is not none else '—' }}</td><td>{{ i.result }}</td><td>{{ i.note }}</td></tr>{% else %}<tr><td colspan="4">{{ t.no_data }}</td></tr>{% endfor %}
+</tbody></table></div>

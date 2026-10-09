@@ -1,0 +1,190 @@
+"""Web-layer dependencies: the context object and the adapter protocols to other services.
+
+The orchestrator wires the real services behind ``TrafficPort`` / ``RequestsPort`` /
+``BroadcastPort`` (thin adapters); the web layer never imports the bot, scheduler or collector.
+"""
+
+from __future__ import annotations
+
+import logging
+from collections.abc import Awaitable, Callable, Mapping, Sequence
+from dataclasses import dataclass, field
+from datetime import datetime
+from typing import Any, Protocol
+
+from argon2 import PasswordHasher
+
+from tgpanel.apply.pipeline import ApplyPipeline
+from tgpanel.domain.expiry import Term
+from tgpanel.domain.queries import Period
+from tgpanel.services.api import OperationResult
+from tgpanel.services.container import AppContext
+from tgpanel.web.security import LoginLimiter
+
+log = logging.getLogger("tgpanel.web")
+
+# --------------------------------------------------------------------------- traffic port
+
+
+@dataclass(frozen=True, slots=True)
+class Totals:
+    up: int
+    down: int
+
+
+@dataclass(frozen=True, slots=True)
+class SeriesResult:
+    """``points`` items are ``(ts, up, down)`` tuples or objects with ts/up/down attributes;
+    ``ts`` is an aware datetime or a unix timestamp in seconds."""
+
+    granularity: str  # "minute" | "hour" | "day"
+    points: Sequence[Any]
+    total_up: int
+    total_down: int
+
+
+@dataclass(frozen=True, slots=True)
+class PoolView:
+    pool_id: int
+    port: int
+    used: int
+    capacity: int
+
+
+@dataclass(frozen=True, slots=True)
+class DashboardView:
+    users_total: int = 0
+    users_active: int = 0
+    users_disabled: int = 0
+    users_expired: int = 0
+    online: int = 0
+    up_24h: int = 0
+    down_24h: int = 0
+    up_30d: int = 0
+    down_30d: int = 0
+    pools: tuple[PoolView, ...] = ()
+    sessions_live: float | None = None
+    max_sessions_global: int | None = None
+    limit_hits_total: float | None = None
+    relay_ok: bool | None = None
+    services: Mapping[str, bool] = field(default_factory=dict)  # unit -> active
+    cert_days_left: int | None = None
+
+
+class TrafficPort(Protocol):
+    async def user_series(
+        self, user_id: int, start: datetime | None, end: datetime, max_points: int
+    ) -> SeriesResult: ...
+    async def user_totals(self, user_id: int, period: Period) -> Totals: ...
+    async def dashboard(self) -> DashboardView: ...
+
+
+# ------------------------------------------------------------------------- requests port
+
+
+@dataclass(frozen=True, slots=True)
+class DecisionResult:
+    ok: bool
+    error: str | None = None  # Russian, secret-free
+
+
+class RequestsPort(Protocol):
+    async def approve(self, request_id: int, term: Term | None, actor: str) -> DecisionResult: ...
+    async def reject(self, request_id: int, actor: str) -> DecisionResult: ...
+
+
+# ------------------------------------------------------------------------ broadcast port
+
+
+@dataclass(frozen=True, slots=True)
+class BroadcastPreview:
+    recipients: int  # all selected
+    sendable: int  # bot started and can_message
+    skipped: int  # excluded (bot not started / blocked)
+    sample: str  # rendered text for the first recipient WITHOUT any link/secret
+    error: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class BroadcastItem:
+    user_id: int | None
+    tg_id: int | None
+    result: str  # pending | sent | failed | blocked | skipped
+    note: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class BroadcastReport:
+    broadcast_id: int
+    status: str  # running | done
+    total: int
+    sent: int
+    failed: int
+    skipped: int
+    items: Sequence[BroadcastItem] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class LinkSendResult:
+    user_id: int
+    ok: bool
+    note: str = ""  # Russian reason when not ok
+
+
+class BroadcastPort(Protocol):
+    async def preview(self, template: str, user_ids: Sequence[int]) -> BroadcastPreview: ...
+    async def start(self, template: str, user_ids: Sequence[int], actor: str) -> int: ...
+    async def report(self, broadcast_id: int) -> BroadcastReport | None: ...
+    async def send_links(self, user_ids: Sequence[int], actor: str) -> list[LinkSendResult]: ...
+
+
+# --------------------------------------------------------------------------------- context
+
+
+@dataclass
+class WebContext:
+    app: AppContext
+    traffic: TrafficPort
+    requests: RequestsPort
+    broadcast: BroadcastPort
+    secret_key: str  # TGPANEL_SECRET_KEY, >= 32 chars
+    cookie_secure: bool = True
+    trusted_proxies: frozenset[str] = frozenset({"127.0.0.1", "::1"})
+    password_hasher: PasswordHasher = field(default_factory=PasswordHasher)
+    limiter: LoginLimiter = field(default_factory=LoginLimiter)
+    clock: Callable[[], datetime] | None = None  # defaults to the pipeline clock
+
+    @property
+    def pipeline(self) -> ApplyPipeline:
+        return self.app.pipeline
+
+    def now(self) -> datetime:
+        return (self.clock or self.app.pipeline.now)()
+
+
+async def safe[T](call: Awaitable[T], what: str) -> T | None:
+    """Await an adapter call; a failure degrades the page instead of breaking it."""
+    try:
+        return await call
+    except Exception as exc:
+        log.warning("adapter call failed: %s (%s)", what, type(exc).__name__)
+        return None
+
+
+__all__ = [
+    "BroadcastItem",
+    "BroadcastPort",
+    "BroadcastPreview",
+    "BroadcastReport",
+    "DashboardView",
+    "DecisionResult",
+    "LinkSendResult",
+    "OperationResult",
+    "PoolView",
+    "RequestsPort",
+    "SeriesResult",
+    "Totals",
+    "TrafficPort",
+    "WebContext",
+    "safe",
+]

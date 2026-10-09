@@ -1,0 +1,6 @@
+[Unit]
+Description=Restart tgpanel MTProxy pools after proxy-multi.conf changed
+
+[Service]
+Type=oneshot
+ExecStart=/opt/tgpanel/scripts/restart-pools.sh

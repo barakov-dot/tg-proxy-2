@@ -1,0 +1,298 @@
+"""Access requests from the Telegram bot (PLAN 6.1).
+
+One pending request per Telegram ID (partial unique index), a rate limit, a blacklist
+(setting ``bot_blacklist``: ids separated by commas/spaces), and two issuance modes:
+``open`` (the profile is created at once) and ``approval`` (an admin decides).
+Approving creates the user through ``UserService.create`` - ONE apply - and the link is
+returned only after that apply succeeded. Approving twice is harmless.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import re
+import sqlite3
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
+from datetime import datetime, timedelta
+from enum import StrEnum
+
+from tgpanel.apply.pipeline import ApplyPipeline
+from tgpanel.apply.settings_spec import read_settings
+from tgpanel.db import repo
+from tgpanel.db.connection import Database, transaction
+from tgpanel.db.times import to_db
+from tgpanel.domain.expiry import Term, default_expiry
+from tgpanel.domain.models import UserRecord
+from tgpanel.services.api import NewUser, UserService
+
+KEY_BLACKLIST = "bot_blacklist"
+RATE_WINDOW = timedelta(hours=1)
+RATE_MAX_REQUESTS = 3
+MAX_NAME = 100
+
+
+class RequestKind(StrEnum):
+    CREATED = "created"  # approval mode: pending, admins must be told
+    ALREADY_PENDING = "already_pending"
+    BLACKLISTED = "blacklisted"
+    RATE_LIMITED = "rate_limited"
+    HAS_ACCESS = "has_access"
+    ISSUED = "issued"  # open mode (or approve): user exists, ``link`` is set
+    FAILED = "failed"  # apply failed: no link, request stays pending
+    ALREADY_DECIDED = "already_decided"
+    NOT_FOUND = "not_found"
+    REJECTED = "rejected"
+
+
+@dataclass(frozen=True, slots=True)
+class RequestOutcome:
+    kind: RequestKind
+    request: repo.AccessRequest | None = None
+    user: UserRecord | None = None
+    link: str | None = None
+    error: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class StartInfo:
+    user: UserRecord | None
+    first_start: bool  # the bot was just linked to an existing (e.g. imported) user
+
+
+def parse_ids(raw: str) -> set[int]:
+    return {int(t) for t in re.split(r"[\s,;]+", raw.strip()) if t.isdigit()}
+
+
+def display_name(full_name: str, username: str | None, tg_id: int) -> str:
+    name = " ".join(full_name.split())[:MAX_NAME].strip()
+    if not name and username:
+        name = "@" + username.lstrip("@")
+    return name or f"tg{tg_id}"
+
+
+def _bind_user(conn: sqlite3.Connection, user_id: int, username: str | None) -> None:
+    fields: dict[str, object] = {"bot_started": True, "can_message": True}
+    if username:
+        fields["tg_username"] = username.lstrip("@")
+    repo.update_user(conn, user_id, **fields)
+
+
+class RequestService:
+    def __init__(
+        self,
+        pipeline: ApplyPipeline,
+        db: Database,
+        users: UserService,
+        *,
+        rate_max: int = RATE_MAX_REQUESTS,
+        rate_window: timedelta = RATE_WINDOW,
+    ) -> None:
+        self._pipeline = pipeline
+        self._db = db
+        self._users = users
+        self._rate_max = rate_max
+        self._rate_window = rate_window
+        self._locks: dict[int, asyncio.Lock] = {}
+
+    # ------------------------------------------------------------------ reads
+
+    async def issuance_mode(self) -> str:
+        return (await self._db.run(read_settings)).issuance_mode
+
+    async def is_blacklisted(self, tg_id: int) -> bool:
+        raw = await self._db.run(repo.get_setting, KEY_BLACKLIST, "")
+        return tg_id in parse_ids(str(raw or ""))
+
+    async def get(self, request_id: int) -> repo.AccessRequest | None:
+        return await self._db.run(repo.get_access_request, request_id)
+
+    async def list_pending(self) -> list[repo.AccessRequest]:
+        return await self._db.run(repo.list_access_requests, "pending")
+
+    # ------------------------------------------------------------------ bot /start
+
+    async def register_start(self, tg_id: int, username: str | None) -> StartInfo:
+        """Bind the chat to an existing user (imported or created by hand) at /start."""
+        user = await self._db.run(repo.get_user_by_tg_id, tg_id)
+        if user is None:
+            return StartInfo(None, False)
+        extra = await self._db.run(repo.get_user_extra, user.id)
+        first = extra is None or not extra.bot_started
+        wanted = (username or "").lstrip("@") or None
+        if (
+            extra is None
+            or not extra.bot_started
+            or not extra.can_message
+            or (wanted is not None and wanted != extra.tg_username)
+        ):
+
+            def work(conn: sqlite3.Connection) -> None:
+                with transaction(conn):
+                    _bind_user(conn, user.id, username)
+
+            await self._pipeline.db_write(work)
+        return StartInfo(user, first)
+
+    # ------------------------------------------------------------------ submit
+
+    async def submit(
+        self,
+        tg_id: int,
+        username: str | None,
+        full_name: str,
+        *,
+        on_preparing: Callable[[], Awaitable[None]] | None = None,
+    ) -> RequestOutcome:
+        if await self.is_blacklisted(tg_id):
+            return RequestOutcome(RequestKind.BLACKLISTED)
+        user = await self._db.run(repo.get_user_by_tg_id, tg_id)
+        if user is not None:
+            return RequestOutcome(RequestKind.HAS_ACCESS, user=user)
+        open_mode = await self.issuance_mode() == "open"
+        pending = await self._db.run(repo.pending_request_for, tg_id)
+        if pending is not None:
+            if not open_mode:
+                return RequestOutcome(RequestKind.ALREADY_PENDING, request=pending)
+            # open mode: an earlier issuance failed; pressing the button again retries it
+            if on_preparing is not None:
+                await on_preparing()
+            return await self._approve(pending.id, None, "system")
+        if await self._rate_limited(tg_id):
+            return RequestOutcome(RequestKind.RATE_LIMITED)
+
+        def create(conn: sqlite3.Connection) -> int | None:
+            with transaction(conn):
+                try:
+                    rid = repo.create_access_request(
+                        conn,
+                        tg_id,
+                        (username or "").lstrip("@") or None,
+                        full_name[:200],
+                        self._pipeline.now(),
+                    )
+                except sqlite3.IntegrityError:
+                    return None
+                repo.add_audit(
+                    conn, self._pipeline.now(), f"bot:{tg_id}", "request.create", f"request:{rid}"
+                )
+                return rid
+
+        rid = await self._pipeline.db_write(create)
+        if rid is None:
+            return RequestOutcome(
+                RequestKind.ALREADY_PENDING,
+                request=await self._db.run(repo.pending_request_for, tg_id),
+            )
+        if not open_mode:
+            return RequestOutcome(
+                RequestKind.CREATED, request=await self._db.run(repo.get_access_request, rid)
+            )
+        if on_preparing is not None:
+            await on_preparing()
+        return await self._approve(rid, None, "system")
+
+    async def _rate_limited(self, tg_id: int) -> bool:
+        since = to_db(self._pipeline.now() - self._rate_window)
+
+        def count(conn: sqlite3.Connection) -> int:
+            row = conn.execute(
+                "SELECT COUNT(*) FROM access_requests WHERE tg_id = ? AND created_at >= ?",
+                (tg_id, since),
+            ).fetchone()
+            return int(row[0])
+
+        return await self._db.run(count) >= self._rate_max
+
+    # ------------------------------------------------------------------ decisions
+
+    async def approve(self, request_id: int, term: Term | None, actor: str) -> RequestOutcome:
+        return await self._approve(request_id, term, actor)
+
+    async def _approve(self, request_id: int, term: Term | None, actor: str) -> RequestOutcome:
+        lock = self._locks.setdefault(request_id, asyncio.Lock())
+        async with lock:
+            return await self._approve_locked(request_id, term, actor)
+
+    async def _approve_locked(
+        self, request_id: int, term: Term | None, actor: str
+    ) -> RequestOutcome:
+        req = await self._db.run(repo.get_access_request, request_id)
+        if req is None:
+            return RequestOutcome(RequestKind.NOT_FOUND)
+        if req.status != "pending":
+            return RequestOutcome(RequestKind.ALREADY_DECIDED, request=req)
+        existing = await self._db.run(repo.get_user_by_tg_id, req.tg_id)
+        if existing is not None:
+            await self._finalize(req, existing.id, actor, "approved")
+            return RequestOutcome(
+                RequestKind.ISSUED, request=req, user=existing, link=self._safe_link(existing)
+            )
+        name = await self._free_name(display_name(req.full_name, req.tg_username, req.tg_id), req)
+        expires: datetime | None = None
+        if term is not None:
+            expires = default_expiry(term, self._pipeline.now())
+        result = await self._users.create(
+            [NewUser(name=name, tg_id=req.tg_id, comment="заявка из бота", expires_at=expires)],
+            actor,
+        )
+        if not result.ok or not result.user_ids:
+            return RequestOutcome(
+                RequestKind.FAILED, request=req, error=result.error or "Не удалось создать доступ"
+            )
+        uid = result.user_ids[0]
+        await self._finalize(req, uid, actor, "approved")
+        user = await self._users.get(uid)
+        return RequestOutcome(
+            RequestKind.ISSUED, request=req, user=user, link=result.links.get(uid)
+        )
+
+    def _safe_link(self, user: UserRecord) -> str | None:
+        try:
+            return self._users.link(user)
+        except Exception:
+            return None
+
+    async def _free_name(self, base: str, req: repo.AccessRequest) -> str:
+        def taken(conn: sqlite3.Connection, name: str) -> bool:
+            return (
+                conn.execute("SELECT 1 FROM users WHERE name = ?", (name,)).fetchone() is not None
+            )
+
+        if not await self._db.run(taken, base):
+            return base
+        suffix = f" ({req.tg_id})"
+        return base[: MAX_NAME - len(suffix)] + suffix
+
+    async def _finalize(
+        self, req: repo.AccessRequest, user_id: int, actor: str, status: str
+    ) -> None:
+        def work(conn: sqlite3.Connection) -> None:
+            with transaction(conn):
+                now = self._pipeline.now()
+                _bind_user(conn, user_id, req.tg_username)
+                repo.decide_access_request(conn, req.id, status, actor, now)
+                repo.add_audit(conn, now, actor, f"request.{status}", f"request:{req.id}")
+
+        await self._pipeline.db_write(work)
+
+    async def reject(self, request_id: int, actor: str) -> RequestOutcome:
+        lock = self._locks.setdefault(request_id, asyncio.Lock())
+        async with lock:
+            req = await self._db.run(repo.get_access_request, request_id)
+            if req is None:
+                return RequestOutcome(RequestKind.NOT_FOUND)
+            if req.status != "pending":
+                return RequestOutcome(RequestKind.ALREADY_DECIDED, request=req)
+
+            def work(conn: sqlite3.Connection) -> None:
+                with transaction(conn):
+                    now = self._pipeline.now()
+                    repo.decide_access_request(conn, request_id, "rejected", actor, now)
+                    repo.add_audit(conn, now, actor, "request.rejected", f"request:{request_id}")
+
+            await self._pipeline.db_write(work)
+            return RequestOutcome(
+                RequestKind.REJECTED,
+                request=await self._db.run(repo.get_access_request, request_id),
+            )

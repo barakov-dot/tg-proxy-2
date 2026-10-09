@@ -1,0 +1,14 @@
+{% extends 'base.html' %}
+{% block title %}{{ t.login_title }}{% endblock %}
+{% block content %}
+<section class="card narrow">
+<h1>{{ t.login_title }}</h1>
+{% if error %}<div class="alert err" role="alert">{{ error }}</div>{% endif %}
+<form method="post" action="{{ url('/login') }}" autocomplete="off">
+  <input type="hidden" name="login_token" value="{{ login_token }}">
+  <label>{{ t.login_user }} <input name="username" required maxlength="100" autofocus></label>
+  <label>{{ t.login_password }} <input type="password" name="password" required maxlength="1024"></label>
+  <button type="submit" class="primary">{{ t.login_submit }}</button>
+</form>
+</section>
+{% endblock %}

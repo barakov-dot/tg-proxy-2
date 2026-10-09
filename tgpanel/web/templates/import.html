@@ -1,0 +1,14 @@
+{% extends 'base.html' %}
+{% block title %}{{ t.nav_import }}{% endblock %}
+{% block content %}
+<h1>{{ t.nav_import }}</h1>
+<div class="alert warn">{{ t.import_stop_old_bot }}</div>
+{% if error %}<div class="alert err" role="alert">{{ error }}</div>{% endif %}
+<form method="post" action="{{ url('/import/preview') }}" enctype="multipart/form-data" class="card">
+  <input type="hidden" name="csrf_token" value="{{ csrf }}">
+  <label>{{ t.import_regex }} <input name="regex" value="{{ regex }}" maxlength="200"></label>
+  <label>{{ t.import_csv_text }} <textarea name="csv_text" rows="5" class="wide"></textarea></label>
+  <label>{{ t.import_csv_file }} <input type="file" name="csv_file" accept=".csv,.txt"></label>
+  <button type="submit" class="primary">{{ t.import_preview }}</button>
+</form>
+{% endblock %}
