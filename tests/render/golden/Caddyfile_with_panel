@@ -1,0 +1,24 @@
+{
+	admin off
+	email {$ACME_EMAIL}
+}
+
+{$TPROXY_HOSTNAME} {
+	encode zstd gzip
+	header Strict-Transport-Security "max-age=31536000"
+	reverse_proxy 127.0.0.1:8080
+}
+
+# >>> tgpanel
+panel.example.com {
+	encode zstd gzip
+	header Strict-Transport-Security "max-age=31536000"
+	@panel path /AbCdEfGhIjKlMnOpQrStUv_-x/*
+	handle @panel {
+		reverse_proxy 127.0.0.1:8090
+	}
+	handle {
+		respond 404
+	}
+}
+# <<< tgpanel

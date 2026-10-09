@@ -6,7 +6,7 @@ Web panel + Telegram bot over an installed tproxy-server. Full spec: PLAN.md (si
 Python 3.12+, FastAPI, aiogram 3, SQLite (WAL), Jinja2 + HTMX. Deploy target: Ubuntu 24.04 / Debian 13, root.
 
 ## Commands
-- Setup: `uv venv --python 3.12 && uv pip install -e ".[dev]"`
+- Setup: `uv venv --python 3.12 ~/.venvs/tgpanel && uv pip install --python ~/.venvs/tgpanel/bin/python -e ".[dev]"  (venv outside the Nextcloud-synced folder; it breaks there)`
 - Lint/types/tests: `ruff check . && mypy && pytest`
 - Shell: `shellcheck install.sh scripts/*.sh`
 

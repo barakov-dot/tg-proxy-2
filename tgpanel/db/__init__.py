@@ -1,1 +1,1 @@
-"""db layer."""
+"""db layer: SQLite schema, migrations and repositories."""

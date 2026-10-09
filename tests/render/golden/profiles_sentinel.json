@@ -1,0 +1,10 @@
+{
+  "profiles": [
+    {
+      "name": "_tgpanel_sentinel",
+      "secret": "ffffffffffffffffffffffffffffffff",
+      "backend": "127.0.0.1:2400",
+      "carrier_mode": "https"
+    }
+  ]
+}

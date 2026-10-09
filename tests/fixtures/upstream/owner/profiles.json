@@ -1,0 +1,94 @@
+{
+  "profiles": [
+    {
+      "name": "user_93455874",
+      "secret": "259f2eff4770e9d689f723ebf8ab7ef4",
+      "backend": "127.0.0.1:2398",
+      "carrier_mode": "https"
+    },
+    {
+      "name": "user_12345",
+      "secret": "2a80f449a00a939f1561e8f8e4f8bcdb",
+      "backend": "127.0.0.1:2398",
+      "carrier_mode": "https"
+    },
+    {
+      "name": "user_777000111",
+      "secret": "34eff95fb8db7ac371bc1aa0b3e3182f",
+      "backend": "127.0.0.1:2398",
+      "carrier_mode": "https"
+    },
+    {
+      "name": "user_5550001234",
+      "secret": "d10821c8e3641c97697e164172564c70",
+      "backend": "127.0.0.1:2398",
+      "carrier_mode": "https"
+    },
+    {
+      "name": "user_481516234200",
+      "secret": "f617fdfc9c3ea0fe7592524078083af2",
+      "backend": "127.0.0.1:2398",
+      "carrier_mode": "https"
+    },
+    {
+      "name": "user_42424242",
+      "secret": "020540e17ee24a2e043401173de92924",
+      "backend": "127.0.0.1:2398",
+      "carrier_mode": "https"
+    },
+    {
+      "name": "user_1000000007",
+      "secret": "60b339c5f53507b98445481219eefa0a",
+      "backend": "127.0.0.1:2398",
+      "carrier_mode": "https"
+    },
+    {
+      "name": "user_8800553535",
+      "secret": "dc72ef3c9452f7ef1bd0811e95b035bb",
+      "backend": "127.0.0.1:2398",
+      "carrier_mode": "https"
+    },
+    {
+      "name": "user_123456789012",
+      "secret": "7e45e478af3b05114f186c04fa5944f6",
+      "backend": "127.0.0.1:2398",
+      "carrier_mode": "https"
+    },
+    {
+      "name": "user_99999",
+      "secret": "0b6e27615e873910fa8520177eb567fe",
+      "backend": "127.0.0.1:2398",
+      "carrier_mode": "https"
+    },
+    {
+      "name": "user_31337313",
+      "secret": "6804ebcb37a338869607dc32c9b4a99b",
+      "backend": "127.0.0.1:2398",
+      "carrier_mode": "https"
+    },
+    {
+      "name": "user_270000001",
+      "secret": "eaa5a5d1cb572058cf7f7ba74e74d294",
+      "backend": "127.0.0.1:2398",
+      "carrier_mode": "https"
+    },
+    {
+      "name": "user_6543210987",
+      "secret": "84dad79953afe086e836a3496980b83b",
+      "backend": "127.0.0.1:2398",
+      "carrier_mode": "https"
+    },
+    {
+      "name": "user_111222333",
+      "secret": "e1cc98a165576aec04c3644e96ac9270",
+      "backend": "127.0.0.1:2398",
+      "carrier_mode": "https"
+    },
+    {
+      "name": "user_20240601",
+      "secret": "33cd2cd2dcd812da7a0d8e363aa1eb81",
+      "backend": "127.0.0.1:2398",
+      "carrier_mode": "https"
+    }
+  ]
+}

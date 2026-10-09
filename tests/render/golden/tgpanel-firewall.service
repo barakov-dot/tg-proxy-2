@@ -1,0 +1,15 @@
+# Managed by tgpanel. Do not edit.
+[Unit]
+Description=tgpanel nftables rules (traffic accounting, pool port guard)
+After=nftables.service
+PartOf=nftables.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/sbin/nft -f /etc/tgpanel/tgpanel.nft
+ExecReload=/usr/sbin/nft -f /etc/tgpanel/tgpanel.nft
+ExecStop=-/usr/sbin/nft delete table inet tgpanel
+
+[Install]
+WantedBy=multi-user.target nftables.service

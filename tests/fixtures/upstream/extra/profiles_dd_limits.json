@@ -1,0 +1,21 @@
+{
+  "profiles": [
+    {
+      "name": "user_424242",
+      "secret": "dd0fb74673ee1f9145f31e691a3cb5e70c",
+      "backend": "127.0.0.1:2398",
+      "carrier_mode": "https"
+    },
+    {
+      "name": "limited",
+      "secret": "080cc09ebe47d849a3534cd92e241ef0",
+      "backend": "127.0.0.1:2398",
+      "carrier_mode": "websocket",
+      "limits": {
+        "max_sessions": 32,
+        "max_streams": 256
+      },
+      "note": "unknown field tolerated"
+    }
+  ]
+}

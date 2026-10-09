@@ -1,0 +1,25 @@
+# Managed by tgpanel. Do not edit: regenerated on every apply.
+# add + delete + create makes loading idempotent (works whether or not the table exists).
+table inet tgpanel
+delete table inet tgpanel
+table inet tgpanel {
+	set up {
+		type ipv4_addr
+		counter
+		elements = { 127.64.0.1, 127.64.0.2 }
+	}
+	set down {
+		type ipv4_addr
+		counter
+		elements = { 127.64.0.1, 127.64.0.2 }
+	}
+	chain acct {
+		type filter hook output priority 0; policy accept;
+		oifname "lo" meta l4proto tcp ip daddr @up
+		oifname "lo" meta l4proto tcp ip saddr @down
+	}
+	chain guard {
+		type filter hook input priority -10; policy accept;
+		iifname != "lo" tcp dport { 2400-2463, 8900-8963 } drop
+	}
+}

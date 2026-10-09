@@ -1,0 +1,22 @@
+{
+  "profiles": [
+    {
+      "name": "u1",
+      "secret": "00000000000000000000000000000001",
+      "backend": "127.64.0.1:2400",
+      "carrier_mode": "https-lanes"
+    },
+    {
+      "name": "u3",
+      "secret": "00000000000000000000000000000003",
+      "backend": "127.64.0.3:2400",
+      "carrier_mode": "websocket"
+    },
+    {
+      "name": "u4",
+      "secret": "dd00000000000000000000000000000004",
+      "backend": "127.64.0.4:2401",
+      "carrier_mode": "https-lanes"
+    }
+  ]
+}

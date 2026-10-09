@@ -1,0 +1,22 @@
+{
+  "ListenAddr": "127.0.0.1:8080",
+  "AdminAddr": "127.0.0.1:8081",
+  "SiteRoot": "/srv/tproxy-site",
+  "BasePath": "/",
+  "TokenKeyFile": "/etc/tproxy-server/token.key",
+  "StaticRoutes": [
+    {
+      "path": "/robots.txt",
+      "file": "robots.txt"
+    },
+    {
+      "path": "/favicon.ico",
+      "file": "favicon.ico"
+    }
+  ],
+  "LogLevel": "info",
+  "ExperimentalFlags": {
+    "EarlyData": false,
+    "Retries": 3
+  }
+}

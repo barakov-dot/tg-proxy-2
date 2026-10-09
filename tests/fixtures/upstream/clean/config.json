@@ -1,0 +1,31 @@
+{
+  "ListenAddr": "127.0.0.1:8080",
+  "AdminAddr": "127.0.0.1:8081",
+  "SiteRoot": "/srv/tproxy-site",
+  "BasePath": "/",
+  "TokenKeyFile": "/etc/tproxy-server/token.key",
+  "StaticRoutes": [
+    {
+      "path": "/robots.txt",
+      "file": "robots.txt"
+    },
+    {
+      "path": "/favicon.ico",
+      "file": "favicon.ico"
+    }
+  ],
+  "limits": {
+    "max_profiles": 32,
+    "max_sessions_global": 128,
+    "max_streams_global": 4096,
+    "new_sessions_burst": 128,
+    "max_bootstraps_global": 512,
+    "new_bootstraps_burst": 256,
+    "max_pending_global": 536870912
+  },
+  "LogLevel": "info",
+  "ExperimentalFlags": {
+    "EarlyData": false,
+    "Retries": 3
+  }
+}
