@@ -58,8 +58,9 @@
   <input name="comment" placeholder="{{ t.col_comment }}" maxlength="2000">
   <input name="confirm" placeholder="{{ t.delete_word }}" class="short" autocomplete="off">
   <button type="submit" class="primary">{{ t.run }}</button>
-  <button type="button" hx-post="{{ url('/users/reveal-many') }}" hx-target="#reveal-many" hx-swap="innerHTML">{{ t.reveal_links }}</button>
+  <button type="button" hx-post="{{ url('/users/reveal-many') }}" hx-include="input[name=ids]:checked" hx-target="#reveal-many" hx-swap="innerHTML">{{ t.reveal_links }}</button>
 </div>
+</form>
 <div class="table-wrap">
 <table class="users">
 <thead><tr><th></th>
@@ -68,7 +69,7 @@
 <tbody>
 {% for rv in rows %}{% set u = rv.user %}
 <tr>
-  <td><input type="checkbox" name="ids" value="{{ u.id }}" aria-label="{{ u.id }}"></td>
+  <td><input type="checkbox" name="ids" value="{{ u.id }}" form="bulk-form" aria-label="{{ u.id }}"></td>
   {% for c in cols %}<td>
   {%- if c == 'id' %}{{ u.id }}
   {%- elif c == 'name' %}<a href="{{ url('/users/' ~ u.id) }}">{{ u.name }}</a>
@@ -90,7 +91,6 @@
 </tr>
 {% else %}<tr><td colspan="{{ cols|length + 2 }}">{{ t.no_data }}</td></tr>{% endfor %}
 </tbody></table></div>
-</form>
 <div id="reveal-many"></div>
 <nav class="pager">
   {% if q.page > 1 %}<a href="{{ qurl('/users', canon, page=q.page - 1) }}">‹ {{ t.prev }}</a>{% endif %}

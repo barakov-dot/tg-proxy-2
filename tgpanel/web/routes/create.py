@@ -13,6 +13,7 @@ from tgpanel.domain.expiry import Term, default_expiry
 from tgpanel.domain.models import CarrierMode
 from tgpanel.services.api import NewUser
 from tgpanel.services.errors import UserServiceError
+from tgpanel.web.inputs import parse_day, parse_uint
 from tgpanel.web.routes.common import (
     HttpError,
     auth_of,
@@ -51,9 +52,9 @@ def parse_list(text: str) -> list[NewUser]:
             raise FormError(T["create_line_noname"].format(n=lineno))
         tg_id: int | None = None
         if raw_id:
-            if not raw_id.isdigit() or len(raw_id) > 16:
+            tg_id = parse_uint(raw_id, max_digits=16)
+            if tg_id is None or tg_id == 0:
                 raise FormError(T["create_line_badid"].format(n=lineno))
-            tg_id = int(raw_id)
         users.append(NewUser(name=name, tg_id=tg_id, comment=comment))
     return users
 
@@ -67,10 +68,9 @@ def parse_term(form_term: str, date_raw: str, tz: ZoneInfo, now: datetime) -> da
     term = Term(form_term)
     explicit: datetime | None = None
     if term is Term.DATE:
-        try:
-            day = datetime.strptime(date_raw, "%Y-%m-%d")
-        except ValueError:
-            raise FormError(T["bad_date"]) from None
+        day = parse_day(date_raw)
+        if day is None:
+            raise FormError(T["bad_date"])
         explicit = day.replace(hour=23, minute=59, second=59, tzinfo=tz).astimezone(UTC)
     try:
         return default_expiry(term, now, explicit)
@@ -86,12 +86,13 @@ def build_users(
         if not name:
             raise FormError(T["create_noname"])
         raw_id = fstr(form, "tg_id")
-        if raw_id and (not raw_id.isdigit() or len(raw_id) > 16):
+        single_id = parse_uint(raw_id, max_digits=16) if raw_id else None
+        if raw_id and (single_id is None or single_id == 0):
             raise FormError(T["bad_number"])
         users = [
             NewUser(
                 name=name,
-                tg_id=int(raw_id) if raw_id else None,
+                tg_id=single_id,
                 comment=fraw(form, "comment").strip(),
             )
         ]
@@ -100,9 +101,9 @@ def build_users(
         raw_n = fstr(form, "count")
         if not prefix:
             raise FormError(T["create_noprefix"])
-        if not raw_n.isdigit() or not 1 <= int(raw_n) <= MAX_BATCH:
+        n = parse_uint(raw_n, max_digits=4) or 0
+        if not 1 <= n <= MAX_BATCH:
             raise FormError(T["create_badcount"].format(limit=MAX_BATCH))
-        n = int(raw_n)
         width = len(str(n))
         comment = fraw(form, "comment").strip()
         users = [NewUser(name=f"{prefix}-{i:0{width}d}", comment=comment) for i in range(1, n + 1)]

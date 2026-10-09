@@ -39,7 +39,7 @@ def admin_menu(pending: int) -> InlineKeyboardMarkup:
         [btn(texts.MENU_USERS, "l:0:a:n:0"), btn(requests, "rq")],
         [btn(texts.MENU_CREATE, "cr"), btn(texts.MENU_BROADCAST, "bc")],
         [btn(texts.MENU_MODE, "md"), btn(texts.MENU_APPLY, "ap")],
-        [btn(texts.MENU_BACKUP, "bk")],
+        [btn(texts.MENU_BACKUP, "bk"), btn(texts.MENU_BLACKLIST, "bl")],
     )
 
 
@@ -82,7 +82,10 @@ def user_list(
 def user_card(uid: int, *, enabled: bool, selected: bool) -> InlineKeyboardMarkup:
     return kb(
         [
-            btn(texts.BTN_DISABLE if enabled else texts.BTN_ENABLE, f"t:{uid}"),
+            btn(
+                texts.BTN_DISABLE if enabled else texts.BTN_ENABLE,
+                f"t:{uid}:{0 if enabled else 1}",  # the state to set, not a toggle
+            ),
             btn(texts.BTN_EXTEND, f"x:{uid}"),
         ],
         [btn(texts.BTN_LINK, f"k:{uid}"), btn(texts.BTN_QR, f"q:{uid}")],
@@ -141,3 +144,10 @@ def broadcast_confirm() -> InlineKeyboardMarkup:
 
 def report_button(bid: int) -> InlineKeyboardMarkup:
     return kb([btn(texts.BTN_FULL_REPORT, f"br:{bid}")])
+
+
+def blacklist_menu() -> InlineKeyboardMarkup:
+    return kb(
+        [btn(texts.BLACKLIST_ADD, "bla"), btn(texts.BLACKLIST_REMOVE, "blr")],
+        menu_row(),
+    )

@@ -7,7 +7,7 @@ The orchestrator wires the real services behind ``TrafficPort`` / ``RequestsPort
 from __future__ import annotations
 
 import logging
-from collections.abc import Awaitable, Callable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Protocol
@@ -17,9 +17,13 @@ from argon2 import PasswordHasher
 from tgpanel.apply.pipeline import ApplyPipeline
 from tgpanel.domain.expiry import Term
 from tgpanel.domain.queries import Period
+from tgpanel.services.admin import AdminService, WriteEnv
 from tgpanel.services.api import OperationResult
+from tgpanel.services.backups import BackupService
+from tgpanel.services.bulk import BulkService
 from tgpanel.services.container import AppContext
-from tgpanel.web.security import LoginLimiter
+from tgpanel.services.dashboard import DashboardView, PoolView
+from tgpanel.web.security import GlobalFailureLimiter, LoginLimiter
 
 log = logging.getLogger("tgpanel.web")
 
@@ -41,34 +45,6 @@ class SeriesResult:
     points: Sequence[Any]
     total_up: int
     total_down: int
-
-
-@dataclass(frozen=True, slots=True)
-class PoolView:
-    pool_id: int
-    port: int
-    used: int
-    capacity: int
-
-
-@dataclass(frozen=True, slots=True)
-class DashboardView:
-    users_total: int = 0
-    users_active: int = 0
-    users_disabled: int = 0
-    users_expired: int = 0
-    online: int = 0
-    up_24h: int = 0
-    down_24h: int = 0
-    up_30d: int = 0
-    down_30d: int = 0
-    pools: tuple[PoolView, ...] = ()
-    sessions_live: float | None = None
-    max_sessions_global: int | None = None
-    limit_hits_total: float | None = None
-    relay_ok: bool | None = None
-    services: Mapping[str, bool] = field(default_factory=dict)  # unit -> active
-    cert_days_left: int | None = None
 
 
 class TrafficPort(Protocol):
@@ -153,10 +129,27 @@ class WebContext:
     password_hasher: PasswordHasher = field(default_factory=PasswordHasher)
     limiter: LoginLimiter = field(default_factory=LoginLimiter)
     clock: Callable[[], datetime] | None = None  # defaults to the pipeline clock
+    global_limiter: GlobalFailureLimiter = field(default_factory=GlobalFailureLimiter)
+    write_env: WriteEnv | None = None  # writes TGPANEL_BOT_TOKEN to the env file (0600, atomic)
+    extra_hosts: frozenset[str] = frozenset()  # allowed Host values besides the panel hostname
+    admin: AdminService = field(init=False)
+    backups: BackupService = field(init=False)
+    bulk: BulkService = field(init=False)
+    used_tokens: set[str] = field(default_factory=set)  # one-time form tokens already spent
+
+    def __post_init__(self) -> None:
+        self.admin = AdminService(
+            self.app.pipeline, write_env=self.write_env, hasher=self.password_hasher
+        )
+        self.backups = BackupService(self.app.pipeline)
+        self.bulk = BulkService(self.app.pipeline)
 
     @property
     def pipeline(self) -> ApplyPipeline:
         return self.app.pipeline
+
+    def limiter_clock(self) -> float:
+        return self.now().timestamp()
 
     def now(self) -> datetime:
         return (self.clock or self.app.pipeline.now)()

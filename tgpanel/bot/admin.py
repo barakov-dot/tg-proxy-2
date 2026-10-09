@@ -9,7 +9,7 @@ from typing import Any
 
 from aiogram import Bot, F, Router
 from aiogram.exceptions import TelegramForbiddenError
-from aiogram.filters import Command, Filter
+from aiogram.filters import Command, CommandObject, Filter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, InlineKeyboardMarkup, Message, TelegramObject
@@ -183,7 +183,7 @@ async def cb_search(cb: CallbackQuery, state: FSMContext) -> None:
     await show(cb, texts.SEARCH_PROMPT)
 
 
-@router.message(Search.query, F.text)
+@router.message(Search.query, F.text, ~F.text.startswith("/"))
 async def msg_search(message: Message, deps: BotDeps, state: FSMContext) -> None:
     query = (message.text or "").strip()[:100]
     await state.set_state(None)
@@ -254,17 +254,19 @@ async def cb_card(cb: CallbackQuery, deps: BotDeps, state: FSMContext, m: re.Mat
     await _show_card(cb, deps, state, _uid(m))
 
 
-@router.callback_query(uid_cb("t"))
+@router.callback_query(F.data.regexp(r"^t:(\d{1,9}):([01])$").as_("m"))
 async def cb_toggle(cb: CallbackQuery, deps: BotDeps, state: FSMContext, m: re.Match[str]) -> None:
-    uid = _uid(m)
+    """Sets the target state carried by the button, so a double click changes nothing more."""
+    uid, enable = int(m.group(1)), m.group(2) == "1"
     user = await deps.users.get(uid)
     if user is None:
         await alert(cb, texts.USER_NOT_FOUND)
         return
     await cb.answer(texts.OPERATION_RUNNING)
-    res = await deps.users.set_status(
-        [uid], user.status is not UserStatus.ACTIVE, actor_of(cb.from_user.id)
-    )
+    if (user.status is UserStatus.ACTIVE) == enable:
+        await _show_card(cb, deps, state, uid)
+        return
+    res = await deps.users.set_status([uid], enable, actor_of(cb.from_user.id))
     await _show_card(cb, deps, state, uid, esc(res.error) if not res.ok and res.error else "")
 
 
@@ -367,7 +369,7 @@ async def cb_comment_edit(cb: CallbackQuery, state: FSMContext, m: re.Match[str]
     await show(cb, texts.COMMENT_PROMPT)
 
 
-@router.message(EditComment.text, F.text)
+@router.message(EditComment.text, F.text, ~F.text.startswith("/"))
 async def msg_comment(message: Message, deps: BotDeps, state: FSMContext) -> None:
     data = await state.get_data()
     uid = int(data.get("edit_uid", 0))
@@ -429,7 +431,14 @@ async def cb_request_term(cb: CallbackQuery, deps: BotDeps, bot: Bot, m: re.Matc
     if out.kind is RequestKind.ISSUED and out.request is not None:
         name = out.user.name if out.user else out.request.full_name
         await show(cb, texts.CREATED.format(name=esc(name)), keyboards.kb(keyboards.menu_row()))
-        await deliver_outcome(bot, deps, out.request.tg_id, out, texts.REQUEST_APPROVED)
+        await deliver_outcome(
+            bot,
+            deps,
+            out.request.tg_id,
+            out,
+            key="msg.approved",
+            default=texts.DEFAULT_APPROVED,
+        )
     elif out.kind is RequestKind.ALREADY_DECIDED and out.request is not None:
         await show(
             cb,
@@ -451,10 +460,13 @@ async def cb_request_reject(cb: CallbackQuery, deps: BotDeps, bot: Bot, m: re.Ma
     out = await deps.requests.reject(_uid(m), actor_of(cb.from_user.id))
     if out.kind is RequestKind.REJECTED and out.request is not None:
         await show(cb, texts.REQUEST_REJECTED_ADMIN, keyboards.kb(keyboards.menu_row()))
+        notice = await deps.templates.render(
+            "msg.rejected", texts.DEFAULT_REJECTED, {"name": out.request.full_name}
+        )
         try:
-            await bot.send_message(out.request.tg_id, texts.REQUEST_REJECTED)
+            await bot.send_message(out.request.tg_id, notice)
         except TelegramForbiddenError:
-            pass
+            log.info("rejection notice was not delivered: bot blocked")
         return
     if out.kind is RequestKind.ALREADY_DECIDED and out.request is not None:
         await alert(
@@ -528,7 +540,7 @@ async def cb_create(cb: CallbackQuery, state: FSMContext) -> None:
     await show(cb, texts.CREATE_NAME)
 
 
-@router.message(CreateUser.name, F.text)
+@router.message(CreateUser.name, F.text, ~F.text.startswith("/"))
 async def msg_create_name(message: Message, state: FSMContext) -> None:
     name = (message.text or "").strip()
     if not name or len(name) > 100 or "\n" in name:
@@ -543,10 +555,10 @@ async def _ask_term(target: Message | CallbackQuery) -> None:
     await show(target, texts.CREATE_TERM, keyboards.term_choice("ct"))
 
 
-@router.message(CreateUser.tg_id, F.text)
+@router.message(CreateUser.tg_id, F.text, ~F.text.startswith("/"))
 async def msg_create_tg(message: Message, state: FSMContext) -> None:
     raw = (message.text or "").strip()
-    if not raw.isdigit() or not 0 < int(raw) <= MAX_TG_ID:
+    if not (raw.isascii() and raw.isdigit()) or not 0 < int(raw) <= MAX_TG_ID:
         await message.answer(texts.CREATE_BAD_TG_ID)
         return
     data = (await state.get_data())["cu"]
@@ -569,7 +581,7 @@ async def cb_create_term(cb: CallbackQuery, state: FSMContext, m: re.Match[str])
     await show(cb, texts.CREATE_COMMENT, keyboards.skip_button("cs:cm"))
 
 
-@router.message(CreateUser.comment, F.text)
+@router.message(CreateUser.comment, F.text, ~F.text.startswith("/"))
 async def msg_create_comment(message: Message, deps: BotDeps, state: FSMContext, bot: Bot) -> None:
     await _finish_create(message, deps, state, bot, message.text or "")
 
@@ -648,10 +660,14 @@ def _preview_text(preview: BroadcastPreview) -> str:
     return "\n".join(lines)
 
 
-@router.message(BroadcastText.text, F.text)
+@router.message(BroadcastText.text, F.text, ~F.text.startswith("/"))
 async def msg_broadcast_text(message: Message, deps: BotDeps, state: FSMContext) -> None:
     raw = (message.text or "").strip()
-    template = texts.BROADCAST_DEFAULT if raw == "-" else raw
+    template = (
+        await deps.templates.custom("msg.broadcast") or texts.DEFAULT_BROADCAST
+        if raw == "-"
+        else raw
+    )
     draft = (await state.get_data()).get("bc") or {}
     await state.set_state(None)
     preview = await deps.broadcast.preview(draft.get("ids"))
@@ -677,17 +693,20 @@ async def cb_broadcast_go(cb: CallbackQuery, deps: BotDeps, state: FSMContext, b
     async def job() -> None:
         try:
             rep = await deps.broadcast.start(template, actor_of(admin), ids)
+            text = (
+                f"Рассылка #{rep.broadcast_id} завершена: отправлено {rep.sent}, "
+                f"бот заблокирован {rep.forbidden}, ошибок {rep.errors}, "
+                f"пропущено {rep.skipped}."
+            )
+            markup: InlineKeyboardMarkup | None = keyboards.report_button(rep.broadcast_id)
         except Exception as exc:
-            msg = esc(str(exc)) if isinstance(exc, OperationRejected) else texts.ERROR_GENERIC
-            await bot.send_message(admin, msg)
-            return
-        summary = (
-            f"Рассылка #{rep.broadcast_id} завершена: отправлено {rep.sent}, "
-            f"бот заблокирован {rep.forbidden}, ошибок {rep.errors}, пропущено {rep.skipped}."
-        )
-        await bot.send_message(
-            admin, summary, reply_markup=keyboards.report_button(rep.broadcast_id)
-        )
+            log.warning("broadcast failed: %s", type(exc).__name__)
+            text = esc(str(exc)) if isinstance(exc, OperationRejected) else texts.ERROR_GENERIC
+            markup = None
+        try:
+            await bot.send_message(admin, text, reply_markup=markup)
+        except Exception as exc:
+            log.warning("broadcast summary was not delivered: %s", type(exc).__name__)
 
     deps.spawn(job())
 
@@ -706,3 +725,81 @@ async def cb_broadcast_report(cb: CallbackQuery, deps: BotDeps, m: re.Match[str]
         lines.append(f"…и ещё {rep.total - 60}")
     await cb.answer()
     await show(cb, "\n".join(lines), keyboards.kb(keyboards.menu_row()))
+
+
+# ------------------------------------------------------------------ blacklist
+
+
+class BlacklistEdit(StatesGroup):
+    add = State()
+    remove = State()
+
+
+async def _blacklist_view(deps: BotDeps) -> tuple[str, InlineKeyboardMarkup]:
+    ids = await deps.requests.blacklist_ids()
+    shown = ", ".join(str(i) for i in ids[:50]) or texts.BLACKLIST_EMPTY
+    if len(ids) > 50:
+        shown += f" …и ещё {len(ids) - 50}"
+    return texts.BLACKLIST_TEXT.format(count=len(ids), ids=shown), keyboards.blacklist_menu()
+
+
+@router.callback_query(F.data == "bl")
+async def cb_blacklist(cb: CallbackQuery, deps: BotDeps, state: FSMContext) -> None:
+    await state.set_state(None)
+    text, markup = await _blacklist_view(deps)
+    await show(cb, text, markup)
+
+
+@router.callback_query(F.data.in_({"bla", "blr"}))
+async def cb_blacklist_ask(cb: CallbackQuery, state: FSMContext) -> None:
+    adding = cb.data == "bla"
+    await state.set_state(BlacklistEdit.add if adding else BlacklistEdit.remove)
+    await show(cb, texts.BLACKLIST_ASK_ADD if adding else texts.BLACKLIST_ASK_REMOVE)
+
+
+async def _blacklist_apply(
+    message: Message, deps: BotDeps, state: FSMContext, raw: str, add: bool
+) -> None:
+    raw = raw.strip()
+    if not (raw.isascii() and raw.isdigit()) or not 0 < int(raw) <= MAX_TG_ID:
+        await message.answer(texts.BLACKLIST_BAD_ID)
+        return
+    await state.set_state(None)
+    admin = message.from_user.id if message.from_user else 0
+    try:
+        await deps.requests.blacklist_edit(int(raw), add, actor_of(admin))
+    except OperationRejected as exc:
+        await message.answer(esc(str(exc)))
+        return
+    text, markup = await _blacklist_view(deps)
+    await message.answer(text, reply_markup=markup)
+
+
+@router.message(BlacklistEdit.add, F.text, ~F.text.startswith("/"))
+async def msg_blacklist_add(message: Message, deps: BotDeps, state: FSMContext) -> None:
+    await _blacklist_apply(message, deps, state, message.text or "", True)
+
+
+@router.message(BlacklistEdit.remove, F.text, ~F.text.startswith("/"))
+async def msg_blacklist_remove(message: Message, deps: BotDeps, state: FSMContext) -> None:
+    await _blacklist_apply(message, deps, state, message.text or "", False)
+
+
+@router.message(Command("ban", "unban"))
+async def cmd_ban(message: Message, command: CommandObject, deps: BotDeps) -> None:
+    await _blacklist_apply_cmd(message, command, deps)
+
+
+async def _blacklist_apply_cmd(message: Message, command: CommandObject, deps: BotDeps) -> None:
+    raw = (command.args or "").strip()
+    if not (raw.isascii() and raw.isdigit()) or not 0 < int(raw) <= MAX_TG_ID:
+        await message.answer(texts.BLACKLIST_USAGE)
+        return
+    admin = message.from_user.id if message.from_user else 0
+    try:
+        await deps.requests.blacklist_edit(int(raw), command.command == "ban", actor_of(admin))
+    except OperationRejected as exc:
+        await message.answer(esc(str(exc)))
+        return
+    text, markup = await _blacklist_view(deps)
+    await message.answer(text, reply_markup=markup)

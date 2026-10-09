@@ -10,7 +10,10 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - run: pip install -e ".[dev]"
+      - name: install pinned dev dependencies (hashes)
+        run: |
+          pip install --require-hashes --only-binary=:all: -r requirements-dev.lock
+          pip install --no-deps -e .
       - run: ruff check .
       - run: mypy
       - run: pytest
@@ -20,8 +23,27 @@ jobs:
       - uses: actions/checkout@v4
       - name: shellcheck
         run: |
-          files=$(git ls-files '*.sh')
-          if [ -n "$files" ]; then shellcheck $files; fi
+          files="$(git ls-files '*.sh') deploy/tgpanel-cli"
+          shellcheck $files
+  lock:
+    # requirements.lock must install with hashes on both target Pythons and match pyproject
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        python: ["3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: install with hashes, binary wheels only (dry run)
+        run: pip install --require-hashes --only-binary=:all: --dry-run -r requirements.lock
+      - name: lock is up to date with pyproject.toml
+        run: |
+          pip install uv==0.11.16
+          uv pip compile pyproject.toml --generate-hashes --python-version 3.12 \
+            --python-platform x86_64-manylinux_2_28 -o /tmp/requirements.lock
+          diff <(grep -v '^#' requirements.lock) <(grep -v '^#' /tmp/requirements.lock)
   installer-containers:
     # install.sh on a server WITHOUT the WEB proxy must exit 1 and change nothing (PLAN 10).
     runs-on: ubuntu-24.04
@@ -32,18 +54,5 @@ jobs:
       - uses: actions/checkout@v4
       - name: installer refuses a server without the proxy
         run: |
-          docker run --rm -v "$PWD:/src:ro" "${{ matrix.image }}" bash -ec '
-            apt-get update -qq && apt-get install -y -qq curl ca-certificates >/dev/null
-            snap() { find /etc /opt /usr/local /var/lib /var/backups -xdev -printf "%p %s %T@\n" 2>/dev/null | sort | sha256sum; }
-            before=$(snap)
-            set +e
-            bash /src/install.sh --panel-domain panel.example.com \
-              --bot-token 123456:abcdefghijklmnopqrstuvwxyzABCDEFGHI --admin-id 1 \
-              >/tmp/out.txt 2>&1
-            rc=$?
-            set -e
-            cat /tmp/out.txt
-            [ "$rc" = 1 ]
-            grep -q "WEB proxy не найден" /tmp/out.txt
-            [ "$before" = "$(snap)" ]
-          '
+          docker run --rm --platform linux/amd64 -v "$PWD:/src:ro" "${{ matrix.image }}" \
+            bash /src/scripts/installer-container-check.sh

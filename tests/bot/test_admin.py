@@ -20,7 +20,7 @@ async def test_non_admin_cannot_use_admin_command_or_callbacks(env: Env) -> None
     backups = len(env.svc.ctx.db.call(repo.list_backups))
     await env.tg.send(OUTSIDER, "/admin")
     assert env.session.texts(OUTSIDER) == []
-    for data in (f"dy:{user.id}", f"t:{user.id}", "bk", "ms:open", "rt:1:1m", "bgo", "cr"):
+    for data in (f"dy:{user.id}", f"t:{user.id}:0", "bk", "ms:open", "rt:1:1m", "bgo", "cr"):
         await env.tg.press(OUTSIDER, data)
     assert await env.svc.users.get(user.id) is not None
     assert (await env.svc.users.get(user.id)).status is UserStatus.ACTIVE  # type: ignore[union-attr]
@@ -73,9 +73,9 @@ async def test_user_card_traffic_comment_and_html_escape(env: Env) -> None:
 
 async def test_toggle_extend_and_delete_with_confirmation(env: Env) -> None:
     user = await env.make_user("Vasya", tg_id=USER, started=True)
-    await env.tg.press(ADMIN, f"t:{user.id}")
+    await env.tg.press(ADMIN, f"t:{user.id}:0")
     assert (await env.svc.users.get(user.id)).status is UserStatus.DISABLED  # type: ignore[union-attr]
-    await env.tg.press(ADMIN, f"t:{user.id}")
+    await env.tg.press(ADMIN, f"t:{user.id}:1")
     assert (await env.svc.users.get(user.id)).status is UserStatus.ACTIVE  # type: ignore[union-attr]
     old = (await env.svc.users.get(user.id)).expires_at  # type: ignore[union-attr]
     await env.tg.press(ADMIN, f"x:{user.id}")

@@ -13,6 +13,7 @@ from zoneinfo import ZoneInfo
 
 from tgpanel.domain.models import UserStatus
 from tgpanel.domain.queries import PER_PAGE_CHOICES, Period, SortField, UserFilter, UserListQuery
+from tgpanel.web.inputs import parse_day, parse_decimal, parse_uint
 from tgpanel.web.routes.common import HttpError
 from tgpanel.web.texts import T
 
@@ -42,20 +43,18 @@ def _int(params: Mapping[str, Sequence[str]], key: str, low: int, high: int) -> 
     raw = _one(params, key)
     if not raw:
         return None
-    if not raw.isdigit() or len(raw) > 12 or not low <= int(raw) <= high:
+    value = parse_uint(raw, max_digits=12)
+    if value is None or not low <= value <= high:
         raise HttpError(400, T["bad_filter"])
-    return int(raw)
+    return value
 
 
 def _mb(params: Mapping[str, Sequence[str]], key: str) -> int | None:
-    raw = _one(params, key).replace(",", ".")
+    raw = _one(params, key)
     if not raw:
         return None
-    try:
-        value = float(raw)
-    except ValueError:
-        raise HttpError(400, T["bad_filter"]) from None
-    if not 0 <= value < 1e9:
+    value = parse_decimal(raw)
+    if value is None:
         raise HttpError(400, T["bad_filter"])
     return int(value * MB)
 
@@ -66,10 +65,10 @@ def _date(
     raw = _one(params, key)
     if not raw:
         return None
-    try:
-        day = datetime.strptime(raw, "%Y-%m-%d").replace(tzinfo=tz)
-    except ValueError:
-        raise HttpError(400, T["bad_filter"]) from None
+    parsed = parse_day(raw)
+    if parsed is None:
+        raise HttpError(400, T["bad_filter"])
+    day = parsed.replace(tzinfo=tz)
     if end:
         day = day + timedelta(days=1) - timedelta(seconds=1)
     return day.astimezone(ZoneInfo("UTC"))
@@ -96,7 +95,8 @@ def parse_list_params(
     if period not in PERIODS:
         raise HttpError(400, T["bad_filter"])
     per_raw = _one(params, "per") or str(PER_PAGE_CHOICES[0])
-    if not per_raw.isdigit() or int(per_raw) not in PER_PAGE_CHOICES:
+    per_value = parse_uint(per_raw, max_digits=4)
+    if per_value not in PER_PAGE_CHOICES:
         raise HttpError(400, T["bad_filter"])
     page = _int(params, "page", 1, MAX_PAGE) or 1
 
@@ -125,7 +125,7 @@ def parse_list_params(
         traffic_max=_mb(params, "traffic_max"),
         comment_contains=_text(params, "comment"),
     )
-    per_page = int(per_raw)
+    per_page = per_value or PER_PAGE_CHOICES[0]
     query = UserListQuery(
         filter=flt,
         sort=sort,  # type: ignore[arg-type]  # validated against the Literal above

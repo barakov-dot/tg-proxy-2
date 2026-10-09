@@ -9,6 +9,7 @@
     <input type="hidden" name="csrf_token" value="{{ csrf }}">
     <label>{{ t.col_name }} <input name="name" value="{{ u.name }}" maxlength="100" required></label>
     <label>{{ t.col_tg_id }} <input name="tg_id" inputmode="numeric" value="{{ u.tg_id if u.tg_id is not none else '' }}"></label>
+    <label class="chk"><input type="checkbox" name="clear_tg_id" value="1"> {{ t.clear_tg_id }}</label>
     <label>{{ t.col_tg_username }} <input name="tg_username" value="{{ extra.tg_username if extra and extra.tg_username else '' }}" maxlength="64"></label>
     <label>{{ t.col_comment }} <textarea name="comment" rows="5" maxlength="2000" class="wide">{{ u.comment }}</textarea></label>
     <button type="submit" class="primary">{{ t.save }}</button>
@@ -61,7 +62,7 @@
     <input name="days" type="number" min="1" max="3650" value="30" class="short"> {{ t.days }} <button type="submit">{{ t.act_extend }}</button></form>
   <form method="post" action="{{ url('/users/' ~ u.id ~ '/action') }}" class="inline">
     <input type="hidden" name="csrf_token" value="{{ csrf }}"><input type="hidden" name="action" value="set_expiry">
-    <input type="date" name="expires_date" required> <button type="submit">{{ t.act_set_expiry }}</button></form>
+    <input type="date" name="expires_date" required> <label class="chk"><input type="checkbox" name="confirm_past" value="1"> {{ t.expiry_past_label }}</label> <button type="submit">{{ t.act_set_expiry }}</button></form>
   <form method="post" action="{{ url('/users/' ~ u.id ~ '/action') }}" class="inline">
     <input type="hidden" name="csrf_token" value="{{ csrf }}"><input type="hidden" name="action" value="carrier">
     <select name="carrier"><option value="">{{ t.carrier_default }}</option>{% for m in modes %}<option value="{{ m }}"{% if u.carrier_mode and u.carrier_mode.value == m %} selected{% endif %}>{{ m }}</option>{% endfor %}</select>

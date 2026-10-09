@@ -2,15 +2,14 @@
 
 from __future__ import annotations
 
-import ipaddress
 import re
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Any, cast
+from typing import Annotated, Any, cast
 from urllib.parse import urlencode
 from zoneinfo import ZoneInfo
 
-from fastapi import Request, Response
+from fastapi import Path, Request, Response
 from fastapi.responses import RedirectResponse
 from starlette.datastructures import FormData, UploadFile
 from starlette.templating import Jinja2Templates
@@ -18,6 +17,7 @@ from starlette.templating import Jinja2Templates
 from tgpanel.db import repo
 from tgpanel.system.validation import scrub
 from tgpanel.web.deps import WebContext
+from tgpanel.web.inputs import MAX_ID, ip_key, parse_uint
 from tgpanel.web.security import (
     FLASH_COOKIE,
     SESSION_COOKIE,
@@ -27,6 +27,7 @@ from tgpanel.web.security import (
 )
 from tgpanel.web.texts import T
 
+PathId = Annotated[int, Path(ge=1, le=MAX_ID)]
 SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
 KEY_LOGIN = "panel_login"
 KEY_HASH = "panel_password_hash"
@@ -75,7 +76,8 @@ def root_of(request: Request) -> str:
 
 
 def cookie_path(request: Request) -> str:
-    return root_of(request) or "/"
+    """``/<RANDOM>/`` as in PLAN 5.1 (``/`` for an empty root path)."""
+    return root_of(request) + "/"
 
 
 def clean(text: str | None, limit: int = 500) -> str:
@@ -84,16 +86,20 @@ def clean(text: str | None, limit: int = 500) -> str:
 
 
 def client_ip(request: Request, web: WebContext) -> str:
+    """Limiter key of the client: IPv6 -> /64, IPv4-mapped -> IPv4.
+
+    ``X-Forwarded-For`` is used only when the TCP peer is a trusted proxy, and only its LAST
+    entry (the one our proxy appended); a malformed last entry falls back to the peer address.
+    """
     peer = request.client.host if request.client else ""
     if peer in web.trusted_proxies:
-        forwarded = request.headers.get("x-forwarded-for", "")
-        if forwarded:
-            last = forwarded.split(",")[-1].strip()
-            try:
-                return str(ipaddress.ip_address(last))
-            except ValueError:
-                pass
-    return peer or "unknown"
+        entries = [e.strip() for e in request.headers.get("x-forwarded-for", "").split(",")]
+        entries = [e for e in entries if e]
+        if entries:
+            key = ip_key(entries[-1])
+            if key is not None:
+                return key
+    return ip_key(peer) or peer or "unknown"
 
 
 # ------------------------------------------------------------------------------ cookies
@@ -152,7 +158,7 @@ def read_panel_auth(conn: Any) -> PanelAuthConfig:
     login = repo.get_setting(conn, KEY_LOGIN, "") or ""
     pw_hash = repo.get_setting(conn, KEY_HASH, "") or ""
     raw = repo.get_setting(conn, KEY_VERSION, "1") or "1"
-    version = int(raw) if raw.isdigit() else 1
+    version = int(raw) if raw.isascii() and raw.isdigit() else 1
     return PanelAuthConfig(login, pw_hash, version)
 
 
@@ -202,16 +208,18 @@ def fint(form: FormData, key: str) -> int | None:
     raw = fstr(form, key)
     if not raw:
         return None
-    if not raw.isdigit() or len(raw) > 18:
+    value = parse_uint(raw)
+    if value is None:
         raise HttpError(400, T["bad_number"])
-    return int(raw)
+    return value
 
 
 def fids(form: FormData, key: str = "ids") -> list[int]:
     out: list[int] = []
     for raw in flist(form, key):
-        if raw.isdigit() and len(raw) <= 12:
-            out.append(int(raw))
+        value = parse_uint(raw, max_digits=12)
+        if value is not None and 1 <= value <= MAX_ID:
+            out.append(value)
     return list(dict.fromkeys(out))
 
 

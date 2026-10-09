@@ -1,6 +1,8 @@
 # ruff: noqa: RUF001
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 
 from tests.bot.helpers import FakeNotifier, FakeSender, forbidden, retry_after
@@ -242,3 +244,52 @@ async def test_late_bound_notifier() -> None:
     late.bind(target)
     await late.notify_admins("seen")
     assert target.messages == ["seen"]
+
+
+# ------------------------------------------------------------------ review fixes
+
+
+def test_scrub_secrets_masks_bot_tokens() -> None:
+    from tgpanel.services.notifier import scrub_secrets
+
+    token = "123456789:" + "Ab_-" * 9
+    out = scrub_secrets(f"POST /bot{token}/sendMessage failed")
+    assert token not in out and "[redacted]" in out
+    assert scrub_secrets("short 12345:abc stays") == "short 12345:abc stays"
+
+
+def test_render_message_only_documented_placeholders() -> None:
+    from tgpanel.services.notifier import render_message
+
+    values = {"name": "<N>", "link": "L&", "tg_link": "T", "expires": "E", "days": "3"}
+    assert render_message("{name} {link} {expires} {days} {x} {name.__class__}", values) == (
+        "&lt;N&gt; L&amp; E 3 {x} {name.__class__}"
+    )
+    assert render_message("<b>{name}</b>", values, escape=False) == "<b><N></b>"
+
+
+async def test_running_registry_is_cleaned(svc: Svc, bs: BroadcastService) -> None:
+    await make(svc, 2)
+    bid = await bs.create("hi", "bot:1")
+    task = asyncio.create_task(bs.run(bid))
+    await asyncio.sleep(0)
+    await task
+    assert bs._running == {} and not bs.is_running(bid)
+    await bs.run(bid)
+    assert bs._running == {}
+
+
+async def test_broadcast_uses_shared_messenger_and_limiter(svc: Svc, sender: FakeSender) -> None:
+    await svc.users.load_hostname()
+    limiter = RateLimiter(20, clock=sender.time.monotonic, sleep=sender.time.sleep)
+    messenger = Messenger(sender, svc.ctx.pipeline, limiter=limiter, sleep=sender.time.sleep)
+    service = BroadcastService(svc.ctx.pipeline, svc.ctx.db, svc.users, sender, messenger=messenger)
+    await make(svc, 30)
+    # 10 other messages go through the same limiter first
+    for _ in range(10):
+        await messenger.deliver(1, "x")
+    await service.start("hi", "bot:1")
+    times = [s.at for s in sender.sent]
+    assert len(times) == 40
+    for i, t in enumerate(times):
+        assert len([x for x in times[i:] if x < t + 1.0 - 1e-6]) <= 20

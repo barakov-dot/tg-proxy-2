@@ -26,6 +26,7 @@ import os
 import re
 import secrets
 import sys
+import time
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -73,6 +74,8 @@ POOL_TEMPLATE = "tgpanel-mtproxy@.service"
 BOOTSTRAP_PASSWORD_ENV = "TGPANEL_BOOTSTRAP_PASSWORD"  # noqa: S105 - variable name
 SETTING_LOGIN = "panel_login"
 SETTING_PASSWORD_HASH = "panel_password_hash"  # noqa: S105 - setting name
+SETTING_SESSION_VERSION = "panel_session_version"
+SETTING_BOOTSTRAPPED = "install.bootstrapped"
 
 # deploy file (relative to the repository) -> (target path, mode)
 _STATIC_UNITS: tuple[tuple[str, str, int], ...] = (
@@ -103,6 +106,7 @@ class Runtime:
     input_fn: Callable[[str], str]
     clock: Callable[[], datetime] = lambda: datetime.now(UTC)
     sleep: Callable[[float], Awaitable[None]] = asyncio.sleep
+    monotonic: Callable[[], float] = time.monotonic
     install_dir: str = INSTALL_DIR
     db_path: str = DEFAULT_DB
 
@@ -147,6 +151,23 @@ async def _restart_caddy_checked(rt: Runtime) -> None:
 
 
 async def _rewrite_caddyfile(
+    rt: Runtime, transform: Callable[[str], str], *, restart_if_unchanged: bool = False
+) -> CaddyOutcome:
+    """Same as below, under the global apply lock (no concurrent apply / restore)."""
+    try:
+        lock = await rt.ops.acquire_lock(rt.config.paths.lock, rt.config.timing.lock_timeout_s)
+    except SystemOpsError as exc:
+        return CaddyOutcome(False, error=f"блокировка применения недоступна: {_clean(str(exc))}")
+    try:
+        return await _rewrite_caddyfile_locked(
+            rt, transform, restart_if_unchanged=restart_if_unchanged
+        )
+    finally:
+        with contextlib.suppress(Exception):
+            await lock.release()
+
+
+async def _rewrite_caddyfile_locked(
     rt: Runtime, transform: Callable[[str], str], *, restart_if_unchanged: bool = False
 ) -> CaddyOutcome:
     """Backup-in-memory -> render -> `caddy validate` (drop-in env) -> atomic write -> restart.
@@ -331,12 +352,30 @@ async def cmd_repair(rt: Runtime, args: argparse.Namespace) -> int:
     return EXIT_OK if not failures else EXIT_ERROR
 
 
+AUTO_REF = "auto"
+
+
 async def _read_state_ref(rt: Runtime) -> str:
     try:
         text = (await rt.ops.read_file(f"{rt.config.paths.state_dir}/ref")).decode().strip()
     except SystemOpsError:
-        return DEFAULT_REF
-    return text if _REF_RE.fullmatch(text) else DEFAULT_REF
+        return AUTO_REF
+    return text if text == AUTO_REF or _REF_RE.fullmatch(text) else AUTO_REF
+
+
+async def _resolve_requested_ref(rt: Runtime, requested: str) -> str:
+    """``auto`` = newest v*.*.* tag if any, else the ``main`` branch (printed to the user)."""
+    if requested != AUTO_REF:
+        return requested
+    tag = await rt.tools.git_latest_tag(rt.install_dir)
+    if tag:
+        rt.say(f"Версия: последний релиз {tag}")
+        return tag
+    rt.say(
+        f"Релизных тегов нет: берётся движущаяся ветка {DEFAULT_REF}. "
+        "Для фиксации версии укажите --ref <тег или коммит>."
+    )
+    return DEFAULT_REF
 
 
 async def _switch_code(rt: Runtime, commit: str) -> None:
@@ -357,13 +396,14 @@ async def _panel_healthy(rt: Runtime) -> bool:
 
 async def cmd_update(rt: Runtime, args: argparse.Namespace) -> int:
     ops, tools = rt.ops, rt.tools
-    ref = args.ref or await _read_state_ref(rt)
-    if not _REF_RE.fullmatch(ref) or ".." in ref:
+    requested = args.ref or await _read_state_ref(rt)
+    if requested != AUTO_REF and (not _REF_RE.fullmatch(requested) or ".." in requested):
         rt.say("Некорректное имя ветки, тега или коммита.")
         return EXIT_USAGE
     try:
         previous = await tools.git_head(rt.install_dir)
         await tools.git_fetch(rt.install_dir)
+        ref = await _resolve_requested_ref(rt, requested)
         target = await tools.git_resolve(rt.install_dir, ref)
     except SystemOpsError as exc:
         rt.say(f"Не удалось получить обновление: {_clean(str(exc))}")
@@ -410,7 +450,7 @@ async def cmd_update(rt: Runtime, args: argparse.Namespace) -> int:
     with contextlib.suppress(SystemOpsError):
         await ops.write_atomic(
             f"{rt.config.paths.state_dir}/ref",
-            f"{ref}\n".encode(),
+            f"{requested}\n".encode(),
             mode=0o600,
             owner="root",
             group="root",
@@ -419,47 +459,85 @@ async def cmd_update(rt: Runtime, args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+async def _lock_or_say(rt: Runtime) -> Any:
+    try:
+        return await rt.ops.acquire_lock(rt.config.paths.lock, rt.config.timing.lock_timeout_s)
+    except SystemOpsError as exc:
+        rt.say(f"Не удалось получить блокировку применения: {_clean(str(exc))}")
+        return None
+
+
+async def _release(lock: Any) -> None:
+    with contextlib.suppress(Exception):
+        await lock.release()
+
+
 async def cmd_uninstall(rt: Runtime, args: argparse.Namespace) -> int:
-    ops, cfg = rt.ops, rt.config
-    paths = cfg.paths
+    ops = rt.ops
+    paths = rt.config.paths
     rt.say("Удаление tgpanel возвращает прокси к состоянию до установки панели.")
-    rt.say("Пользователи, созданные панелью, перестанут работать; /var/lib/caddy не трогается.")
+    rt.say("/var/lib/caddy не трогается.")
+    archives = [b for b in await scan_disk_backups(ops, paths) if b.reason == PRE_INSTALL]
+    archive = min(archives, key=lambda b: b.created_at) if archives else None
+    if archive is None and not args.force:
+        rt.say("Копия pre-install не найдена: восстановить исходные профили прокси не из чего.")
+        rt.say(
+            "Удаление остановлено, ничего не изменено. С ключом --force панель будет удалена, "
+            "а профили relay пересобраны из базы данных и направлены на старый процесс MTProxy "
+            "(порт 2398): продолжат работать только импортированные пользователи, "
+            "созданные в панели — нет."
+        )
+        return EXIT_ERROR
+    if archive is not None:
+        rt.say(
+            "Пользователи, созданные панелью, перестанут работать (профили вернутся к pre-install)."
+        )
     if args.purge:
         rt.say("ВНИМАНИЕ: --purge удалит базу данных, настройки и каталог /opt/tgpanel.")
     if not args.yes and not _confirm(rt, "Продолжить? [y/N] "):
         rt.say("Отменено.")
         return EXIT_ERROR
 
-    archives = [b for b in await scan_disk_backups(ops, paths) if b.reason == PRE_INSTALL]
-    if not archives:
-        rt.say("Копия pre-install не найдена: профили прокси восстановить не из чего.")
-        if not args.yes and not _confirm(rt, "Удалить панель без восстановления профилей? [y/N] "):
-            rt.say("Отменено.")
-            return EXIT_ERROR
-    archive = min(archives, key=lambda b: b.created_at) if archives else None
-
     # 0. stop the panel first: nothing may re-apply while we take things apart
     with contextlib.suppress(SystemOpsError):
         await ops.systemctl("disable-now", PANEL_UNIT)
-    try:
-        info = await rt.ctx.pipeline.create_backup("pre-uninstall", ACTOR)
-        rt.say(f"Резервная копия перед удалением: {info.path}")
-    except BackupError as exc:
-        rt.say(f"Не удалось создать резервную копию: {exc}")
+
+    async def abort(text: str) -> int:
+        rt.say(text)
         with contextlib.suppress(SystemOpsError):
             await ops.systemctl("enable-now", PANEL_UNIT)
         return EXIT_ERROR
 
-    # 1. proxy files back to pre-install (relay -> the legacy MTProxy again)
-    if archive is not None:
-        ok = await _restore_proxy_files(rt, archive.path)
-        if not ok:
-            with contextlib.suppress(SystemOpsError):
-                await ops.systemctl("enable-now", PANEL_UNIT)
-            return EXIT_ERROR
+    try:
+        info = await rt.ctx.pipeline.create_backup("pre-uninstall", ACTOR)
+        rt.say(f"Резервная копия перед удалением: {info.path}")
+    except BackupError as exc:
+        return await abort(f"Не удалось создать резервную копию: {exc}")
 
-    # 2. our units, pools, nft table
-    problems = await _remove_our_components(rt)
+    # 1. the legacy MTProxy must serve the relay again before the relay points at it
+    try:
+        rt.say(await rt.ctx.pipeline.set_legacy_mtproxy(True, ACTOR))
+        if not await ops.wait_tcp_open(
+            "127.0.0.1", rt.config.legacy_port, rt.config.timing.port_timeout_s
+        ):
+            return await abort(f"Старый MTProxy не открыл порт {rt.config.legacy_port}.")
+    except (OperationRejected, SystemOpsError) as exc:
+        return await abort(f"Не удалось включить старый MTProxy: {_clean(str(exc))}")
+
+    # 2. proxy files + our components, under the global apply lock
+    lock = await _lock_or_say(rt)
+    if lock is None:
+        return await abort("Удаление остановлено.")
+    try:
+        if archive is not None:
+            ok = await _restore_proxy_files(rt, archive.path, assume_yes=args.yes)
+        else:
+            ok = await _rebuild_profiles_for_legacy(rt, assume_yes=args.yes)
+        if not ok:
+            return await abort("Профили прокси не изменены; панель оставлена.")
+        problems = await _remove_our_components(rt)
+    finally:
+        await _release(lock)
 
     # 3. the Caddy block (proxy block and /var/lib/caddy stay untouched)
     outcome = await remove_caddy_block(rt)
@@ -468,7 +546,15 @@ async def cmd_uninstall(rt: Runtime, args: argparse.Namespace) -> int:
     elif outcome.changed:
         rt.say("Блок панели удалён из Caddyfile, Caddy перезапущен.")
 
-    # 4. data
+    # 4. a reinstall must take a fresh snapshot: the used archive is renamed
+    if archive is not None:
+        used = await _mark_archive_used(rt, archive.path)
+        if used:
+            rt.say(f"Архив pre-install помечен использованным: {used}")
+        else:
+            problems.append("архив pre-install не удалось переименовать")
+
+    # 5. data
     if args.purge:
         for tree in sorted(REMOVABLE_TREES):
             try:
@@ -488,6 +574,24 @@ async def cmd_uninstall(rt: Runtime, args: argparse.Namespace) -> int:
     return EXIT_OK if not problems else EXIT_ERROR
 
 
+async def _mark_archive_used(rt: Runtime, path: str) -> str | None:
+    ops = rt.ops
+    target = path.replace("-pre-install.tar.gz", "-pre-install-used.tar.gz")
+    n = 1
+    while target != path and await ops.exists(target):
+        n += 1
+        target = path.replace("-pre-install.tar.gz", f"-pre-install-used.{n}.tar.gz")
+    if target == path:
+        return None
+    try:
+        data = await ops.read_file(path)
+        await ops.write_atomic(target, data, mode=0o600, owner="root", group="root")
+        await ops.remove(path)
+    except SystemOpsError:
+        return None
+    return target
+
+
 _RESTORE_MEMBERS = ("etc/tproxy-server/profiles.json", "etc/tproxy-server/config.json")
 
 
@@ -505,54 +609,25 @@ async def _wait_healthz(rt: Runtime) -> bool:
     return False
 
 
-async def _restore_proxy_files(rt: Runtime, archive_path: str) -> bool:
-    """profiles.json + config.json from the pre-install archive; checked, rolled back on failure."""
-    import json
+async def _install_proxy_files(
+    rt: Runtime,
+    new_profiles: bytes,
+    new_config: bytes | None,
+    attrs: dict[str, tuple[int, str, str]],
+) -> bool:
+    """Check (`tproxy-server -check` on temp copies), write, restart the relay, roll back.
 
+    Caller holds the global apply lock. ``attrs`` = path -> (mode, owner, group).
+    """
     ops, cfg = rt.ops, rt.config
     paths = cfg.paths
-    try:
-        members = await ops.read_tar_members(
-            archive_path, {backup_mod.MANIFEST_NAME, *_RESTORE_MEMBERS}
-        )
-    except SystemOpsError as exc:
-        rt.say(f"Архив pre-install не читается: {_clean(str(exc))}")
-        return False
-    try:
-        meta = json.loads(members[backup_mod.MANIFEST_NAME]).get("files", {})
-    except (KeyError, ValueError):
-        rt.say("В архиве pre-install повреждён MANIFEST.json.")
-        return False
-    new_profiles = members.get(_RESTORE_MEMBERS[0])
-    new_config = members.get(_RESTORE_MEMBERS[1])
-    if new_profiles is None or new_config is None:
-        rt.say("В архиве pre-install нет profiles.json или config.json.")
-        return False
-    # the legacy MTProxy must run again before the relay points at it
-    try:
-        text = await rt.ctx.pipeline.set_legacy_mtproxy(True, ACTOR)
-        rt.say(text)
-        if not await ops.wait_tcp_open("127.0.0.1", cfg.legacy_port, cfg.timing.port_timeout_s):
-            rt.say(f"Старый MTProxy не открыл порт {cfg.legacy_port}; восстановление остановлено.")
-            return False
-    except (OperationRejected, SystemOpsError) as exc:
-        rt.say(f"Не удалось включить старый MTProxy: {_clean(str(exc))}")
-        return False
-
-    def attrs(path: str) -> tuple[int, str, str]:
-        info = meta.get(path.lstrip("/"), {})
-        return (
-            int(info.get("mode", 0o400)),
-            str(info.get("owner", "root")),
-            str(info.get("group", cfg.tproxy_group)),
-        )
-
-    pm, po, pg = attrs(paths.profiles)
-    cm, co, cg = attrs(paths.config)
+    pm, po, pg = attrs[paths.profiles]
+    cm, co, cg = attrs[paths.config]
     try:
         before = {p: await ops.read_file(p) for p in (paths.profiles, paths.config)}
+        config_bytes = new_config if new_config is not None else before[paths.config]
         await ops.write_atomic(paths.check_profiles, new_profiles, mode=0o600, owner=po, group=pg)
-        await ops.write_atomic(paths.check_config, new_config, mode=0o600, owner=co, group=cg)
+        await ops.write_atomic(paths.check_config, config_bytes, mode=0o600, owner=co, group=cg)
         try:
             verdict = await ops.tproxy_check(paths.check_config, paths.check_profiles)
         finally:
@@ -560,21 +635,22 @@ async def _restore_proxy_files(rt: Runtime, archive_path: str) -> bool:
                 with contextlib.suppress(SystemOpsError):
                     await ops.remove(tmp)
     except SystemOpsError as exc:
-        rt.say(f"Проверка восстановленных файлов не выполнена: {_clean(str(exc))}")
+        rt.say(f"Проверка файлов не выполнена: {_clean(str(exc))}")
         return False
     if not verdict.ok:
-        rt.say(f"relay отклонил файлы из pre-install: {verdict.output}")
+        rt.say(f"relay отклонил новые файлы профилей: {verdict.output}")
         return False
     try:
-        await ops.write_atomic(paths.config, new_config, mode=cm, owner=co, group=cg)
+        if new_config is not None:
+            await ops.write_atomic(paths.config, new_config, mode=cm, owner=co, group=cg)
         await ops.write_atomic(paths.profiles, new_profiles, mode=pm, owner=po, group=pg)
         await ops.systemctl("restart", cfg.relay_unit)
         healthy = await _wait_healthz(rt)
     except SystemOpsError as exc:
         healthy = False
-        rt.say(f"Ошибка при восстановлении: {_clean(str(exc))}")
+        rt.say(f"Ошибка при записи: {_clean(str(exc))}")
     if not healthy:
-        rt.say("relay не ответил после восстановления профилей; возвращаю прежние файлы.")
+        rt.say("relay не ответил после замены профилей; возвращаю прежние файлы.")
         with contextlib.suppress(SystemOpsError):
             await ops.write_atomic(paths.config, before[paths.config], mode=cm, owner=co, group=cg)
             await ops.write_atomic(
@@ -582,7 +658,169 @@ async def _restore_proxy_files(rt: Runtime, archive_path: str) -> bool:
             )
             await ops.systemctl("restart", cfg.relay_unit)
         return False
-    rt.say("profiles.json и config.json восстановлены из pre-install, relay работает.")
+    return True
+
+
+async def _file_attrs(rt: Runtime) -> dict[str, tuple[int, str, str]]:
+    paths = rt.config.paths
+    out: dict[str, tuple[int, str, str]] = {}
+    for path, default_mode in ((paths.profiles, 0o400), (paths.config, 0o640)):
+        try:
+            st = await rt.ops.stat(path)
+            out[path] = (st.mode, st.owner, st.group)
+        except SystemOpsError:
+            out[path] = (default_mode, "root", rt.config.tproxy_group)
+    return out
+
+
+def _merge_limits(current: bytes, archived: bytes) -> bytes:
+    """current config.json with ONLY the ``limits`` block taken from the archive."""
+    import json
+
+    cur = json.loads(current)
+    old = json.loads(archived)
+    if not isinstance(cur, dict) or not isinstance(old, dict):
+        raise ValueError("config.json must be an object")
+    if "limits" in old:
+        cur["limits"] = old["limits"]
+    else:
+        cur.pop("limits", None)
+    return (json.dumps(cur, indent=2, ensure_ascii=False) + "\n").encode()
+
+
+async def _restore_proxy_files(rt: Runtime, archive_path: str, *, assume_yes: bool) -> bool:
+    """profiles.json from the pre-install archive and ONLY ``limits`` of config.json."""
+    from tgpanel.domain.secrets_ import base_secret
+    from tgpanel.render.profiles import parse_profiles
+
+    ops, paths = rt.ops, rt.config.paths
+    try:
+        members = await ops.read_tar_members(
+            archive_path, {backup_mod.MANIFEST_NAME, *_RESTORE_MEMBERS}
+        )
+    except SystemOpsError as exc:
+        rt.say(f"Архив pre-install не читается: {_clean(str(exc))}")
+        return False
+    old_profiles = members.get(_RESTORE_MEMBERS[0])
+    old_config = members.get(_RESTORE_MEMBERS[1])
+    if old_profiles is None or old_config is None:
+        rt.say("В архиве pre-install нет profiles.json или config.json.")
+        return False
+    try:
+        cur_config = await ops.read_file(paths.config)
+        new_config = _merge_limits(cur_config, old_config)
+        old_entries = parse_profiles(old_profiles)
+    except (SystemOpsError, ValueError, RenderError) as exc:
+        rt.say(f"Не удалось подготовить файлы из pre-install: {_clean(str(exc))}")
+        return False
+    try:
+        cur_entries = parse_profiles(await ops.read_file(paths.profiles))
+    except (SystemOpsError, RenderError):
+        cur_entries = []
+    old_secrets = {base_secret(e.secret) for e in old_entries}
+    vanishing = [e for e in cur_entries if base_secret(e.secret) not in old_secrets]
+    by_old_name = {e.name: e for e in old_entries}
+    users = await rt.ctx.db.run(repo.all_users)
+    reissued = sum(
+        1
+        for u in users
+        if u.imported
+        and u.source_profile_name in by_old_name
+        and base_secret(by_old_name[u.source_profile_name].secret) != base_secret(u.secret)
+    )
+    rt.say("Что изменится в profiles.json:")
+    rt.say(f"  сейчас профилей: {len(cur_entries)}, после восстановления: {len(old_entries)}")
+    rt.say(f"  вернутся профили из pre-install: {len(old_entries)}")
+    rt.say(
+        f"  исчезнут профили, которых не было до установки: {len(vanishing)} "
+        "(их ссылки перестанут работать)"
+    )
+    rt.say(f"  пользователей, у которых секрет вернётся к старому: {reissued}")
+    rt.say("В config.json возвращается только блок limits; остальные ключи остаются как есть.")
+    if not assume_yes and not _confirm(rt, "Заменить profiles.json так? [y/N] "):
+        rt.say("Отменено.")
+        return False
+    attrs = await _file_attrs(rt)
+    if not await _install_proxy_files(rt, old_profiles, new_config, attrs):
+        return False
+    rt.say("profiles.json возвращён к состоянию pre-install, limits восстановлены, relay работает.")
+    return True
+
+
+async def _rebuild_profiles_for_legacy(rt: Runtime, *, assume_yes: bool) -> bool:
+    """--force without an archive: profiles.json rebuilt from the DB, all pointing at 2398."""
+    import json
+
+    from tgpanel.domain.secrets_ import generate_secret
+    from tgpanel.render.profiles import SENTINEL_NAME
+
+    ops, cfg = rt.ops, rt.config
+    paths = cfg.paths
+    try:
+        doc = json.loads(await ops.read_file(paths.profiles))
+        entries = doc["profiles"]
+        if not isinstance(entries, list):
+            raise ValueError("profiles")
+    except (SystemOpsError, ValueError, KeyError, TypeError):
+        rt.say("profiles.json не читается: пересборка невозможна.")
+        return False
+    users = {u.profile_name: u for u in await rt.ctx.db.run(repo.all_users)}
+    backend = f"127.0.0.1:{cfg.legacy_port}"
+    kept: list[dict[str, Any]] = []
+    foreign = 0
+    imported = 0
+    dropped = 0
+    taken = {e.get("name") for e in entries if isinstance(e, dict)}
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        name = str(entry.get("name", ""))
+        ours = (
+            name == SENTINEL_NAME
+            or name in users
+            or str(entry.get("backend", "")).startswith("127.64.")
+        )
+        if not ours:
+            kept.append(entry)
+            foreign += 1
+            continue
+        user = users.get(name)
+        if user is not None and user.imported:
+            new_name = user.source_profile_name or name
+            if new_name != name and new_name in taken:
+                new_name = name
+            rebuilt = {k: v for k, v in entry.items() if k != "limits"}
+            rebuilt.update(name=new_name, backend=backend)
+            kept.append(rebuilt)
+            imported += 1
+        else:
+            dropped += 1
+    if not kept:  # the relay refuses an empty list
+        kept.append(
+            {
+                "name": SENTINEL_NAME,
+                "secret": generate_secret(),
+                "backend": backend,
+                "carrier_mode": "https",
+            }
+        )
+    rt.say("Профили relay будут пересобраны из базы данных (копии pre-install нет):")
+    rt.say(f"  чужие профили сохраняются без изменений: {foreign}")
+    rt.say(
+        f"  импортированные пользователи уйдут на старый MTProxy и продолжат работать: {imported}"
+    )
+    rt.say(
+        f"  пользователи, созданные уже в панели: {dropped} — их профили удаляются, "
+        "ссылки перестанут работать (старый MTProxy не знает их секретов)"
+    )
+    if not assume_yes and not _confirm(rt, "Продолжить? [y/N] "):
+        rt.say("Отменено.")
+        return False
+    new_profiles = (json.dumps({"profiles": kept}, indent=2, ensure_ascii=False) + "\n").encode()
+    attrs = await _file_attrs(rt)
+    if not await _install_proxy_files(rt, new_profiles, None, attrs):
+        return False
+    rt.say("profiles.json пересобран, relay работает; config.json не менялся.")
     return True
 
 
@@ -676,6 +914,9 @@ async def cmd_reset_password(rt: Runtime, args: argparse.Namespace) -> int:
             login = args.login or repo.get_setting(conn, SETTING_LOGIN, "") or "admin"
             repo.set_setting(conn, SETTING_LOGIN, login)
             repo.set_setting(conn, SETTING_PASSWORD_HASH, digest)
+            # invalidates every existing web session (the web layer compares this version)
+            version = int(repo.get_setting(conn, SETTING_SESSION_VERSION, "0") or 0) + 1
+            repo.set_setting(conn, SETTING_SESSION_VERSION, str(version))
             repo.add_audit(conn, now, ACTOR, "panel.reset_password", "", "")
         return str(login)
 
@@ -686,9 +927,7 @@ async def cmd_reset_password(rt: Runtime, args: argparse.Namespace) -> int:
         return EXIT_ERROR
     rt.say(f"Логин: {login}")
     rt.say(f"Новый пароль: {password}")
-    rt.say(
-        "Пароль показан один раз и нигде не сохранён. Действующие сессии панели нужно завершить."
-    )
+    rt.say("Пароль показан один раз и нигде не сохранён. Все прежние сессии панели завершены.")
     return EXIT_OK
 
 
@@ -711,8 +950,10 @@ async def cmd_bootstrap(rt: Runtime, args: argparse.Namespace) -> int:
                 repo.set_setting(conn, SETTING_LOGIN, args.login)
                 repo.set_setting(conn, SETTING_PASSWORD_HASH, digest)
                 created = True
-            if args.admin_id:
+            # the admin is added on the FIRST bootstrap only: later it may be removed in the panel
+            if args.admin_id and not repo.get_setting(conn, SETTING_BOOTSTRAPPED):
                 repo.add_admin(conn, int(args.admin_id), now)
+            repo.set_setting(conn, SETTING_BOOTSTRAPPED, "1")
             repo.add_audit(conn, now, ACTOR, "install.bootstrap", "", "")
         return created
 
@@ -743,6 +984,7 @@ async def cmd_caddy_install(rt: Runtime, args: argparse.Namespace) -> int:
         interval_s=5.0,
         clock=rt.clock,
         sleep=rt.sleep,
+        monotonic=rt.monotonic,
     )
     if result.cert is not None:
         origin = {
@@ -818,6 +1060,7 @@ def add_commands(sub: Any) -> None:
     p = sub.add_parser("uninstall", help="убрать tgpanel и вернуть прокси к состоянию pre-install")
     p.add_argument("--purge", action="store_true", help="удалить также данные и настройки")
     p.add_argument("--yes", action="store_true", help="не спрашивать подтверждение")
+    p.add_argument("--force", action="store_true", help="удалить, даже если копии pre-install нет")
     sub.add_parser("show-url", help="показать адрес панели")
     p = sub.add_parser("reset-password", help="выдать новый пароль панели")
     p.add_argument("--login", help="сменить и логин")
@@ -839,6 +1082,7 @@ def _runner(
     tools_factory: Callable[[], ShellTools],
     sleep: Callable[[float], Awaitable[None]],
     clock: Callable[[], datetime],
+    monotonic: Callable[[], float],
 ) -> Callable[..., int]:
     def run(
         args: argparse.Namespace,
@@ -855,6 +1099,7 @@ def _runner(
             db_path=db_path,
             sleep=sleep,
             clock=clock,
+            monotonic=monotonic,
         )
         try:
             return asyncio.run(_run_handler(name, rt, args))
@@ -882,12 +1127,15 @@ def register(
     include_internal: bool = True,
     sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
     clock: Callable[[], datetime] = lambda: datetime.now(UTC),
+    monotonic: Callable[[], float] = time.monotonic,
 ) -> None:
     """Add the subcommands; each parser gets ``ops_run(args, out, input_fn) -> exit code``."""
     add_commands(subparsers)
     for name, parser in subparsers.choices.items():
         if name in _HANDLERS and (include_internal or name not in INTERNAL_COMMANDS):
-            parser.set_defaults(ops_run=_runner(name, ctx_factory, tools_factory, sleep, clock))
+            parser.set_defaults(
+                ops_run=_runner(name, ctx_factory, tools_factory, sleep, clock, monotonic)
+            )
 
 
 def main(
@@ -900,6 +1148,7 @@ def main(
     out: TextIO | None = None,
     sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
     clock: Callable[[], datetime] = lambda: datetime.now(UTC),
+    monotonic: Callable[[], float] = time.monotonic,
 ) -> int:
     from tgpanel.services.container import build_context
 
@@ -924,6 +1173,7 @@ def main(
         tools_factory=(lambda: tools) if tools is not None else RealShellTools,
         sleep=sleep,
         clock=clock,
+        monotonic=monotonic,
     )
     args = parser.parse_args(argv)
     args.db = db_path

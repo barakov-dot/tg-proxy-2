@@ -16,7 +16,7 @@ from tgpanel.bot import admin, texts, user
 from tgpanel.bot.deps import BotDeps
 from tgpanel.bot.middleware import LogMiddleware, PrivateOnlyMiddleware, ThrottleMiddleware
 from tgpanel.bot.sender import AiogramSender
-from tgpanel.system.validation import scrub
+from tgpanel.services.notifier import scrub_secrets
 
 log = logging.getLogger("tgpanel.bot")
 
@@ -50,7 +50,7 @@ def build_dispatcher(deps: BotDeps) -> Dispatcher:
         log.warning(
             "handler failed: %s: %s",
             type(event.exception).__name__,
-            scrub(str(event.exception), 200),
+            scrub_secrets(str(event.exception), 200),
         )
         update = event.update
         try:
@@ -88,6 +88,7 @@ async def run_bot(
             await dp.stop_polling()
             await asyncio.gather(polling, return_exceptions=True)
         stopper.cancel()
+        await deps.shutdown()
         sender.bind(None)
         await bot.session.close()
     if polling.done() and not polling.cancelled() and polling.exception() is not None:

@@ -21,9 +21,11 @@ from tgpanel.domain.models import CarrierMode, UserRecord
 from tgpanel.services.api import OperationResult, UserListQuery, UserRow
 from tgpanel.services.errors import UserServiceError
 from tgpanel.web.deps import WebContext, safe
+from tgpanel.web.inputs import parse_day, parse_uint, valid_username
 from tgpanel.web.listing import COLUMN_KEYS, parse_list_params
 from tgpanel.web.routes.common import (
     HttpError,
+    PathId,
     auth_of,
     clean,
     fids,
@@ -170,11 +172,15 @@ async def users_bulk(request: Request) -> Response:
     back = "/users" + ("?" + filter_qs if filter_qs else "")
     action = fstr(form, "action")
     if fstr(form, "all_matching") == "1":
-        query, canon = parse_list_params(parse_qs(filter_qs, max_num_fields=60), tz)
+        try:
+            parsed_qs = parse_qs(filter_qs, max_num_fields=60)
+        except ValueError:
+            raise HttpError(400, T["bad_filter"]) from None
+        query, canon = parse_list_params(parsed_qs, tz)
         back = "/users" + ("?" + _encode(canon) if canon else "")
         ids = await collect_ids(web, query)
         expected = fint(form, "expected_total")
-        if expected is not None and expected != len(ids):
+        if expected is None or expected != len(ids):
             return redirect(request, back, ("err", T["bulk_changed"]))
     else:
         ids = fids(form)
@@ -203,9 +209,8 @@ async def users_bulk(request: Request) -> Response:
             )
         elif action == "set_comment":
             comment = fstr(form, "comment")
-            for uid in ids:
-                await web.app.users.update_meta(uid, actor, comment=comment)
-            flash = ("ok", T["done_n"].format(n=n))
+            changed = await web.bulk.set_comment(ids, comment, actor)
+            flash = ("ok", T["done_n"].format(n=changed))
         elif action == "delete":
             if fstr(form, "confirm").lower() != T["delete_word"]:
                 flash = ("err", T["delete_confirm_bad_bulk"].format(word=T["delete_word"]))
@@ -237,7 +242,7 @@ async def users_bulk(request: Request) -> Response:
 
 
 @router.post("/users/{user_id}/comment")
-async def user_comment(request: Request, user_id: int) -> Response:
+async def user_comment(request: Request, user_id: PathId) -> Response:
     web = get_web(request)
     auth = auth_of(request)
     form = await load_form(request)
@@ -277,7 +282,7 @@ async def _card_context(web: WebContext, user: UserRecord) -> dict[str, Any]:
 
 
 @router.get("/users/{user_id}")
-async def user_card(request: Request, user_id: int) -> Response:
+async def user_card(request: Request, user_id: PathId) -> Response:
     web = get_web(request)
     user = await web.app.users.get(user_id)
     if user is None:
@@ -286,7 +291,7 @@ async def user_card(request: Request, user_id: int) -> Response:
 
 
 @router.post("/users/{user_id}/meta")
-async def user_meta(request: Request, user_id: int) -> Response:
+async def user_meta(request: Request, user_id: PathId) -> Response:
     web = get_web(request)
     auth = auth_of(request)
     form = await load_form(request)
@@ -295,40 +300,50 @@ async def user_meta(request: Request, user_id: int) -> Response:
         raise HttpError(404, T["not_found"])
     name = fstr(form, "name")
     comment = str(form.get("comment") or "")
-    username = fstr(form, "tg_username")
+    username = fstr(form, "tg_username").lstrip("@")
     tg_raw = fstr(form, "tg_id")
+    clear_tg = fstr(form, "clear_tg_id") == "1"
+    if not valid_username(username):
+        return redirect(request, f"/users/{user_id}", ("err", T["bad_username"]))
     fields: dict[str, Any] = {}
     if name and name != user.name:
         fields["name"] = name
     if comment != user.comment:
         fields["comment"] = comment
-    if tg_raw:
-        if not tg_raw.isdigit() or len(tg_raw) > 16:
+    tg_new: int | None = None
+    if tg_raw and not clear_tg:
+        tg_new = parse_uint(tg_raw, max_digits=16)
+        if tg_new is None or tg_new == 0:
             return redirect(request, f"/users/{user_id}", ("err", T["bad_number"]))
-        if int(tg_raw) != user.tg_id:
-            fields["tg_id"] = int(tg_raw)
+        if tg_new != user.tg_id:
+            fields["tg_id"] = tg_new
     extra = await web.app.db.run(repo.get_user_extra, user_id)
-    if extra is not None and username.lstrip("@") != (extra.tg_username or ""):
+    if extra is not None and username != (extra.tg_username or ""):
         fields["tg_username"] = username
-    if not fields:
+    cleared = False
+    if clear_tg and user.tg_id is not None:
+        cleared = True
+    if not fields and not cleared:
         return redirect(request, f"/users/{user_id}", ("ok", T["nothing_changed"]))
     try:
-        await web.app.users.update_meta(user_id, auth.actor, **fields)
+        if fields:
+            await web.app.users.update_meta(user_id, auth.actor, **fields)
+        if cleared:
+            await web.bulk.clear_tg_id(user_id, auth.actor)
     except (UserServiceError, OperationRejected) as exc:
         return redirect(request, f"/users/{user_id}", ("err", clean(str(exc))))
     return redirect(request, f"/users/{user_id}", ("ok", T["saved"]))
 
 
 def _end_of_day(raw: str, tz: ZoneInfo) -> datetime:
-    try:
-        day = datetime.strptime(raw, "%Y-%m-%d")
-    except ValueError:
-        raise HttpError(400, T["bad_date"]) from None
+    day = parse_day(raw)
+    if day is None:
+        raise HttpError(400, T["bad_date"])
     return day.replace(hour=23, minute=59, second=59, tzinfo=tz).astimezone(ZoneInfo("UTC"))
 
 
 @router.post("/users/{user_id}/action")
-async def user_action(request: Request, user_id: int) -> Response:
+async def user_action(request: Request, user_id: PathId) -> Response:
     web = get_web(request)
     auth = auth_of(request)
     form = await load_form(request)
@@ -353,6 +368,8 @@ async def user_action(request: Request, user_id: int) -> Response:
             flash = _result_flash(await users.extend([user_id], days, actor), T["saved"])
         elif action == "set_expiry":
             when = _end_of_day(fstr(form, "expires_date"), tz)
+            if when <= web.now() and fstr(form, "confirm_past") != "1":
+                return redirect(request, back, ("err", T["expiry_past_confirm"]))
             flash = _result_flash(await users.set_expiry([user_id], when, actor), T["saved"])
         elif action == "clear_expiry":
             flash = _result_flash(await users.set_expiry([user_id], None, actor), T["saved"])
@@ -400,11 +417,8 @@ async def reveal_block(request: Request, web: WebContext, user: UserRecord, acto
     except UserServiceError as exc:
         return await render(request, "_reveal.html", 409, u=user, error=clean(str(exc)))
 
-    def audit(conn: sqlite3.Connection) -> None:
-        repo.add_audit(conn, web.now(), actor, "user.reveal", f"user:{user.id}", "")
-
     try:
-        await web.pipeline.db_write(audit)
+        await web.admin.audit(actor, "user.reveal", f"user:{user.id}")
     except OperationRejected:
         log.warning("reveal audit skipped: database busy")
     return await render(
@@ -420,7 +434,7 @@ async def reveal_block(request: Request, web: WebContext, user: UserRecord, acto
 
 
 @router.post("/users/{user_id}/reveal")
-async def user_reveal(request: Request, user_id: int) -> Response:
+async def user_reveal(request: Request, user_id: PathId) -> Response:
     web = get_web(request)
     auth = auth_of(request)
     user = await web.app.users.get(user_id)
@@ -447,11 +461,8 @@ async def users_reveal_many(request: Request) -> Response:
     except UserServiceError as exc:
         return await render(request, "_reveal_many.html", 409, error=clean(str(exc)), text="")
 
-    def audit(conn: sqlite3.Connection) -> None:
-        repo.add_audit(conn, web.now(), auth.actor, "user.reveal", "bulk", f"count={len(ids)}")
-
     try:
-        await web.pipeline.db_write(audit)
+        await web.admin.audit(auth.actor, "user.reveal", "bulk", f"count={len(ids)}")
     except OperationRejected:
         log.warning("reveal audit skipped: database busy")
     return await render(request, "_reveal_many.html", error=None, text="\n".join(lines))
@@ -461,7 +472,7 @@ async def users_reveal_many(request: Request) -> Response:
 
 
 @router.get("/users/{user_id}/traffic.json")
-async def user_traffic(request: Request, user_id: int) -> Response:
+async def user_traffic(request: Request, user_id: PathId) -> Response:
     web = get_web(request)
     preset = request.query_params.get("preset", "30d")
     if preset not in (*PRESET_DELTAS, "all"):
@@ -469,7 +480,12 @@ async def user_traffic(request: Request, user_id: int) -> Response:
     if await web.app.users.get(user_id) is None:
         raise HttpError(404, T["not_found"])
     end = web.now()
-    start = None if preset == "all" else end - PRESET_DELTAS[preset]
+    start: datetime | None
+    if preset == "all":
+        extra = await web.app.db.run(repo.get_user_extra, user_id)
+        start = extra.created_at if extra is not None else None
+    else:
+        start = end - PRESET_DELTAS[preset]
     series = await safe(web.traffic.user_series(user_id, start, end, 600), "user_series")
     if series is None:
         return JSONResponse({"error": T["traffic_unavailable"]}, status_code=503)

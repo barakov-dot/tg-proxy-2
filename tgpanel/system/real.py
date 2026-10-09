@@ -57,6 +57,7 @@ from tgpanel.system.validation import (
 
 _MINIMAL_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 _MAX_HTTP_BODY = 8 * 1024 * 1024
+CADDY_VALIDATE_DIR = "/run/tgpanel/caddy-validate"  # throwaway XDG dirs for `caddy validate`
 _KILL_GRACE_S = 5.0  # how long to wait for the pipes of a killed command to close
 _DEFAULT_IP_PROBES = (
     "https://api.ipify.org",
@@ -565,9 +566,18 @@ class RealSystemOps:
     async def caddy_validate(self, caddyfile_path: str, env: dict[str, str]) -> CheckResult:
         validate_path(caddyfile_path)
         validate_env(env)
+        # tgpanel runs with ProtectHome: caddy must not need a writable home (XDG dirs below)
+        scratch = CADDY_VALIDATE_DIR
+        with contextlib.suppress(OSError):
+            await asyncio.to_thread(lambda: os.makedirs(scratch, mode=0o700, exist_ok=True))
         res = await run_command(
             [self._caddy, "validate", "--config", caddyfile_path, "--adapter", "caddyfile"],
-            env={"HOME": "/root", **env},
+            env={
+                "HOME": "/root",
+                "XDG_DATA_HOME": scratch,
+                "XDG_CONFIG_HOME": scratch,
+                **env,
+            },
             timeout_s=self._timeout,
         )
         return CheckResult(ok=res.ok, output=res.output)

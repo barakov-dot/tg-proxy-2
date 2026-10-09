@@ -48,6 +48,9 @@ def render_panel_block(
         '\theader Strict-Transport-Security "max-age=31536000"\n'
         f"\t@panel path /{path}/*\n"
         "\thandle @panel {\n"
+        "\t\trequest_body {\n"
+        "\t\t\tmax_size 2MB\n"
+        "\t\t}\n"
         f"\t\treverse_proxy {upstream}\n"
         "\t}\n"
         "\thandle {\n"

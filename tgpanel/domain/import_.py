@@ -69,56 +69,33 @@ class ImportPlan:
         return bool(self.errors)
 
 
-_LOOKAROUND = re.compile(r"\(\?(?:=|!|<=|<!|P=|\()")
-_BACKREF = re.compile(r"\\(?:[1-9]|g<|k<)")
-MAX_MATCH_INPUT = 64  # relay profile names are at most 64 characters: bounds any backtracking
+MAX_MATCH_INPUT = 64  # relay profile names are at most 64 characters
+_LIT = r"(?:[^\\.^$*+?{}\[\]|()\n\r]|\\[.\-_/:@ ^$*+?{}\[\]|()\\])"
+# ^<literal prefix>(\d{n,m} | \d{n} | \d+)<literal suffix>$ and nothing else: such a pattern
+# is linear (one literal run, one digit run, one literal run), so it cannot backtrack badly.
+_ID_PATTERN_RE = re.compile(
+    rf"\^({_LIT}*)\(\\d(?:\+|\{{(\d{{1,3}})(?:,(\d{{1,3}}))?\}})\)({_LIT}*)\$"
+)
+ID_REGEX_ERROR = (
+    "Выражение для Telegram ID допускает только вид ^префикс(\\d{n,m})суффикс$ "
+    "или ^префикс(\\d+)суффикс$; префикс и суффикс - обычные символы"
+)
 
 
 def check_id_regex_safety(pattern: str) -> str | None:
-    """Conservative ReDoS guard: reason string if the pattern is rejected, else None.
+    """Reason (Russian) if the pattern is outside the restricted grammar, else None.
 
-    Rejected: look-arounds, conditionals, back-references, and a quantified group that itself
-    contains a quantifier (``(a+)+``, ``(\\d*)*``, ``(a|b+){2,}``). Matching is additionally run on
-    at most ``MAX_MATCH_INPUT`` characters, so even accepted patterns have a hard budget.
+    Accepted: ``^<literal>(\\d{n,m}|\\d{n}|\\d+)<literal>$`` (escape-aware literals). Anything
+    else - alternation, groups, classes, other quantifiers, look-arounds - is refused, so no
+    accepted pattern can backtrack catastrophically.
     """
-    if _LOOKAROUND.search(pattern):
-        return "id regex must not use look-arounds or conditionals"
-    if _BACKREF.search(pattern):
-        return "id regex must not use back-references"
-    stack: list[bool] = []  # per open group: does it contain a repeating quantifier?
-    i, n = 0, len(pattern)
-    in_class = False
-    while i < n:
-        ch = pattern[i]
-        if ch == "\\":
-            i += 2
-            continue
-        if in_class:
-            in_class = ch != "]"
-            i += 1
-            continue
-        if ch == "[":
-            in_class = True
-        elif ch == "(":
-            stack.append(False)
-        elif ch == ")":
-            inner = stack.pop() if stack else False
-            if inner:
-                if stack:
-                    stack[-1] = True
-                if i + 1 < n and _is_repeat(pattern, i + 1):
-                    return "id regex has nested quantifiers"
-        elif _is_repeat(pattern, i) and stack:
-            stack[-1] = True
-        i += 1
+    match = _ID_PATTERN_RE.fullmatch(pattern)
+    if match is None:
+        return ID_REGEX_ERROR
+    low, high = match.group(2), match.group(3)
+    if low is not None and (int(low) < 1 or (high is not None and int(high) < int(low))):
+        return "В выражении для Telegram ID неверные границы количества цифр"
     return None
-
-
-def _is_repeat(pattern: str, i: int) -> bool:
-    ch = pattern[i]
-    if ch in "*+":
-        return True
-    return ch == "{" and re.match(r"\{\d*,?\d*\}", pattern[i:]) is not None
 
 
 def mask_secret(secret: str) -> str:
@@ -177,18 +154,18 @@ def plan_import(
     pattern: re.Pattern[str] | None = None
     regex_error: str | None = None
     if len(id_regex) > MAX_REGEX_LENGTH:
-        regex_error = f"id regex is longer than {MAX_REGEX_LENGTH} characters"
+        regex_error = f"Выражение для Telegram ID длиннее {MAX_REGEX_LENGTH} символов"
     else:
         unsafe = check_id_regex_safety(id_regex)
         if unsafe is not None:
             regex_error = unsafe
         try:
-            pattern = None if unsafe else re.compile(id_regex)
+            pattern = None if unsafe else re.compile(id_regex, re.ASCII)
         except re.error as exc:
-            regex_error = f"id regex is invalid: {exc}"
+            regex_error = f"Выражение для Telegram ID некорректно: {exc}"
         else:
             if pattern is not None and pattern.groups < 1:
-                regex_error = "id regex must contain a capture group for the telegram id"
+                regex_error = "Выражение для Telegram ID должно содержать группу с цифрами"
                 pattern = None
     existing_tg_set = set(existing_tg_ids)
     mtproxy_norm = None if mtproxy_secrets is None else {_norm(s) for s in mtproxy_secrets}

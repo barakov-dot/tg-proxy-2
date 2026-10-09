@@ -4,6 +4,9 @@
 	header Strict-Transport-Security "max-age=31536000"
 	@panel path /{{PANEL_PATH}}/*
 	handle @panel {
+		request_body {
+			max_size 2MB
+		}
 		reverse_proxy 127.0.0.1:8090
 	}
 	handle {

@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # tgpanel server self-check (PLAN phase 8). Run as root ON THE SERVER, ideally BEFORE or right
 # after installing tgpanel. Read-mostly: it never changes proxy files, profiles, units or the
-# Caddyfile permanently. Everything it creates uses the unique prefix below (a throwaway nft
-# table, temp files, throwaway MTProxy processes, one throwaway unit file) and is removed by a
-# trap, also when the script is interrupted.
+# Caddyfile permanently. Everything it creates uses the unique prefix below (throwaway nft
+# tables, temp files, throwaway MTProxy processes, one throwaway unit file) and is removed by a
+# trap on EXIT/INT/TERM/HUP.
 #
 # Items and what each check proves (numbers follow PLAN phase 8):
 #   1  MTProxy accepts TCP connections on 127.64.x.y:<port> (it binds 0.0.0.0, so any 127/8
@@ -13,14 +13,18 @@
 #   3  Two addresses served by ONE MTProxy process are counted separately.
 #   4  A process with 16 secrets (-S x16) starts and stays up; a 17th is tried and only
 #      reported (decides whether secrets_per_process must drop to 15).
-#   8  Memory (RSS) per MTProxy process with 1 and 16 secrets -> estimate for 20 pools.
+#   8  Memory (RSS) per idle MTProxy process (1 and 16 secrets, real -C) -> lower estimate for
+#      20 pools (grows with clients).
 #   -  `systemctl mask` on a regular unit file (throwaway unit): shows whether `legacy-mtproxy
 #      off` must use its drop-in fallback.
 #   -  `nft list set` on a missing table: confirms the error behaviour the pipeline relies on.
-#   14 Panel certificate: issuer/dates from the live TLS handshake (run the installer twice and
-#      compare "not before" to confirm that the second run did not request a new certificate).
-# Needing a Telegram client (printed as instructions): 5, 6, 7, 12, 13; plus 9 (forced apply
-# failure), 10 (reboot) and 11 (uninstall) which change the server and are done by hand.
+#   -  `caddy validate` with an unwritable HOME (tgpanel.service runs with ProtectHome).
+#   14 Panel certificate: notBefore is saved in /var/lib/tgpanel/selfcheck-cert-notbefore and
+#      compared between runs (run: script, install.sh again, script -> must be unchanged).
+# Temporary MTProxy ports are protected by a throwaway nft table that drops non-loopback
+# traffic to them, and the processes inherit MTPROXY_NAT_ARGS like the real unit.
+# Needing a Telegram client (printed as instructions): 4 (client via secret #1 and #16), 5, 6,
+# 7, 12, 13; plus 9 (safe apply-failure procedure), 10 (reboot) and 11 (uninstall).
 set -uo pipefail
 
 PREFIX="tgpanel-selfcheck-$$"
@@ -29,14 +33,23 @@ TPROXY_BIN="${TPROXY_BIN:-/usr/local/bin/tproxy-server}"
 MTPROXY_USER="${MTPROXY_USER:-mtproxy}"
 AES_PWD="${AES_PWD:-/etc/mtproxy/proxy-secret}"
 MULTI_CONF="${MULTI_CONF:-/etc/mtproxy/proxy-multi.conf}"
-NFT_TABLE="tgpanel_selfcheck"
+MTPROXY_ENV="${MTPROXY_ENV:-/etc/mtproxy/mtproxy.env}"
+MAX_CONN="${SELFCHECK_MAX_CONN:-4096}"
+NFT_TABLE="tgpanel_selfcheck_$$"
+GUARD_TABLE="tgpanel_selfcheck_guard_$$"
 ENV_FILE="${ENV_FILE:-/etc/tgpanel/tgpanel.env}"
+CERT_STATE="${CERT_STATE:-/var/lib/tgpanel/selfcheck-cert-notbefore}"
 WORKDIR=""
 PIDS=()
+NAT_ARGS=()
 UNIT_FILE=""
 NAMES=()
 STATES=()
 DETAILS=()
+PROXY_PID=""
+MAIN_PID=""
+MAIN_PORT=""
+SIXTEEN_PID=""
 
 record() { # status name detail
   STATES+=("$1")
@@ -56,6 +69,7 @@ cleanup() {
     done
   fi
   nft delete table inet "$NFT_TABLE" >/dev/null 2>&1 || true
+  nft delete table inet "$GUARD_TABLE" >/dev/null 2>&1 || true
   if [ -n "$UNIT_FILE" ]; then
     systemctl unmask "$(basename "$UNIT_FILE")" >/dev/null 2>&1 || true
     rm -f "$UNIT_FILE"
@@ -64,13 +78,16 @@ cleanup() {
   if [ -n "$WORKDIR" ]; then rm -rf "$WORKDIR"; fi
 }
 trap cleanup EXIT
-trap 'exit 130' INT TERM
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 need_root() {
   [ "$(id -u)" = 0 ] || {
     echo "Запустите от root." >&2
     exit 2
   }
+  local tool
   for tool in nft nc ss ps awk curl; do
     command -v "$tool" >/dev/null 2>&1 || {
       echo "Не найден инструмент: $tool" >&2
@@ -92,12 +109,13 @@ free_port() { # first last -> a port nobody listens on
 
 hex_secret() { head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n'; }
 
-# start_proxy <name> <port> <stats_port> <secret_count> -> pid in PROXY_PID, log in $WORKDIR/<name>.log
+# start_proxy <name> <port> <stats_port> <secret_count> -> pid in PROXY_PID
 start_proxy() {
   local name="$1" port="$2" stats="$3" count="$4" args=() i
   for ((i = 0; i < count; i++)); do args+=(-S "$(hex_secret)"); done
   "$MTPROXY_BIN" -u "$MTPROXY_USER" -p "$stats" -H "$port" "${args[@]}" \
-    --aes-pwd "$AES_PWD" "$MULTI_CONF" -M 1 -C 256 >"$WORKDIR/$name.log" 2>&1 &
+    ${NAT_ARGS[@]+"${NAT_ARGS[@]}"} \
+    --aes-pwd "$AES_PWD" "$MULTI_CONF" -M 1 -C "$MAX_CONN" >"$WORKDIR/$name.log" 2>&1 &
   PROXY_PID=$!
   PIDS+=("$PROXY_PID")
 }
@@ -122,6 +140,36 @@ send_traffic() { # ip port
 
 # ---------------------------------------------------------------------------------- checks
 
+load_nat_args() { # inherit MTPROXY_NAT_ARGS exactly like the real unit does
+  local raw="${MTPROXY_NAT_ARGS:-}"
+  if [ -z "$raw" ] && [ -r "$MTPROXY_ENV" ]; then
+    raw="$(sed -n 's/^MTPROXY_NAT_ARGS=//p' "$MTPROXY_ENV" | head -n 1 | tr -d '"')"
+  fi
+  if [ -n "$raw" ]; then
+    read -r -a NAT_ARGS <<<"$raw"
+    info "NAT-аргументы MTProxy" "унаследованы: ${NAT_ARGS[*]}"
+  fi
+}
+
+# Temporary ports of the throwaway MTProxy processes must not be reachable from outside.
+install_guard() {
+  local ports="2470-2499, 8970-8999"
+  if nft -f - >/dev/null 2>&1 <<EOF
+table inet $GUARD_TABLE {
+	chain guard {
+		type filter hook input priority -10; policy accept;
+		iifname != "lo" tcp dport { $ports } drop
+	}
+}
+EOF
+  then
+    pass "защита временных портов" "таблица $GUARD_TABLE закрывает $ports снаружи"
+  else
+    fail "защита временных портов" "не удалось создать таблицу nft: проверки с MTProxy пропущены"
+    return 1
+  fi
+}
+
 check_prereqs() {
   local missing=""
   [ -x "$MTPROXY_BIN" ] || missing="$missing $MTPROXY_BIN"
@@ -135,7 +183,7 @@ check_prereqs() {
 }
 
 check_1_loopback_backend() {
-  local port stats
+  local port stats out
   port="$(free_port 2470 2489)" || port=""
   stats="$(free_port 8970 8989)" || stats=""
   if [ -z "$port" ] || [ -z "$stats" ]; then
@@ -170,7 +218,7 @@ check_1_loopback_backend() {
 }
 
 check_2_3_nft_counters() {
-  [ -n "${MAIN_PORT:-}" ] || {
+  [ -n "$MAIN_PORT" ] || {
     info "2/3 счётчики nft" "нет рабочего MTProxy из проверки 1"
     return
   }
@@ -219,7 +267,7 @@ EOF
 }
 
 check_4_secret_limit() {
-  local port stats pid
+  local port stats pid p17 s17
   port="$(free_port 2490 2499)" || port=""
   stats="$(free_port 8990 8999)" || stats=""
   if [ -z "$port" ] || [ -z "$stats" ]; then
@@ -235,8 +283,8 @@ check_4_secret_limit() {
   else
     fail "4 процесс с 16 секретами" "не живёт: поставьте secrets_per_process = 15; $(tail -n 3 "$WORKDIR/s16.log" | tr '\n' ' ')"
   fi
-  local p17 s17
-  p17="$(free_port 2480 2489)" && s17="$(free_port 8980 8989)" || return 0
+  p17="$(free_port 2480 2489)" || return 0
+  s17="$(free_port 8980 8989)" || return 0
   start_proxy s17 "$p17" "$s17" 17
   pid="$PROXY_PID"
   sleep 3
@@ -249,10 +297,10 @@ check_4_secret_limit() {
 
 check_8_memory() {
   local one="" sixteen=""
-  [ -n "${MAIN_PID:-}" ] && one="$(ps -o rss= -p "$MAIN_PID" 2>/dev/null | tr -d ' ')"
-  [ -n "${SIXTEEN_PID:-}" ] && sixteen="$(ps -o rss= -p "$SIXTEEN_PID" 2>/dev/null | tr -d ' ')"
+  [ -n "$MAIN_PID" ] && one="$(ps -o rss= -p "$MAIN_PID" 2>/dev/null | tr -d ' ')"
+  [ -n "$SIXTEEN_PID" ] && sixteen="$(ps -o rss= -p "$SIXTEEN_PID" 2>/dev/null | tr -d ' ')"
   if [ -n "$one" ]; then
-    info "8 память на процесс MTProxy" "1 секрет: $((one / 1024)) МиБ${sixteen:+, 16 секретов: $((sixteen / 1024)) МиБ}; для 20 пулов ≈ $((${sixteen:-$one} * 20 / 1024)) МиБ"
+    info "8 память на процесс MTProxy" "1 секрет: $((one / 1024)) МиБ${sixteen:+, 16 секретов: $((sixteen / 1024)) МиБ} (при -C $MAX_CONN, без клиентов); для 20 пулов ≈ $((${sixteen:-$one} * 20 / 1024)) МиБ — нижняя оценка, с подключёнными клиентами память растёт"
   else
     info "8 память на процесс MTProxy" "нет данных"
   fi
@@ -284,6 +332,37 @@ check_nft_missing_table() {
   fi
 }
 
+# caddy validate must work with an unwritable HOME (tgpanel.service runs with ProtectHome).
+check_caddy_validate_unwritable_home() {
+  local caddy=/usr/local/bin/caddy envargs=() f line kv
+  if [ ! -x "$caddy" ]; then
+    info "caddy validate без доступа к HOME" "нет $caddy"
+    return
+  fi
+  for f in /etc/systemd/system/caddy.service.d/*.conf; do
+    [ -f "$f" ] || continue
+    while IFS= read -r line; do
+      kv="${line#Environment=}"
+      kv="${kv//\"/}"
+      envargs+=("$kv")
+    done < <(grep '^Environment=' "$f" || true)
+  done
+  mkdir -p "$WORKDIR/xdg"
+  if env -i PATH=/usr/bin:/bin HOME=/nonexistent-selfcheck ${envargs[@]+"${envargs[@]}"} \
+    "$caddy" validate --config /etc/caddy/Caddyfile --adapter caddyfile >"$WORKDIR/caddy1.log" 2>&1; then
+    pass "caddy validate при недоступном HOME" "работает и без XDG-каталогов"
+  else
+    info "caddy validate при недоступном HOME без XDG" "не работает, нужны XDG_*_HOME: $(tail -n 2 "$WORKDIR/caddy1.log" | tr '\n' ' ' | cut -c1-160)"
+    if env -i PATH=/usr/bin:/bin HOME=/nonexistent-selfcheck XDG_DATA_HOME="$WORKDIR/xdg" \
+      XDG_CONFIG_HOME="$WORKDIR/xdg" ${envargs[@]+"${envargs[@]}"} \
+      "$caddy" validate --config /etc/caddy/Caddyfile --adapter caddyfile >"$WORKDIR/caddy2.log" 2>&1; then
+      pass "caddy validate с XDG_DATA_HOME/XDG_CONFIG_HOME" "работает (так его вызывает tgpanel)"
+    else
+      fail "caddy validate с XDG-каталогами" "$(tail -n 2 "$WORKDIR/caddy2.log" | tr '\n' ' ' | cut -c1-160)"
+    fi
+  fi
+}
+
 check_14_certificate() {
   local domain=""
   [ -r "$ENV_FILE" ] && domain="$(sed -n 's/^TGPANEL_PANEL_DOMAIN=//p' "$ENV_FILE" | head -n 1)"
@@ -291,13 +370,28 @@ check_14_certificate() {
     info "14 сертификат панели" "tgpanel ещё не установлен или нет openssl"
     return
   fi
-  local dates issuer
-  dates="$(echo | openssl s_client -connect "$domain:443" -servername "$domain" 2>/dev/null | openssl x509 -noout -startdate -enddate 2>/dev/null | tr '\n' ' ')"
-  issuer="$(echo | openssl s_client -connect "$domain:443" -servername "$domain" 2>/dev/null | openssl x509 -noout -issuer 2>/dev/null)"
-  if [ -n "$dates" ]; then
-    info "14 сертификат панели" "$issuer; $dates (повторный запуск установщика не должен менять notBefore)"
-  else
+  local cert notbefore notafter issuer previous
+  cert="$(echo | openssl s_client -connect "$domain:443" -servername "$domain" 2>/dev/null |
+    openssl x509 -noout -startdate -enddate -issuer 2>/dev/null || true)"
+  if [ -z "$cert" ]; then
     fail "14 сертификат панели" "TLS-рукопожатие с $domain не удалось"
+    return
+  fi
+  notbefore="$(printf '%s\n' "$cert" | sed -n 's/^notBefore=//p')"
+  notafter="$(printf '%s\n' "$cert" | sed -n 's/^notAfter=//p')"
+  issuer="$(printf '%s\n' "$cert" | sed -n 's/^issuer=//p')"
+  if [ -r "$CERT_STATE" ]; then
+    previous="$(cat "$CERT_STATE")"
+    if [ "$previous" = "$notbefore" ]; then
+      pass "14 сертификат не перевыпускался между запусками" "notBefore=$notbefore; издатель: $issuer; до $notafter"
+    else
+      info "14 сертификат изменился с прошлого запуска" "было notBefore=$previous, стало $notbefore (ожидаемо при продлении; НЕ ожидаемо после повторного запуска установщика)"
+    fi
+  else
+    info "14 сертификат панели" "первый запуск, запомнил notBefore=$notbefore (издатель: $issuer; до $notafter)"
+  fi
+  if mkdir -p "$(dirname "$CERT_STATE")" 2>/dev/null; then
+    (umask 077 && printf '%s' "$notbefore" >"$CERT_STATE")
   fi
 }
 
@@ -305,20 +399,31 @@ print_manual() {
   cat <<'EOF'
 
 Ручные проверки (нужен клиент Telegram или изменение сервера):
+  4   Предел секретов, как он проявился у владельца: создайте пул с 16 пользователями, затем
+      подключите клиент Telegram через секрет №1 и через секрет №16 этого пула. Оба должны
+      работать. Если №16 (или процесс целиком) не работает — поставьте в настройках панели
+      secrets_per_process = 15.
   5   Выключите пользователя в панели -> клиент не подключается; включите -> подключается
       без перезапуска пула (journalctl -u 'tgpanel-mtproxy@*' не показывает рестарта).
   6   Перезапустите relay (systemctl restart tproxy-server) с несколькими подключёнными
       клиентами: засеките время восстановления, проверьте счётчик tproxy_limit_hits_total
       на 127.0.0.1:8081/metrics (упора в burst-лимиты быть не должно).
   7   Откройте ссылку https://t.me/webproxy?server=<хост>&secret=<секрет> и tg://webproxy?...
-      в клиенте: какой формат открывается; результат запишите в настройки/README.
-  9   Искусственный сбой apply: временно испортите шаблон (например, tgpanel apply при
-      недоступном порту) -> панель откатывается, прокси продолжает работать.
+      в клиенте: какой формат открывается; результат запишите в README.
+  9   Искусственный сбой apply (безопасно): создайте в панели тестового пользователя, затем
+        chattr +i /etc/tproxy-server/profiles.json
+      выполните  tgpanel apply  (или создайте ещё одного тестового пользователя) — ожидается
+      ОШИБКА, откат, relay и существующие ссылки продолжают работать; затем
+        chattr -i /etc/tproxy-server/profiles.json
+      и удалите тестовых пользователей. Не оставляйте флаг +i: он блокирует работу панели.
   10  Перезагрузите сервер: tgpanel doctor без ошибок, счётчики не дают ложных всплесков.
   11  tgpanel uninstall возвращает сервер к состоянию pre-install (профили, Caddyfile).
   12  Импорт 15 профилей user_<id>: Telegram ID распознаны, старые ссылки работают,
       трафик считается, у пользователей комментарий «import».
   13  Создайте пользователя: замерьте время от «Создать» до рабочей ссылки.
+  14  Запустите этот скрипт, затем повторно install.sh, затем скрипт ещё раз: notBefore
+      сертификата не должен измениться (скрипт сам сравнивает со значением из
+      /var/lib/tgpanel/selfcheck-cert-notbefore).
 EOF
 }
 
@@ -335,10 +440,9 @@ summary() {
 
 main() {
   need_root
-  WORKDIR="$(mktemp -d "/tmp/${PREFIX}.XXXXXX")"
-  chmod 0755 "$WORKDIR"
-  MAIN_PID="" MAIN_PORT="" SIXTEEN_PID=""
-  if check_prereqs; then
+  WORKDIR="$(mktemp -d "/tmp/${PREFIX}.XXXXXX")" # mktemp -d is 0700
+  if check_prereqs && install_guard; then
+    load_nat_args
     check_1_loopback_backend
     check_2_3_nft_counters
     check_4_secret_limit
@@ -346,6 +450,7 @@ main() {
   fi
   check_mask_regular_unit
   check_nft_missing_table
+  check_caddy_validate_unwritable_home
   check_14_certificate
   print_manual
   summary

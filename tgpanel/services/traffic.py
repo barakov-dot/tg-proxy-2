@@ -311,7 +311,7 @@ class TrafficService:
         counts = {s: 0 for s in UserStatus}
         for r in conn.execute("SELECT status, COUNT(*) AS n FROM users GROUP BY status"):
             counts[UserStatus(r["status"])] = int(r["n"])
-        cutoff = times.to_db(now - repo.ONLINE_FRESHNESS)
+        cutoff = times.to_db(now - cfg.online_freshness(repo.all_settings(conn)))
         online = int(
             conn.execute(
                 "SELECT COUNT(*) FROM counter_state WHERE active_last = 1 AND active_prev = 1"

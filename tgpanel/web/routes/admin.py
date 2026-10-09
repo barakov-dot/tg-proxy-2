@@ -2,10 +2,7 @@
 
 from __future__ import annotations
 
-import posixpath
-import re
-import sqlite3
-from collections.abc import AsyncIterator
+import secrets
 from typing import Any
 
 from fastapi import APIRouter, Depends, Request, Response
@@ -17,22 +14,22 @@ from tgpanel.apply.settings_spec import SPECS
 from tgpanel.db import repo
 from tgpanel.domain.expiry import Term
 from tgpanel.domain.models import CarrierMode, UserStatus
+from tgpanel.services.admin import MAX_TEMPLATE, MESSAGE_KEYS
 from tgpanel.services.api import UserFilter, UserListQuery
-from tgpanel.system.ops import SystemOpsError
 from tgpanel.web.deps import WebContext, safe
+from tgpanel.web.inputs import parse_uint
 from tgpanel.web.routes.common import (
-    KEY_HASH,
-    KEY_VERSION,
     HttpError,
+    PathId,
     auth_of,
     clean,
+    delete_cookie,
     fint,
     fraw,
     fstr,
     get_signer,
     get_web,
     load_form,
-    read_panel_auth,
     redirect,
     render,
     require_auth,
@@ -44,30 +41,7 @@ from tgpanel.web.texts import T
 
 router = APIRouter(dependencies=[Depends(require_auth)])
 
-KEY_BOT_TOKEN = "bot_token"  # noqa: S105 - setting name
-MESSAGE_KEYS = (
-    "msg.link",
-    "msg.welcome",
-    "msg.approved",
-    "msg.rejected",
-    "msg.expiring",
-    "msg.expired",
-    "msg.broadcast",
-)
-MAX_TEMPLATE = 3500
-MIN_PASSWORD = 12
-_TOKEN_RE = re.compile(r"^\d{6,12}:[A-Za-z0-9_-]{30,60}$")
-_SECRET_LIKE = re.compile(r"(?i)(?:dd)?[0-9a-f]{32}")
-CHUNK = 1 << 20
-
-
-async def db_write(web: WebContext, fn: Any) -> str | None:
-    """Run a DB write via the pipeline lock; returns an error text or None."""
-    try:
-        await web.pipeline.db_write(fn)
-    except OperationRejected as exc:
-        return clean(str(exc))
-    return None
+BCAST_TOKEN_TTL_S = 3600
 
 
 # ------------------------------------------------------------------------ requests
@@ -91,7 +65,7 @@ async def requests_page(request: Request) -> Response:
 
 
 @router.post("/requests/{request_id}/approve")
-async def request_approve(request: Request, request_id: int) -> Response:
+async def request_approve(request: Request, request_id: PathId) -> Response:
     web = get_web(request)
     auth = auth_of(request)
     form = await load_form(request)
@@ -115,7 +89,7 @@ async def request_approve(request: Request, request_id: int) -> Response:
 
 
 @router.post("/requests/{request_id}/reject")
-async def request_reject(request: Request, request_id: int) -> Response:
+async def request_reject(request: Request, request_id: PathId) -> Response:
     web = get_web(request)
     auth = auth_of(request)
     res = await safe(web.requests.reject(request_id, auth.actor), "reject")
@@ -149,6 +123,7 @@ async def broadcast_form(request: Request) -> Response:
         template=await _template_default(web),
         audience="active",
         preview=None,
+        form_token="",
         error=None,
     )
 
@@ -168,11 +143,16 @@ async def broadcast_preview(request: Request) -> Response:
             template=template,
             audience="active",
             preview=None,
+            form_token="",
             error=T["broadcast_bad_form"],
         )
     ids = await collect_ids(web, UserListQuery(filter=AUDIENCES[audience]))
     preview = await safe(web.broadcast.preview(template, ids), "broadcast.preview")
     error = None if preview is not None else T["bot_unavailable"]
+    token = get_signer(request).dumps(
+        "bcast",
+        {"n": secrets.token_urlsafe(12), "e": int(web.now().timestamp()) + BCAST_TOKEN_TTL_S},
+    )
     return await render(
         request,
         "broadcast.html",
@@ -180,6 +160,7 @@ async def broadcast_preview(request: Request) -> Response:
         template=template,
         audience=audience,
         preview=preview,
+        form_token=token,
         error=error or (clean(preview.error) if preview and preview.error else None),
     )
 
@@ -193,9 +174,20 @@ async def broadcast_start(request: Request) -> Response:
     template = fraw(form, "template").strip()
     if audience not in AUDIENCES or not template or len(template) > MAX_TEMPLATE:
         return redirect(request, "/broadcast", ("err", T["broadcast_bad_form"]))
+    payload = get_signer(request).loads("bcast", fstr(form, "form_token"))
+    nonce = str(payload.get("n", "")) if payload else ""
+    if (
+        not nonce
+        or int(payload.get("e", 0)) < int(web.now().timestamp())  # type: ignore[union-attr]
+        or nonce in web.used_tokens
+    ):
+        return redirect(request, "/broadcast", ("err", T["broadcast_token_used"]))
     ids = await collect_ids(web, UserListQuery(filter=AUDIENCES[audience]))
     if not ids:
         return redirect(request, "/broadcast", ("err", T["broadcast_nobody"]))
+    if len(web.used_tokens) > 2000:
+        web.used_tokens.clear()
+    web.used_tokens.add(nonce)  # spent: a double click or a reload cannot send twice
     bid = await safe(web.broadcast.start(template, ids, auth.actor), "broadcast.start")
     if bid is None:
         return redirect(request, "/broadcast", ("err", T["bot_unavailable"]))
@@ -203,7 +195,7 @@ async def broadcast_start(request: Request) -> Response:
 
 
 @router.get("/broadcast/{broadcast_id}")
-async def broadcast_report(request: Request, broadcast_id: int) -> Response:
+async def broadcast_report(request: Request, broadcast_id: PathId) -> Response:
     web = get_web(request)
     report = await safe(web.broadcast.report(broadcast_id), "broadcast.report")
     if report is None:
@@ -212,7 +204,7 @@ async def broadcast_report(request: Request, broadcast_id: int) -> Response:
 
 
 @router.get("/broadcast/{broadcast_id}/report")
-async def broadcast_report_fragment(request: Request, broadcast_id: int) -> Response:
+async def broadcast_report_fragment(request: Request, broadcast_id: PathId) -> Response:
     web = get_web(request)
     report = await safe(web.broadcast.report(broadcast_id), "broadcast.report")
     if report is None:
@@ -257,14 +249,13 @@ async def _settings_context(
                 "error": (errors or {}).get(key),
             }
         )
-    all_stored = await web.app.db.run(repo.all_settings)
-    admins = await web.app.db.run(repo.list_admins)
+    templates = await web.admin.templates()
     return {
         "fields": fields,
-        "admins": admins,
-        "token_set": bool(all_stored.get(KEY_BOT_TOKEN)),
+        "admins": await web.admin.list_admins(),
+        "token_set_at": await web.admin.bot_token_set_at(),
         "templates": [
-            {"key": k, "label": T[f"tpl_{k.split('.', 1)[1]}"], "value": all_stored.get(k, "")}
+            {"key": k, "label": T[f"tpl_{k.split('.', 1)[1]}"], "value": templates[k]}
             for k in MESSAGE_KEYS
         ],
     }
@@ -286,6 +277,9 @@ async def settings_save(request: Request) -> Response:
     errors: dict[str, str] = {}
     changed: dict[str, str] = {}
     for key, raw in submitted.items():
+        if FIELD_TYPES.get(key) == "number" and parse_uint(raw, max_digits=9) is None:
+            errors[key] = T["bad_number"]
+            continue
         try:
             new = web.app.settings.validate({key: raw})[key]
             old = web.app.settings.validate({key: str(current[key])})[key]
@@ -319,75 +313,37 @@ async def settings_admins(request: Request) -> Response:
     tg_id = fint(form, "tg_id")
     if tg_id is None or not 0 < tg_id <= 2**53 or action not in ("add", "remove"):
         return redirect(request, "/settings", ("err", T["bad_number"]))
-
-    def write(conn: sqlite3.Connection) -> None:
+    try:
         if action == "add":
-            repo.add_admin(conn, tg_id, web.now())
+            await web.admin.add_admin(tg_id, auth.actor)
         else:
-            repo.remove_admin(conn, tg_id)
-        repo.add_audit(conn, web.now(), auth.actor, f"admin.{action}", f"tg:{tg_id}", "")
-
-    error = await db_write(web, write)
-    return redirect(request, "/settings", ("err", error) if error else ("ok", T["saved"]))
+            await web.admin.remove_admin(tg_id, auth.actor)
+    except OperationRejected as exc:
+        return redirect(request, "/settings", ("err", clean(str(exc))))
+    return redirect(request, "/settings", ("ok", T["saved"]))
 
 
 @router.post("/settings/bot-token")
 async def settings_bot_token(request: Request) -> Response:
     web = get_web(request)
-    auth = auth_of(request)
     form = await load_form(request)
-    token = fstr(form, "token")
-    if not _TOKEN_RE.match(token):
-        return redirect(request, "/settings", ("err", T["token_bad"]))
-
-    def write(conn: sqlite3.Connection) -> None:
-        repo.set_setting(conn, KEY_BOT_TOKEN, token)
-        repo.add_audit(conn, web.now(), auth.actor, "settings.set", KEY_BOT_TOKEN, "***")
-
-    error = await db_write(web, write)
-    return redirect(request, "/settings", ("err", error) if error else ("ok", T["token_saved"]))
+    try:
+        await web.admin.set_bot_token(fstr(form, "token"), auth_of(request).actor)
+    except OperationRejected as exc:
+        return redirect(request, "/settings", ("err", clean(str(exc))))
+    return redirect(request, "/settings", ("ok", T["token_saved"]))
 
 
 @router.post("/settings/templates")
 async def settings_templates(request: Request) -> Response:
     web = get_web(request)
-    auth = auth_of(request)
     form = await load_form(request)
-    values: dict[str, str] = {}
-    for key in MESSAGE_KEYS:
-        text = fraw(form, key).strip()
-        if len(text) > MAX_TEMPLATE or _SECRET_LIKE.search(text):
-            return redirect(request, "/settings", ("err", T["template_bad"]))
-        values[key] = text
-
-    def write(conn: sqlite3.Connection) -> None:
-        for key, text in values.items():
-            if text:
-                repo.set_setting(conn, key, text)
-            else:
-                repo.delete_setting(conn, key)
-        repo.add_audit(conn, web.now(), auth.actor, "settings.templates", "", "")
-
-    error = await db_write(web, write)
-    return redirect(request, "/settings", ("err", error) if error else ("ok", T["saved"]))
-
-
-async def _bump_version(web: WebContext, actor: str, new_hash: str | None, action: str) -> int:
-    holder: list[int] = []
-
-    def write(conn: sqlite3.Connection) -> None:
-        cfg = read_panel_auth(conn)
-        version = cfg.version + 1
-        holder.append(version)
-        repo.set_setting(conn, KEY_VERSION, str(version))
-        if new_hash is not None:
-            repo.set_setting(conn, KEY_HASH, new_hash)
-        repo.add_audit(conn, web.now(), actor, action, "", "")
-
-    error = await db_write(web, write)
-    if error:
-        raise HttpError(503, error)
-    return holder[0]
+    values = {key: fraw(form, key) for key in MESSAGE_KEYS}
+    try:
+        await web.admin.set_templates(values, auth_of(request).actor)
+    except OperationRejected as exc:
+        return redirect(request, "/settings", ("err", clean(str(exc))))
+    return redirect(request, "/settings", ("ok", T["saved"]))
 
 
 @router.post("/settings/password")
@@ -395,23 +351,14 @@ async def settings_password(request: Request) -> Response:
     web = get_web(request)
     auth = auth_of(request)
     form = await load_form(request)
-    current = fraw(form, "current")
-    new = fraw(form, "new")
-    again = fraw(form, "again")
-    cfg = await web.app.db.run(read_panel_auth)
     try:
-        web.password_hasher.verify(cfg.password_hash, current)
-    except Exception:  # wrong password or bad stored hash
-        return redirect(request, "/settings", ("err", T["password_wrong"]))
-    if len(new) < MIN_PASSWORD or len(new) > 1024:
-        return redirect(request, "/settings", ("err", T["password_short"].format(n=MIN_PASSWORD)))
-    if new != again:
-        return redirect(request, "/settings", ("err", T["password_mismatch"]))
-    version = await _bump_version(
-        web, auth.actor, web.password_hasher.hash(new), "web.password_change"
-    )
+        version = await web.admin.change_password(
+            fraw(form, "current"), fraw(form, "new"), fraw(form, "again"), auth.actor
+        )
+    except OperationRejected as exc:
+        return redirect(request, "/settings", ("err", clean(str(exc))))
     signer = get_signer(request)
-    session = signer.make_session(cfg.login, version, int(web.now().timestamp()))
+    session = signer.make_session(auth.session.login, version, int(web.now().timestamp()))
     response = redirect(request, "/settings", ("ok", T["password_changed"]))
     set_cookie(response, request, SESSION_COOKIE, signer.dump_session(session), SESSION_TTL_S)
     return response
@@ -420,9 +367,10 @@ async def settings_password(request: Request) -> Response:
 @router.post("/settings/logout-all")
 async def settings_logout_all(request: Request) -> Response:
     web = get_web(request)
-    await _bump_version(web, auth_of(request).actor, None, "web.logout_all")
-    from tgpanel.web.routes.common import delete_cookie
-
+    try:
+        await web.admin.logout_all(auth_of(request).actor)
+    except OperationRejected as exc:
+        raise HttpError(503, clean(str(exc))) from None
     response = redirect(request, "/login")
     delete_cookie(response, request, SESSION_COOKIE)
     return response
@@ -434,59 +382,50 @@ async def settings_logout_all(request: Request) -> Response:
 @router.get("/backups")
 async def backups_page(request: Request) -> Response:
     web = get_web(request)
-    items = await web.app.db.run(repo.list_backups)
-    return await render(request, "backups.html", page="backups", items=items)
+    return await render(request, "backups.html", page="backups", items=await web.backups.list())
 
 
 @router.post("/backups/create")
 async def backups_create(request: Request) -> Response:
     web = get_web(request)
-    auth = auth_of(request)
     try:
-        await web.pipeline.create_backup("manual", auth.actor, full=True)
+        await web.backups.create(auth_of(request).actor)
     except (BackupError, OperationRejected) as exc:
         return redirect(request, "/backups", ("err", clean(str(exc))))
     return redirect(request, "/backups", ("ok", T["backup_created"]))
 
 
-async def _stream(data: bytes) -> AsyncIterator[bytes]:
-    for i in range(0, len(data), CHUNK):
-        yield data[i : i + CHUNK]
-
-
 @router.get("/backups/{backup_id}/download")
-async def backup_download(request: Request, backup_id: int) -> Response:
+async def backup_download(request: Request, backup_id: PathId) -> Response:
     web = get_web(request)
-    rec = await web.app.db.run(repo.get_backup, backup_id)
-    base = web.pipeline.config.paths.backups_dir.rstrip("/") + "/"
-    if rec is None or posixpath.normpath(rec.path) != rec.path or not rec.path.startswith(base):
-        raise HttpError(404, T["not_found"])
     try:
-        data = await web.pipeline.ops.read_file(rec.path)
-    except SystemOpsError:
-        raise HttpError(404, T["not_found"]) from None
-    filename = re.sub(r"[^A-Za-z0-9._-]", "_", posixpath.basename(rec.path))
+        download = await web.backups.open_download(backup_id, auth_of(request).actor)
+    except BackupError as exc:
+        raise HttpError(413, clean(str(exc))) from None
+    except OperationRejected as exc:
+        raise HttpError(503, clean(str(exc))) from None
+    if download is None:
+        raise HttpError(404, T["not_found"])
     return StreamingResponse(
-        _stream(data),
+        download.chunks,
         media_type="application/gzip",
         headers={
-            "Content-Disposition": f'attachment; filename="{filename}"',
-            "Content-Length": str(len(data)),
+            "Content-Disposition": f'attachment; filename="{download.filename}"',
+            "Content-Length": str(download.size),
         },
     )
 
 
 @router.post("/backups/{backup_id}/restore")
-async def backup_restore(request: Request, backup_id: int) -> Response:
+async def backup_restore(request: Request, backup_id: PathId) -> Response:
     web = get_web(request)
-    auth = auth_of(request)
     form = await load_form(request)
     if fstr(form, "confirm").lower() != T["restore_word"]:
         return redirect(
             request, "/backups", ("err", T["restore_confirm_bad"].format(word=T["restore_word"]))
         )
     try:
-        outcome = await web.pipeline.restore_backup(backup_id, auth.actor)
+        outcome = await web.backups.restore(backup_id, auth_of(request).actor)
     except (BackupError, OperationRejected) as exc:
         return redirect(request, "/backups", ("err", clean(str(exc))))
     if not outcome.ok:
@@ -503,10 +442,9 @@ PAGE_SIZE = 100
 async def audit_page(request: Request) -> Response:
     web = get_web(request)
     tab = request.query_params.get("tab", "audit")
-    raw_page = request.query_params.get("page", "1")
-    if tab not in ("audit", "apply") or not raw_page.isdigit() or not 1 <= int(raw_page) <= 100000:
+    page = parse_uint(request.query_params.get("page", "1"), max_digits=6) or 0
+    if tab not in ("audit", "apply") or not 1 <= page <= 100000:
         raise HttpError(400, T["bad_filter"])
-    page = int(raw_page)
     offset = (page - 1) * PAGE_SIZE
     entries: list[Any]
     if tab == "audit":

@@ -143,12 +143,22 @@ def test_uninstall_restores_preinstall_and_keeps_caddy_storage(installed: Ops) -
     )
     ops.fake.put_file(PROFILES, json.dumps({"profiles": []}), mode=0o400, group="tproxy")
     ops.fake.set_active("mtproxy", False)
-    ops.answers = ["y"]
+    cfg = json.loads(ops.fake.get_text("/etc/tproxy-server/config.json"))
+    cfg["limits"] = {"max_profiles": 99}
+    cfg["added_later"] = "keep-me"
+    ops.fake.put_file("/etc/tproxy-server/config.json", json.dumps(cfg), mode=0o640, group="tproxy")
+    ops.answers = ["y", "y"]
     code, out = ops("uninstall")
     assert code == 0, out
     assert json.loads(ops.fake.get_text(PROFILES)) == original_profiles
     assert not has_panel_block(ops.fake.get_text(CADDYFILE))
     assert "mtproxy" in ops.fake.active
+    restored_cfg = json.loads(ops.fake.get_text("/etc/tproxy-server/config.json"))
+    assert restored_cfg["added_later"] == "keep-me"  # only limits come from the archive
+    assert restored_cfg.get("limits") != {"max_profiles": 99}
+    assert "Что изменится в profiles.json" in out and "исчезнут профили" in out
+    assert not any(p.endswith("-pre-install.tar.gz") for p in ops.fake.files)
+    assert any(p.endswith("-pre-install-used.tar.gz") for p in ops.fake.files)
     for path in (FW_UNIT, PANEL_UNIT, "/etc/systemd/system/tgpanel-mtproxy@.service"):
         assert path not in ops.fake.files
     assert not ops.fake.nft_sets
@@ -166,8 +176,54 @@ def test_uninstall_purge_removes_data_trees_but_not_backups_or_caddy(installed: 
         "/etc/tgpanel",
         "/var/lib/tgpanel",
     }
-    assert any(p.endswith("-pre-install.tar.gz") for p in installed.fake.files)
+    assert any(p.endswith("-pre-install-used.tar.gz") for p in installed.fake.files)
     assert "/var/lib/caddy/.local/share/caddy/keep.txt" in installed.fake.files
+
+
+def test_uninstall_diff_declined_changes_nothing(installed: Ops) -> None:
+    ops = installed
+    before = ops.fake.get_text(PROFILES)
+    ops.answers = ["y", "n"]
+    code, out = ops("uninstall")
+    assert code == 1 and "Отменено" in out
+    assert ops.fake.get_text(PROFILES) == before
+    assert has_panel_block(ops.fake.get_text(CADDYFILE))
+    assert ("enable-now", "tgpanel") in ops.fake.systemctl_calls()
+    assert any(p.endswith("-pre-install.tar.gz") for p in ops.fake.files)
+
+
+def _drop_archive(ops: Ops) -> None:
+    for p in [p for p in ops.fake.files if "pre-install" in p]:
+        del ops.fake.files[p]
+
+
+def test_uninstall_without_archive_refuses_without_force(installed: Ops) -> None:
+    ops = installed
+    _drop_archive(ops)
+    before = {p: f.data for p, f in ops.fake.files.items() if not p.startswith("/var/backups")}
+    code, out = ops("uninstall", "--yes")
+    assert code == 1 and "--force" in out
+    assert {
+        p: f.data for p, f in ops.fake.files.items() if not p.startswith("/var/backups")
+    } == before
+    assert ops.fake.systemctl_calls("disable-now", "tgpanel") == []
+
+
+def test_uninstall_force_rebuilds_profiles_through_legacy(installed: Ops) -> None:
+    from tests.ops.test_import_helpers import import_two_and_create_one
+
+    ops = installed
+    import_two_and_create_one(ops)
+    _drop_archive(ops)
+    code, out = ops("uninstall", "--force", "--yes")
+    assert code == 0, out
+    profiles = json.loads(ops.fake.get_text(PROFILES))["profiles"]
+    assert profiles
+    assert all(p["backend"] == "127.0.0.1:2398" for p in profiles)
+    assert not any(p["name"].startswith("u") and p["name"][1:].isdigit() for p in profiles)
+    assert "созданные уже в панели: 1" in out
+    assert "mtproxy" in ops.fake.active
+    assert not has_panel_block(ops.fake.get_text(CADDYFILE))
 
 
 def test_uninstall_declined(installed: Ops) -> None:
@@ -209,6 +265,20 @@ def test_update_success(installed: Ops) -> None:
     assert installed.fake.restart_count("tgpanel") == 1
     assert installed.fake.files["/var/lib/tgpanel/ref"].data == b"main\n"
     assert any("pre-update" in p for p in installed.fake.files)
+
+
+def test_update_auto_ref_picks_latest_tag(installed: Ops) -> None:
+    installed.tools.latest_tag = "v1.2.3"
+    installed.tools.refs["v1.2.3"] = "d" * 40
+    code, out = installed("update")
+    assert code == 0, out
+    assert "v1.2.3" in out and installed.tools.head == "d" * 40
+    assert installed.fake.files["/var/lib/tgpanel/ref"].data == b"auto\n"
+
+
+def test_update_auto_ref_without_tags_warns_about_branch(installed: Ops) -> None:
+    code, out = installed("update")
+    assert code == 0 and "движущаяся ветка main" in out
 
 
 def test_update_same_commit_is_noop(installed: Ops) -> None:
@@ -262,7 +332,14 @@ def test_reset_password_prints_once_and_stores_hash(installed: Ops) -> None:
     finally:
         conn.close()
     assert password not in audit
+    conn = sqlite3.connect(installed.db)
+    try:
+        v1 = conn.execute("SELECT value FROM settings WHERE key='panel_session_version'").fetchone()
+    finally:
+        conn.close()
+    assert v1 is not None and v1[0] == "1"
     _, out2 = installed("reset-password")
+    assert settings(installed)["panel_session_version"] == "2"
     assert password not in out2
 
 
@@ -271,13 +348,14 @@ def test_bootstrap_keeps_existing_credentials(ops: Ops) -> None:
 
     os.environ["TGPANEL_BOOTSTRAP_PASSWORD"] = "first-password-123"
     try:
-        _, out = ops("bootstrap", "--domain", DOMAIN, "--login", "boss", "--admin-id", "7")
+        _, out = ops("bootstrap", f"--domain={DOMAIN}", "--login=boss", "--admin-id=7")
         first = settings(ops)["panel_password_hash"]
         os.environ["TGPANEL_BOOTSTRAP_PASSWORD"] = "second-password-456"
-        _, out2 = ops("bootstrap", "--domain", DOMAIN, "--login", "other", "--admin-id", "7")
+        _, out2 = ops("bootstrap", f"--domain={DOMAIN}", "--login=other", "--admin-id=7")
     finally:
         del os.environ["TGPANEL_BOOTSTRAP_PASSWORD"]
-    assert "credentials-created" in out and "credentials-kept" in out2
+    assert "credentials-created" in out
+    assert "credentials-kept" in out2
     s = settings(ops)
     assert s["panel_password_hash"] == first and s["panel_login"] == "boss"
     assert s["panel_hostname"] == DOMAIN and s["proxy_hostname"] == "proxy.example.com"
@@ -297,3 +375,53 @@ def test_pre_install_backup_is_created_once(ops: Ops) -> None:
     names = [p for p in ops.fake.files if p.endswith("-pre-install.tar.gz")]
     assert len(names) == 1
     assert ops.fake.files[names[0]].mode == 0o600
+
+
+def test_bootstrap_does_not_readd_removed_admin(ops: Ops) -> None:
+    ops("bootstrap", f"--domain={DOMAIN}", "--admin-id=7")
+    conn = sqlite3.connect(ops.db)
+    conn.execute("DELETE FROM admins")
+    conn.commit()
+    conn.close()
+    ops("bootstrap", f"--domain={DOMAIN}", "--admin-id=7")
+    conn = sqlite3.connect(ops.db)
+    try:
+        assert conn.execute("SELECT COUNT(*) FROM admins").fetchone()[0] == 0
+    finally:
+        conn.close()
+
+
+# ------------------------------------------------------------------- doctor details
+
+
+def test_doctor_guard_chain_missing_fails(installed: Ops) -> None:
+    installed.tools.chains.discard(("tgpanel", "guard"))
+    code, out = installed("doctor")
+    assert code == 1 and "Цепочка nft guard" in out and "доступны снаружи" in out
+
+
+def test_doctor_aaaa_matching_local_ipv6_is_fine_and_mapped_ignored(installed: Ops) -> None:
+    ip = installed.fake.public_ip or ""
+    installed.tools.ipv6 = ["2001:db8::5"]
+    installed.fake.set_dns(DOMAIN, a=[ip], aaaa=["2001:db8::5", "::ffff:203.0.113.10"])
+    _, out = installed("doctor")
+    assert "DNS домена панели: A →" in out
+    installed.fake.set_dns(DOMAIN, a=[ip], aaaa=["2001:db8::99"])
+    _, out = installed("doctor")
+    assert "AAAA-запись (2001:db8::99)" in out
+
+
+def test_caddy_env_honours_environment_file(installed: Ops) -> None:
+    import asyncio
+
+    from tests.ops.conftest import FAST
+    from tgpanel.doctor import read_caddy_env
+
+    installed.fake.put_file(
+        "/etc/systemd/system/caddy.service.d/extra.conf",
+        "[Service]\nEnvironmentFile=-/etc/caddy/extra.env\n",
+    )
+    installed.fake.put_file("/etc/caddy/extra.env", "EXTRA_VAR=from-file\n")
+    env = asyncio.run(read_caddy_env(installed.fake, FAST))
+    assert env["EXTRA_VAR"] == "from-file"
+    assert env["TPROXY_HOSTNAME"] == "proxy.example.com"

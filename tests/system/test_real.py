@@ -266,3 +266,12 @@ async def test_resolve_localhost_and_bad_host() -> None:
     assert "127.0.0.1" in a
     with pytest.raises(SystemOpsError):
         await ops.resolve("a b")
+
+
+async def test_caddy_validate_sets_throwaway_xdg_dirs(tmp_path: Path) -> None:
+    script = tmp_path / "fakecaddy"
+    script.write_text('#!/bin/sh\necho "$XDG_DATA_HOME $XDG_CONFIG_HOME"\n')
+    script.chmod(0o755)
+    ops = RealSystemOps(caddy_bin=str(script))
+    res = await ops.caddy_validate("/etc/caddy/Caddyfile", {})
+    assert res.output == "/run/tgpanel/caddy-validate /run/tgpanel/caddy-validate"

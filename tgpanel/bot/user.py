@@ -66,8 +66,12 @@ async def cmd_start(message: Message, deps: BotDeps, state: FSMContext) -> None:
         await message.answer(texts.REQUEST_PENDING + suffix)
         return
     open_mode = await deps.requests.issuance_mode() == "open"
+    default = texts.START_NO_PROFILE_OPEN if open_mode else texts.DEFAULT_WELCOME
+    welcome = await deps.templates.render(
+        "msg.welcome", default, {"name": message.from_user.full_name}
+    )
     await message.answer(
-        (texts.START_NO_PROFILE_OPEN if open_mode else texts.START_NO_PROFILE) + suffix,
+        welcome + suffix,
         reply_markup=keyboards.user_start(can_request=True, has_link=False),
     )
 
@@ -87,13 +91,20 @@ async def cb_my_link(cb: CallbackQuery, deps: BotDeps, bot: Bot) -> None:
 
 
 async def deliver_outcome(
-    bot: Bot, deps: BotDeps, tg_id: int, out: RequestOutcome, intro: str
+    bot: Bot,
+    deps: BotDeps,
+    tg_id: int,
+    out: RequestOutcome,
+    intro: str = "",
+    *,
+    key: str = "msg.link",
+    default: str = texts.DEFAULT_LINK,
 ) -> None:
     """Send the freshly issued link to the requester (only if the apply succeeded)."""
     if out.user is None or out.link is None:
         await bot.send_message(tg_id, texts.LINK_UNAVAILABLE)
         return
-    await send_link(bot, deps, tg_id, out.user, intro)
+    await send_link(bot, deps, tg_id, out.user, intro, key=key, default=default)
 
 
 @router.callback_query(F.data == "req")

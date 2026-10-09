@@ -15,7 +15,7 @@ from tgpanel.db import repo
 from tgpanel.domain.models import UserRecord
 from tgpanel.services.api import NewUser
 from tgpanel.services.broadcast import BroadcastService
-from tgpanel.services.notifier import make_on_failure
+from tgpanel.services.notifier import Messenger, RateLimiter, make_on_failure
 from tgpanel.services.requests import RequestService
 
 ADMIN = 1
@@ -60,6 +60,12 @@ async def env(svc: Svc) -> AsyncIterator[Env]:  # noqa: F811
     sender = FakeSender()
     notifier = FakeNotifier()
     ctx.pipeline.on_failure = make_on_failure(notifier)
+    messenger = Messenger(
+        sender,
+        ctx.pipeline,
+        limiter=RateLimiter(20, clock=sender.time.monotonic, sleep=sender.time.sleep),
+        sleep=sender.time.sleep,
+    )
     deps = BotDeps(
         users=ctx.users,
         settings=ctx.settings,
@@ -71,11 +77,11 @@ async def env(svc: Svc) -> AsyncIterator[Env]:  # noqa: F811
             ctx.db,
             ctx.users,
             sender,
-            monotonic=sender.time.monotonic,
-            sleep=sender.time.sleep,
+            messenger=messenger,
         ),
         traffic=FakeTraffic(),
         sender=sender,
+        messenger=messenger,
         throttle_interval=0.0,
     )
     session = MockSession()

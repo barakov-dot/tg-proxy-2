@@ -426,6 +426,9 @@ def test_s8_chain_failure_returns_an_invalid_marker(monkeypatch: pytest.MonkeyPa
         r"(a)\1",
         r"(?P<n>a)(?P=n)",
         r"(\d+)(?(1)a|b)",
+        r"^(a|aa)+(\d+)$",
+        r"^(\w|\d)+(1)",
+        r"^(a?){30}(1)",
     ],
 )
 def test_s9_dangerous_patterns_are_rejected(pattern: str) -> None:
@@ -437,7 +440,7 @@ def test_s9_dangerous_patterns_are_rejected(pattern: str) -> None:
 
 
 @pytest.mark.parametrize(
-    "pattern", [r"^user_(\d{5,15})$", r"^u(?:ser)?_(\d+)$", r"^id-([0-9]{3,})$"]
+    "pattern", [r"^user_(\d{5,15})$", r"^u_(\d+)$", r"^id-(\d{3})$", r"^a\.b(\d{1,4})-x$"]
 )
 def test_s9_ordinary_patterns_still_work(pattern: str) -> None:
     assert check_id_regex_safety(pattern) is None
@@ -462,7 +465,7 @@ async def test_s9_importer_blocks_an_unsafe_regex(env: Env) -> None:
         + b'", "backend": "127.0.0.1:2398"}]}'
     )
     prev = await Importer(env.pipeline).preview(id_regex=r"^(\d+)+$")
-    assert prev.blocked and any("nested" in e for e in prev.errors)
+    assert prev.blocked and any("допускает только вид" in e for e in prev.errors)
 
 
 # ===================================================================================== nits
@@ -523,3 +526,14 @@ async def test_nit_sensitive_settings_are_not_audited(
 
 
 _ = add_users
+
+
+def test_w6_restricted_regex_grammar_and_timing() -> None:
+    started = time.monotonic()
+    for bad in (r"^(a|aa)+(\d+)$", r"^(\w|\d)+(1)", r"^(a?){30}(1)", r"^user_(\d{9,2})$"):
+        assert check_id_regex_safety(bad) is not None
+        profile = SourceProfile("a" * 40 + "!", "a" * 32, None, "127.0.0.1:2398")
+        plan = plan_import([profile], id_regex=bad)
+        assert plan.errors
+    assert check_id_regex_safety(r"^user_(\d{5,15})$") is None
+    assert time.monotonic() - started < 1.0

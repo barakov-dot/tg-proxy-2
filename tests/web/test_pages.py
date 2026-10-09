@@ -8,6 +8,7 @@ from collections.abc import Callable
 from tests.web.conftest import ROOT, Web
 from tgpanel.db import repo
 from tgpanel.domain.models import CarrierMode, UserStatus
+from tgpanel.services.dashboard import DashboardService
 from tgpanel.services.requests import RequestService
 from tgpanel.services.traffic import TrafficService
 from tgpanel.web.adapters import RequestsAdapter, TrafficAdapter
@@ -46,7 +47,7 @@ async def test_user_card_actions(aw: Web) -> None:
 
     r = await aw.post(
         base + "/meta",
-        {"name": "alice2", "tg_id": "555", "tg_username": "@al", "comment": "заметка\nвторая"},
+        {"name": "alice2", "tg_id": "555", "tg_username": "@alice_x", "comment": "заметка\nвторая"},
     )
     assert "Сохранено" in await flash_text(aw, r)
     user = await aw.ctx.users.get(uid)
@@ -54,7 +55,7 @@ async def test_user_card_actions(aw: Web) -> None:
         user and user.name == "alice2" and user.tg_id == 555 and user.comment == "заметка\nвторая"
     )
     extra = aw.ctx.db.call(repo.get_user_extra, uid)
-    assert extra and extra.tg_username == "al"
+    assert extra and extra.tg_username == "alice_x"
 
     await aw.post(base + "/action", {"action": "disable"})
     assert (await aw.ctx.users.get(uid)).status is UserStatus.DISABLED  # type: ignore[union-attr]
@@ -102,7 +103,8 @@ async def test_traffic_json_presets_and_errors(aw: Web) -> None:
         data = r.json()
         assert r.status_code == 200 and data["granularity"] == "hour"
         assert data["total_up"] == 15 and len(data["points"]) == 2 and len(data["points"][0]) == 3
-    assert aw.traffic.calls[-1][1] is None  # "all" has no lower bound
+    extra = aw.ctx.db.call(repo.get_user_extra, uid)
+    assert extra and aw.traffic.calls[-1][1] == extra.created_at  # "all" starts at creation
     assert (await aw.client.get(aw.u(f"/users/{uid}/traffic.json?preset=bad"))).status_code == 400
     assert (await aw.client.get(aw.u("/users/99/traffic.json"))).status_code == 404
     aw.traffic.fail = True
@@ -121,7 +123,10 @@ async def test_qr_is_svg_and_has_no_inline_style(aw: Web) -> None:
 async def test_real_traffic_adapter_and_requests_adapter(aw: Web) -> None:
     (uid,) = await aw.create_users("alice")
     aw.ctx.db.call(repo.add_traffic, "day", uid, aw.clock.now, bytes_up=100, bytes_down=50)
-    aw.web.traffic = TrafficAdapter(TrafficService(aw.ctx.db, aw.clock), aw.ctx.pipeline.ops)
+    traffic = TrafficService(aw.ctx.db, aw.clock)
+    aw.web.traffic = TrafficAdapter(
+        traffic, DashboardService(traffic, aw.ctx.pipeline.ops, aw.ctx.db)
+    )
     r = await aw.client.get(aw.u(f"/users/{uid}/traffic.json?preset=7d"))
     assert r.status_code == 200 and r.json()["total_up"] == 100
     assert r.json()["granularity"] in ("hour", "day", "minute")
@@ -154,13 +159,23 @@ async def test_broadcast_flow(aw: Web) -> None:
     for i in ids:
         aw.ctx.db.call(repo.update_user, i, bot_started=True)
     r = await aw.post("/broadcast/preview", {"audience": "active", "template": "Привет {name}"})
+    prev_text = r.text
     assert r.status_code == 200 and "Пример: Привет" in r.text and "Выбрано: 2" in r.text
     assert (
         await aw.post("/broadcast/preview", {"audience": "x", "template": "t"})
     ).status_code == 422
-    r = await aw.post("/broadcast/start", {"audience": "all", "template": "Привет"})
+    token = re.search(r'name="form_token" value="([^"]+)"', prev_text)
+    assert token
+    form = {"audience": "all", "template": "Привет", "form_token": token.group(1)}
+    r = await aw.post("/broadcast/start", form)
     assert r.headers["location"] == ROOT + "/broadcast/7"
     assert aw.broadcast.started == [("Привет", ids)]
+    # the token is one-time: a repeated submit does not send a second broadcast
+    again = await aw.post("/broadcast/start", form)
+    assert "Форма устарела" in await flash_text(aw, again)
+    assert len(aw.broadcast.started) == 1
+    no_token = await aw.post("/broadcast/start", {"audience": "all", "template": "x"})
+    assert "Форма устарела" in await flash_text(aw, no_token)
     rep = await aw.client.get(aw.u("/broadcast/7"))
     assert rep.status_code == 200 and "отправлено: 2" in rep.text
     assert (await aw.client.get(aw.u("/broadcast/8"))).status_code == 404
@@ -215,8 +230,12 @@ async def test_admins_and_bot_token_are_write_only(aw: Web) -> None:
     assert "неверный формат" in await flash_text(
         aw, await aw.post("/settings/bot-token", {"token": "bad"})
     )
+    assert aw.env_writes == []
     await aw.post("/settings/bot-token", {"token": token})
-    assert aw.ctx.db.call(repo.get_setting, "bot_token") == token
+    assert aw.env_writes == [("TGPANEL_BOT_TOKEN", token)]
+    assert aw.ctx.db.call(repo.get_setting, "bot_token") is None  # never stored in the DB
+    stored = "\n".join(f"{k}={v}" for k, v in aw.ctx.db.call(repo.all_settings).items())
+    assert token not in stored
     html = (await aw.client.get(aw.u("/settings"))).text
     assert token not in html and "Токен задан" in html
     audit = "\n".join(a.details for a in aw.ctx.db.call(repo.list_audit, limit=100))

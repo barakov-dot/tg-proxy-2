@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 
 from aiogram import Bot
@@ -21,9 +22,28 @@ class AiogramSender:
 
     def __init__(self, bot: Bot | None = None) -> None:
         self._bot = bot
+        self._ready = asyncio.Event()
+        if bot is not None:
+            self._ready.set()
+
+    @property
+    def is_bound(self) -> bool:
+        return self._bot is not None
 
     def bind(self, bot: Bot | None) -> None:
         self._bot = bot
+        if bot is None:
+            self._ready.clear()
+        else:
+            self._ready.set()
+
+    async def wait_ready(self, wait_s: float) -> bool:
+        """True as soon as a Bot is bound (False after ``wait_s`` seconds)."""
+        try:
+            await asyncio.wait_for(self._ready.wait(), wait_s)
+        except TimeoutError:
+            return False
+        return True
 
     async def send_message(
         self, chat_id: int, text: str, *, button: LinkButton | None = None, html: bool = True

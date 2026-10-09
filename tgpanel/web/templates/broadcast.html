@@ -13,6 +13,7 @@
   <p class="hint">{{ t.broadcast_placeholders }}</p>
   <button type="submit">{{ t.preview }}</button>
   {% if preview %}
+  <input type="hidden" name="form_token" value="{{ form_token }}">
   <div class="alert ok">
     <p>{{ t.broadcast_recipients }}: {{ preview.recipients }}; {{ t.broadcast_sendable }}: {{ preview.sendable }}; {{ t.broadcast_skipped }}: {{ preview.skipped }}</p>
     <pre class="sample">{{ preview.sample }}</pre>

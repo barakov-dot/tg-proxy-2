@@ -5,13 +5,10 @@ from __future__ import annotations
 import hmac
 import logging
 import secrets
-import sqlite3
 
-from argon2.exceptions import InvalidHashError, VerificationError, VerifyMismatchError
 from fastapi import APIRouter, Depends, Request, Response
 
 from tgpanel.apply.errors import OperationRejected
-from tgpanel.db import repo
 from tgpanel.web.deps import WebContext
 from tgpanel.web.routes.common import (
     client_ip,
@@ -33,34 +30,40 @@ from tgpanel.web.texts import T
 router = APIRouter()
 log = logging.getLogger("tgpanel.web")
 
-# a fixed valid argon2 hash used to spend the same time for unknown / missing accounts
-_DUMMY_HASH: str | None = None
+# a valid argon2 hash of a random password: unknown / missing accounts spend the same time
+_DUMMY: dict[str, str] = {}
+AUDIT_FAILURE_INTERVAL_S = 60.0
 
 
 async def _audit(web: WebContext, actor: str, action: str, details: str = "") -> None:
-    def write(conn: sqlite3.Connection) -> None:
-        repo.add_audit(conn, web.now(), actor, action, "", details)
-
     try:
-        await web.pipeline.db_write(write)
+        await web.admin.audit(actor, action, "", details)
     except OperationRejected:
         log.warning("audit write skipped: database busy")
 
 
-def _verify(web: WebContext, stored_hash: str, password: str) -> bool:
-    global _DUMMY_HASH
+async def _audit_failure(request: Request, web: WebContext, key: str, *, blocked: bool) -> None:
+    """One audit row per client per minute (plus one when a block starts), not one per attempt."""
+    seen: dict[str, float] = request.app.state.failure_audit
+    now = web.limiter_clock()
+    if len(seen) > 4096:
+        seen.clear()
+    last = seen.get(key)
+    if blocked:
+        seen[key] = now
+        await _audit(web, "web:anonymous", "web.login_blocked", f"ip={key}")
+    elif last is None or now - last >= AUDIT_FAILURE_INTERVAL_S:
+        seen[key] = now
+        await _audit(web, "web:anonymous", "web.login_failed", f"ip={key}")
+
+
+async def _verify(web: WebContext, stored_hash: str, password: str) -> bool:
     if not stored_hash:
-        if _DUMMY_HASH is None:
-            _DUMMY_HASH = web.password_hasher.hash(secrets.token_urlsafe(8))
-        try:
-            web.password_hasher.verify(_DUMMY_HASH, password)
-        except (VerifyMismatchError, VerificationError, InvalidHashError):
-            pass
+        if "hash" not in _DUMMY:
+            _DUMMY["hash"] = await web.admin.hash(secrets.token_urlsafe(8))
+        await web.admin.verify(_DUMMY["hash"], password)
         return False
-    try:
-        return bool(web.password_hasher.verify(stored_hash, password))
-    except (VerifyMismatchError, VerificationError, InvalidHashError):
-        return False
+    return bool(await web.admin.verify(stored_hash, password))
 
 
 async def _login_page(request: Request, status: int = 200, error: str | None = None) -> Response:
@@ -68,6 +71,14 @@ async def _login_page(request: Request, status: int = 200, error: str | None = N
     token = get_signer(request).make_login_token(int(web.now().timestamp()))
     response = await render(request, "login.html", status, login_token=token, error=error)
     set_cookie(response, request, LOGIN_COOKIE, token, 3600)
+    return response
+
+
+async def _throttled(seconds: float, request: Request) -> Response:
+    response = await _login_page(
+        request, 429, T["login_throttled"].format(seconds=int(seconds) + 1)
+    )
+    response.headers["Retry-After"] = str(int(seconds) + 1)
     return response
 
 
@@ -89,13 +100,14 @@ async def login_submit(request: Request) -> Response:
     web = get_web(request)
     signer = get_signer(request)
     ip = client_ip(request, web)
+    global_wait = web.global_limiter.blocked_for()
+    if global_wait > 0:
+        return await _throttled(global_wait, request)
     wait = web.limiter.allow(ip)
     if wait > 0:
-        response = await _login_page(
-            request, 429, T["login_throttled"].format(seconds=int(wait) + 1)
-        )
-        response.headers["Retry-After"] = str(int(wait) + 1)
-        return response
+        if web.limiter.newly_blocked:
+            await _audit_failure(request, web, ip, blocked=True)
+        return await _throttled(wait, request)
     form = await load_form(request)
     now_s = int(web.now().timestamp())
     if not signer.login_token_ok(
@@ -105,10 +117,12 @@ async def login_submit(request: Request) -> Response:
     login = fstr(form, "username")
     password = fraw(form, "password")
     cfg = await web.app.db.run(read_panel_auth)
-    ok_hash = _verify(web, cfg.password_hash, password) if len(password) <= 1024 else False
+    ok_hash = await _verify(web, cfg.password_hash, password) if len(password) <= 1024 else False
     ok_login = hmac.compare_digest(login.encode(), cfg.login.encode()) if cfg.login else False
     if not (ok_hash and ok_login):
-        await _audit(web, "web:anonymous", "web.login_failed", f"ip={ip}")
+        if web.global_limiter.record_failure():
+            await _audit(web, "web:anonymous", "web.login_flood", "global failure limit reached")
+        await _audit_failure(request, web, ip, blocked=False)
         return await _login_page(request, 401, T["login_failed"])
     web.limiter.success(ip)
     session = signer.make_session(cfg.login, cfg.version, now_s)

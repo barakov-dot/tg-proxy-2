@@ -3,7 +3,7 @@ from __future__ import annotations
 from tests.ops.conftest import CADDYFILE, DOMAIN, PANEL_PATH, Ops, good_cert
 from tgpanel.render.caddy import has_panel_block
 
-ARGS = ("caddy-install", "--domain", DOMAIN, "--path", PANEL_PATH)
+ARGS = ("caddy-install", f"--domain={DOMAIN}", f"--path={PANEL_PATH}")
 STORAGE_DIR = f"/var/lib/caddy/.local/share/caddy/certificates/acme-v02/{DOMAIN}"
 
 
@@ -71,3 +71,18 @@ def test_restart_failure_rolls_back(ops: Ops) -> None:
     assert ops.fake.get_text(CADDYFILE) == original
     assert "Caddyfile возвращён" in out
     assert ops.fake.restart_count("caddy") == 1  # the rollback restart
+
+
+def test_path_with_leading_dash_or_underscore(ops: Ops) -> None:
+    """A random path may start with - or _; --path=VALUE must not break argparse."""
+    for path in ("-" + "a" * 30, "_" + "b" * 30):
+        code, _ = ops("caddy-install", f"--domain={DOMAIN}", f"--path={path}")
+        assert code == 0
+        assert f"/{path}/*" in ops.fake.get_text(CADDYFILE)
+
+
+def test_certificate_wait_uses_monotonic_deadline(ops: Ops) -> None:
+    ops.fake.set_cert(DOMAIN, None)
+    code, _ = ops(*ARGS, "--wait-cert", "20")
+    assert code == 3
+    assert 20 <= ops.time.t <= 25

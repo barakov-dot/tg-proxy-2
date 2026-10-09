@@ -21,7 +21,11 @@ async def test_throttle_drops_fast_events(env: Env) -> None:
     await env.tg.send(USER, "/start")
     n = len(env.session.calls)
     await env.tg.send(USER, "/start")
-    assert len(env.session.calls) == n
+    assert len(env.session.calls) == n + 1  # told "too fast" ...
+    assert "Слишком часто" in env.session.texts(USER)[-1]
+    await env.tg.send(USER, "/start")
+    await env.tg.send(USER, "/start")
+    assert len(env.session.calls) == n + 1  # ... only once per burst
     now[0] = 2.0
     await env.tg.send(USER, "/start")
     assert len(env.session.calls) > n

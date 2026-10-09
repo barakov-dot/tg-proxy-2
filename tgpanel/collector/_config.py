@@ -9,6 +9,7 @@ from __future__ import annotations
 import logging
 import re
 from collections.abc import Mapping
+from datetime import timedelta
 
 KEY_POLL_INTERVAL = "poll_interval_s"
 KEY_ACTIVITY_BYTES = "activity_min_bytes"
@@ -44,3 +45,9 @@ def scrub(text: object, limit: int = 200) -> str:
 
 def log_warning(logger: logging.Logger, message: str, exc: BaseException) -> None:
     logger.warning("%s: %s: %s", message, type(exc).__name__, scrub(exc))
+
+
+def online_freshness(settings: Mapping[str, str]) -> timedelta:
+    """How fresh ``counter_state.updated_at`` must be for a user to count as online."""
+    interval = int_setting(settings, KEY_POLL_INTERVAL, DEFAULT_POLL_INTERVAL_S, 5, 3600)
+    return timedelta(seconds=max(90, 3 * interval))

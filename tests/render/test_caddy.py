@@ -102,3 +102,9 @@ def test_malformed_markers() -> None:
 
 def test_domain_normalised_lowercase() -> None:
     assert "panel.example.com {" in caddy.insert_panel_block("", "PANEL.Example.com", PATH)
+
+
+def test_panel_block_caps_request_body() -> None:
+    block = caddy.render_panel_block(DOM, PATH)
+    assert "request_body {\n\t\t\tmax_size 2MB\n\t\t}" in block
+    assert block.index("request_body") < block.index("reverse_proxy")

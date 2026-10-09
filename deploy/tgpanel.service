@@ -19,8 +19,12 @@ NoNewPrivileges=true
 # /usr, /boot and /etc are read-only except for the paths listed in ReadWritePaths:
 # only files we are allowed to change (PLAN 12) are writable. "-" = skip if missing.
 ProtectSystem=strict
-ReadWritePaths=/etc/tgpanel /etc/tproxy-server /etc/mtproxy /etc/caddy /etc/systemd/system
-ReadWritePaths=/var/lib/tgpanel /var/backups/tgpanel /run
+ReadWritePaths=-/etc/tgpanel -/etc/tproxy-server -/etc/mtproxy -/etc/caddy -/etc/systemd/system
+ReadWritePaths=-/var/lib/tgpanel -/var/backups/tgpanel
+# /run/tgpanel (nft probe file, throwaway XDG dirs for `caddy validate`) is created by systemd and
+# is writable inside the sandbox; the rest of /run stays read-only.
+RuntimeDirectory=tgpanel
+RuntimeDirectoryPreserve=yes
 # No need to see user home directories.
 ProtectHome=true
 # Private /tmp: temporary snapshots for backups are invisible to others.

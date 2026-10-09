@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncGenerator
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -14,6 +15,7 @@ from aiogram.methods import SendMessage, TelegramMethod
 from aiogram.types import (
     CallbackQuery,
     Chat,
+    InaccessibleMessage,
     InlineKeyboardMarkup,
     Message,
     MessageEntity,
@@ -56,6 +58,11 @@ class MockSession(BaseSession):
         if queue:
             raise queue.pop(0)
         self.calls.append((name, method))
+        if name == "GetUpdates":
+            await asyncio.sleep(0.01)
+            return []
+        if name == "GetMe":
+            return User(id=999, is_bot=True, first_name="bot", username="testbot")
         if name in ("SendMessage", "EditMessageText", "SendPhoto"):
             self._mid += 1
             return Message(
@@ -149,7 +156,7 @@ class FakeSender:
 
     time: FakeTime = field(default_factory=FakeTime)
     sent: list[Sent] = field(default_factory=list)
-    script: dict[int, list[Exception]] = field(default_factory=dict)
+    script: dict[int, list[BaseException]] = field(default_factory=dict)
 
     async def send_message(
         self, chat_id: int, text: str, *, button: LinkButton | None = None, html: bool = True
@@ -210,15 +217,19 @@ class Tg:
             self.bot, Update(update_id=self._uid, message=self._msg(uid, text, **kw))
         )
 
-    async def press(self, uid: int, data: str, chat_type: str = "private") -> None:
+    async def press(
+        self, uid: int, data: str, chat_type: str = "private", *, inaccessible: bool = False
+    ) -> None:
         self._uid += 1
-        host = Message(
+        host: Message | InaccessibleMessage = Message(
             message_id=1,
             date=datetime.now(UTC),
             chat=Chat(id=uid, type=chat_type),
             from_user=User(id=999, is_bot=True, first_name="bot"),
             text="menu",
         )
+        if inaccessible:
+            host = InaccessibleMessage(chat=Chat(id=uid, type=chat_type), message_id=1, date=0)
         cb = CallbackQuery(
             id=str(self._uid),
             from_user=self._user(uid),

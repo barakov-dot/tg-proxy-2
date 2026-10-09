@@ -22,7 +22,7 @@
 </section>
 
 <section class="card"><h2>{{ t.settings_bot_token }}</h2>
-  <p>{{ t.token_set if token_set else t.token_unset }}</p>
+  <p>{% if token_set_at %}{{ t.token_set }} ({{ token_set_at }}){% else %}{{ t.token_unset }}{% endif %}</p>
   <form method="post" action="{{ url('/settings/bot-token') }}" autocomplete="off"><input type="hidden" name="csrf_token" value="{{ csrf }}">
   <input type="password" name="token" placeholder="{{ t.token_placeholder }}" autocomplete="new-password" required> <button type="submit">{{ t.save }}</button></form>
   <p class="hint">{{ t.token_restart_hint }}</p>

@@ -12,6 +12,7 @@ IP (``X-Forwarded-For`` is trusted only from the local reverse proxy).
 
 from __future__ import annotations
 
+import hashlib
 import hmac
 import secrets
 import time
@@ -47,7 +48,11 @@ class Signer:
         self._key = secret_key
 
     def _ser(self, purpose: str) -> URLSafeSerializer:
-        return URLSafeSerializer(self._key, salt=f"tgpanel.web.{purpose}")
+        return URLSafeSerializer(
+            self._key,
+            salt=f"tgpanel.web.{purpose}",
+            signer_kwargs={"digest_method": hashlib.sha256, "key_derivation": "hmac"},
+        )
 
     def dumps(self, purpose: str, payload: dict[str, Any]) -> str:
         return str(self._ser(purpose).dumps(payload))
@@ -85,14 +90,19 @@ class Signer:
         return self.dumps("login", {"n": secrets.token_urlsafe(16), "e": now_s + LOGIN_TOKEN_TTL_S})
 
     def login_token_ok(self, cookie: str | None, field_value: str | None, now_s: int) -> bool:
-        if not cookie or not field_value or not hmac.compare_digest(cookie, field_value):
+        if not cookie or not field_value or not _same(cookie, field_value):
             return False
         data = self.loads("login", cookie)
         return data is not None and int(data.get("e", 0)) > now_s
 
 
+def _same(a: str, b: str) -> bool:
+    """Constant-time comparison that also accepts non-ASCII input (it is simply unequal)."""
+    return hmac.compare_digest(a.encode("utf-8", "replace"), b.encode("utf-8", "replace"))
+
+
 def csrf_ok(expected: str, *candidates: str | None) -> bool:
-    return any(c is not None and c != "" and hmac.compare_digest(c, expected) for c in candidates)
+    return any(c is not None and c != "" and _same(c, expected) for c in candidates)
 
 
 @dataclass(slots=True)
@@ -121,10 +131,12 @@ class LoginLimiter:
         self._base = base_penalty_s
         self._cap = max_penalty_s
         self._state: dict[str, _State] = {}
+        self._new_block = False
 
     def allow(self, ip: str) -> float:
         """0.0 when the attempt may proceed (and is counted); otherwise seconds to wait."""
         now = self._clock()
+        self._new_block = False
         self._prune(now)
         st = self._state.setdefault(ip, _State())
         st.last_seen = now
@@ -136,9 +148,15 @@ class LoginLimiter:
             penalty = min(self._cap, self._base * float(2 ** (st.strikes - 1)))
             st.blocked_until = now + penalty
             st.attempts.clear()
+            self._new_block = True
             return penalty
         st.attempts.append(now)
         return 0.0
+
+    @property
+    def newly_blocked(self) -> bool:
+        """True if the last ``allow`` call started a new block."""
+        return self._new_block
 
     def success(self, ip: str) -> None:
         self._state.pop(ip, None)
@@ -149,3 +167,36 @@ class LoginLimiter:
         stale = [k for k, s in self._state.items() if now - s.last_seen > 86400]
         for k in stale:
             del self._state[k]
+
+
+class GlobalFailureLimiter:
+    """All failed logins together (many addresses): ``max_failures`` per window, then a pause."""
+
+    def __init__(
+        self,
+        clock: Callable[[], float] = time.monotonic,
+        *,
+        max_failures: int = 30,
+        window_s: float = 60.0,
+        pause_s: float = 60.0,
+    ) -> None:
+        self._clock = clock
+        self._max = max_failures
+        self._window = window_s
+        self._pause = pause_s
+        self._failures: list[float] = []
+        self._blocked_until = 0.0
+
+    def blocked_for(self) -> float:
+        return max(0.0, self._blocked_until - self._clock())
+
+    def record_failure(self) -> bool:
+        """Count a failure; True if this one tripped the global block."""
+        now = self._clock()
+        self._failures = [t for t in self._failures if now - t < self._window]
+        self._failures.append(now)
+        if len(self._failures) >= self._max and self._blocked_until <= now:
+            self._blocked_until = now + self._pause
+            self._failures.clear()
+            return True
+        return False

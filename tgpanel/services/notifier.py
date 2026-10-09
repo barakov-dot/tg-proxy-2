@@ -8,24 +8,88 @@
 from __future__ import annotations
 
 import asyncio
+import html
 import logging
+import math
+import re
 import sqlite3
 import time
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Protocol
+from zoneinfo import ZoneInfo
 
 from aiogram.exceptions import TelegramForbiddenError, TelegramRetryAfter
 
 from tgpanel.apply.pipeline import ApplyFailure, ApplyPipeline
-from tgpanel.db.connection import transaction
+from tgpanel.db import repo
+from tgpanel.db.connection import Database, transaction
+from tgpanel.domain.models import UserRecord
 from tgpanel.system.validation import scrub
 
 log = logging.getLogger("tgpanel.notifier")
 
+BOT_TOKEN_RE = re.compile(r"\d{6,12}:[A-Za-z0-9_-]{30,}")
+_PLACEHOLDER = re.compile(r"\{(name|link|tg_link|expires|days)\}")
+TEMPLATE_KEYS = (
+    "msg.link",
+    "msg.welcome",
+    "msg.approved",
+    "msg.rejected",
+    "msg.expiring",
+    "msg.expired",
+    "msg.broadcast",
+)
+
 SENT = "sent"
 FORBIDDEN = "forbidden"
 ERROR_PREFIX = "error:"
+
+
+def scrub_secrets(text: str, limit: int = 700) -> str:
+    """``scrub`` plus Telegram bot tokens (``123456789:AA...``)."""
+    return scrub(BOT_TOKEN_RE.sub("[redacted]", text), limit)
+
+
+def render_message(template: str, values: Mapping[str, str], *, escape: bool = True) -> str:
+    """Safe formatter: only {name} {link} {tg_link} {expires} {days} expand; all else is literal.
+
+    With ``escape`` (Telegram HTML mode) the template and the values are HTML-escaped.
+    """
+
+    def esc(text: str) -> str:
+        return html.escape(text, quote=False) if escape else text
+
+    return _PLACEHOLDER.sub(lambda m: esc(values.get(m.group(1), "")), esc(template))
+
+
+def message_values(
+    user: UserRecord, link: str, tg_link: str, tz: str, now: datetime
+) -> dict[str, str]:
+    expires = "без срока"
+    days = ""
+    if user.expires_at is not None:
+        expires = user.expires_at.astimezone(ZoneInfo(tz)).strftime("%d.%m.%Y %H:%M")
+        days = str(max(0, math.ceil((user.expires_at - now).total_seconds() / 86400)))
+    return {"name": user.name, "link": link, "tg_link": tg_link, "expires": expires, "days": days}
+
+
+class Templates:
+    """Message texts edited on the web page (settings ``msg.*``), with code defaults."""
+
+    def __init__(self, db: Database) -> None:
+        self._db = db
+
+    async def custom(self, key: str) -> str | None:
+        raw = await self._db.run(repo.get_setting, key, "")
+        return str(raw or "").strip() or None
+
+    async def render(
+        self, key: str, default: str, values: Mapping[str, str], *, escape: bool = True
+    ) -> str:
+        template = await self.custom(key) or default
+        return render_message(template, values, escape=escape)
 
 
 @dataclass(frozen=True, slots=True)
@@ -141,9 +205,9 @@ def failure_text(failure: ApplyFailure) -> str:
     lines = [
         "Не удалось применить изменения.",
         f"Запуск: #{failure.run_id}",
-        f"Причина: {scrub(failure.reason, 120) or 'не указана'}",
-        f"Инициатор: {scrub(failure.actor, 60)}",
-        scrub(failure.error, 600),
+        f"Причина: {scrub_secrets(failure.reason, 120) or 'не указана'}",
+        f"Инициатор: {scrub_secrets(failure.actor, 60)}",
+        scrub_secrets(failure.error, 600),
     ]
     if failure.rollback_errors:
         lines.append("ВНИМАНИЕ: откат выполнен не полностью, проверьте состояние сервисов.")

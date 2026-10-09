@@ -16,7 +16,12 @@ from tgpanel.apply.pipeline import ApplyPipeline
 from tgpanel.apply.settings_spec import AppSettings, read_settings
 from tgpanel.db import repo
 from tgpanel.db.connection import Database, transaction
-from tgpanel.domain.addresses import allocate_addresses
+from tgpanel.domain.addresses import (
+    QUARANTINE_KEY,
+    allocate_addresses,
+    parse_quarantine,
+    quarantine_released,
+)
 from tgpanel.domain.expiry import (
     Term,
     default_expiry,
@@ -179,7 +184,8 @@ class UserServiceImpl:
             alloc = allocate_pools(pools, existing, len(users), cfg.secrets_per_process)
             for pool in alloc.new_pools:
                 repo.insert_pool(conn, pool, now)
-            ips = allocate_addresses(repo.used_loopback_ips(conn), len(users))
+            quarantined = parse_quarantine(repo.get_setting(conn, QUARANTINE_KEY), now)
+            ips = allocate_addresses(repo.used_loopback_ips(conn), len(users), quarantined)
             bases = {base_secret(u.secret) for u in existing}
             sentinel = repo.get_setting(conn, "sentinel_secret")
             if sentinel:
@@ -347,6 +353,16 @@ class UserServiceImpl:
             for u in targets:
                 self._audit(conn, actor, "user.delete", u.id, f"pool={u.pool_id}")
             repo.delete_users(conn, [u.id for u in targets])
+            if targets:  # quarantine the freed addresses (see domain.addresses)
+                repo.set_setting(
+                    conn,
+                    QUARANTINE_KEY,
+                    quarantine_released(
+                        repo.get_setting(conn, QUARANTINE_KEY),
+                        [u.loopback_ip for u in targets],
+                        self._pipeline.now(),
+                    ),
+                )
             return [u.id for u in targets]
 
         return await self._run(mutation, reason="delete", actor=actor)

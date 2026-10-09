@@ -10,13 +10,15 @@ returned only after that apply succeeded. Approving twice is harmless.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import re
 import sqlite3
-from collections.abc import Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from enum import StrEnum
 
+from tgpanel.apply.errors import OperationRejected
 from tgpanel.apply.pipeline import ApplyPipeline
 from tgpanel.apply.settings_spec import read_settings
 from tgpanel.db import repo
@@ -27,6 +29,8 @@ from tgpanel.domain.models import UserRecord
 from tgpanel.services.api import NewUser, UserService
 
 KEY_BLACKLIST = "bot_blacklist"
+KEY_OPEN_LIMIT = "open_mode_max_per_hour"
+DEFAULT_OPEN_LIMIT = 20
 RATE_WINDOW = timedelta(hours=1)
 RATE_MAX_REQUESTS = 3
 MAX_NAME = 100
@@ -60,8 +64,16 @@ class StartInfo:
     first_start: bool  # the bot was just linked to an existing (e.g. imported) user
 
 
+_ASCII_ID = re.compile(r"[0-9]{1,16}")
+
+
 def parse_ids(raw: str) -> set[int]:
-    return {int(t) for t in re.split(r"[\s,;]+", raw.strip()) if t.isdigit()}
+    """Telegram ids from a free-form list; anything that is not a plain ASCII number is skipped."""
+    out: set[int] = set()
+    for token in re.split(r"[\s,;]+", raw.strip()):
+        if _ASCII_ID.fullmatch(token):
+            out.add(int(token))
+    return out
 
 
 def display_name(full_name: str, username: str | None, tg_id: int) -> str:
@@ -93,16 +105,85 @@ class RequestService:
         self._users = users
         self._rate_max = rate_max
         self._rate_window = rate_window
-        self._locks: dict[int, asyncio.Lock] = {}
+        self._locks: dict[int, tuple[asyncio.Lock, int]] = {}
+        self._open_inflight = 0
+        self._quota_lock = asyncio.Lock()
 
     # ------------------------------------------------------------------ reads
 
     async def issuance_mode(self) -> str:
         return (await self._db.run(read_settings)).issuance_mode
 
+    @contextlib.asynccontextmanager
+    async def _locked(self, request_id: int) -> AsyncIterator[None]:
+        lock, users = self._locks.get(request_id, (asyncio.Lock(), 0))
+        self._locks[request_id] = (lock, users + 1)
+        try:
+            async with lock:
+                yield
+        finally:
+            lock, users = self._locks[request_id]
+            if users <= 1:
+                del self._locks[request_id]
+            else:
+                self._locks[request_id] = (lock, users - 1)
+
+    async def blacklist_ids(self) -> list[int]:
+        try:
+            raw = await self._db.run(repo.get_setting, KEY_BLACKLIST, "")
+            return sorted(parse_ids(str(raw or "")))
+        except Exception:
+            return []
+
     async def is_blacklisted(self, tg_id: int) -> bool:
-        raw = await self._db.run(repo.get_setting, KEY_BLACKLIST, "")
-        return tg_id in parse_ids(str(raw or ""))
+        return tg_id in await self.blacklist_ids()
+
+    async def blacklist_edit(self, tg_id: int, add: bool, actor: str) -> list[int]:
+        """Add or remove one id of the blacklist (written under the pipeline lock)."""
+        if not 0 < tg_id <= 2**53:
+            raise OperationRejected("Некорректный Telegram ID")
+
+        def work(conn: sqlite3.Connection) -> list[int]:
+            with transaction(conn):
+                ids = parse_ids(repo.get_setting(conn, KEY_BLACKLIST, "") or "")
+                if add:
+                    ids.add(tg_id)
+                else:
+                    ids.discard(tg_id)
+                repo.set_setting(conn, KEY_BLACKLIST, ",".join(str(i) for i in sorted(ids)))
+                repo.add_audit(
+                    conn,
+                    self._pipeline.now(),
+                    actor,
+                    "blacklist.add" if add else "blacklist.remove",
+                    f"tg:{tg_id}",
+                )
+                return sorted(ids)
+
+        return await self._pipeline.db_write(work)
+
+    async def _reserve_open(self) -> bool:
+        async with self._quota_lock:
+            if not await self._open_quota_left():
+                return False
+            self._open_inflight += 1
+            return True
+
+    async def _open_quota_left(self) -> bool:
+        """Global limit of profiles issued without approval per hour."""
+        raw = await self._db.run(repo.get_setting, KEY_OPEN_LIMIT, "")
+        limit = int(raw) if raw and _ASCII_ID.fullmatch(raw.strip()) else DEFAULT_OPEN_LIMIT
+        since = to_db(self._pipeline.now() - timedelta(hours=1))
+
+        def count(conn: sqlite3.Connection) -> int:
+            row = conn.execute(
+                "SELECT COUNT(*) FROM access_requests WHERE status = 'approved'"
+                " AND decided_by = 'system' AND decided_at >= ?",
+                (since,),
+            ).fetchone()
+            return int(row[0])
+
+        return await self._db.run(count) + self._open_inflight < limit
 
     async def get(self, request_id: int) -> repo.AccessRequest | None:
         return await self._db.run(repo.get_access_request, request_id)
@@ -144,12 +225,30 @@ class RequestService:
         *,
         on_preparing: Callable[[], Awaitable[None]] | None = None,
     ) -> RequestOutcome:
+        reserved = [False]  # one slot of the hourly open-mode quota, released when done
+        try:
+            return await self._submit(tg_id, username, full_name, on_preparing, reserved)
+        finally:
+            if reserved[0]:
+                self._open_inflight -= 1
+
+    async def _submit(
+        self,
+        tg_id: int,
+        username: str | None,
+        full_name: str,
+        on_preparing: Callable[[], Awaitable[None]] | None,
+        reserved: list[bool],
+    ) -> RequestOutcome:
         if await self.is_blacklisted(tg_id):
             return RequestOutcome(RequestKind.BLACKLISTED)
         user = await self._db.run(repo.get_user_by_tg_id, tg_id)
         if user is not None:
             return RequestOutcome(RequestKind.HAS_ACCESS, user=user)
         open_mode = await self.issuance_mode() == "open"
+        if open_mode:
+            # hourly limit of unattended issuance reached: admins decide instead
+            reserved[0] = open_mode = await self._reserve_open()
         pending = await self._db.run(repo.pending_request_for, tg_id)
         if pending is not None:
             if not open_mode:
@@ -210,8 +309,7 @@ class RequestService:
         return await self._approve(request_id, term, actor)
 
     async def _approve(self, request_id: int, term: Term | None, actor: str) -> RequestOutcome:
-        lock = self._locks.setdefault(request_id, asyncio.Lock())
-        async with lock:
+        async with self._locked(request_id):
             return await self._approve_locked(request_id, term, actor)
 
     async def _approve_locked(
@@ -277,8 +375,7 @@ class RequestService:
         await self._pipeline.db_write(work)
 
     async def reject(self, request_id: int, actor: str) -> RequestOutcome:
-        lock = self._locks.setdefault(request_id, asyncio.Lock())
-        async with lock:
+        async with self._locked(request_id):
             req = await self._db.run(repo.get_access_request, request_id)
             if req is None:
                 return RequestOutcome(RequestKind.NOT_FOUND)

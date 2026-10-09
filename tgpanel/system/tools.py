@@ -18,6 +18,7 @@ from tgpanel.system.ops import SystemOpsError
 from tgpanel.system.real import run_command
 
 _REF_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/@+-]{0,99}$")
+_IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,63}$")
 _UNIT_RE = re.compile(r"^[A-Za-z0-9@._-]{1,200}$")
 # Trees that uninstall --purge may delete. Backups and /var/lib/caddy are deliberately absent.
 REMOVABLE_TREES = frozenset({"/opt/tgpanel", "/etc/tgpanel", "/var/lib/tgpanel"})
@@ -31,6 +32,18 @@ class ShellTools(Protocol):
 
     async def git_fetch(self, repo: str) -> None:
         """`git fetch --tags --prune origin`."""
+        ...
+
+    async def git_latest_tag(self, repo: str) -> str | None:
+        """Newest tag matching v*.*.* (by version order), or None."""
+        ...
+
+    async def nft_chain_exists(self, table: str, chain: str) -> bool:
+        """`nft list chain inet <table> <chain>` succeeds."""
+        ...
+
+    async def local_ipv6(self) -> list[str]:
+        """Global IPv6 addresses configured on this host (without prefix length)."""
         ...
 
     async def git_resolve(self, repo: str, ref: str) -> str:
@@ -85,7 +98,7 @@ class RealShellTools:
         return await self._git(repo, "rev-parse", "HEAD")
 
     async def git_fetch(self, repo: str) -> None:
-        await self._git(repo, "fetch", "--tags", "--prune", "origin", timeout_s=600.0)
+        await self._git(repo, "fetch", "--tags", "--force", "--prune", "origin", timeout_s=600.0)
 
     async def git_resolve(self, repo: str, ref: str) -> str:
         _check_ref(ref)
@@ -98,6 +111,32 @@ class RealShellTools:
             if res.ok:
                 return res.stdout.decode().strip()
         raise SystemOpsError("git reference not found")
+
+    async def git_latest_tag(self, repo: str) -> str | None:
+        out = await self._git(repo, "tag", "-l", "v*.*.*", "--sort=-v:refname")
+        for line in out.splitlines():
+            tag = line.strip()
+            if _REF_RE.fullmatch(tag):
+                return tag
+        return None
+
+    async def nft_chain_exists(self, table: str, chain: str) -> bool:
+        if not (_IDENT_RE.fullmatch(table) and _IDENT_RE.fullmatch(chain)):
+            raise SystemOpsError("invalid nft identifier")
+        res = await run_command(["nft", "list", "chain", "inet", table, chain], timeout_s=30.0)
+        return res.ok
+
+    async def local_ipv6(self) -> list[str]:
+        res = await run_command(["ip", "-6", "-o", "addr", "show", "scope", "global"])
+        if not res.ok:
+            return []
+        out: list[str] = []
+        for line in res.stdout.decode("utf-8", "replace").splitlines():
+            fields = line.split()
+            if "inet6" in fields:
+                addr = fields[fields.index("inet6") + 1].split("/")[0]
+                out.append(addr.lower())
+        return out
 
     async def git_checkout(self, repo: str, commit: str) -> None:
         if not re.fullmatch(r"[0-9a-f]{40}", commit):
@@ -112,6 +151,7 @@ class RealShellTools:
                 "pip",
                 "install",
                 "--require-hashes",
+                "--only-binary=:all:",
                 "--no-input",
                 "--disable-pip-version-check",
                 "-r",
@@ -177,6 +217,9 @@ class FakeShellTools:
         self.migrate_output = "schema version 1"
         # (python, lock_file) -> side effect hook, e.g. to flip service health in tests
         self.on_checkout: list[str] = []
+        self.latest_tag: str | None = None
+        self.chains: set[tuple[str, str]] = {("tgpanel", "guard"), ("tgpanel", "acct")}
+        self.ipv6: list[str] = []
 
     def fail_on(self, method: str, times: int = 1) -> None:
         self.fail[method] = times
@@ -204,6 +247,18 @@ class FakeShellTools:
         if ref in self.refs:
             return self.refs[ref]
         raise SystemOpsError("git reference not found")
+
+    async def git_latest_tag(self, repo: str) -> str | None:
+        self._enter("git_latest_tag", repo)
+        return self.latest_tag
+
+    async def nft_chain_exists(self, table: str, chain: str) -> bool:
+        self._enter("nft_chain_exists", table, chain)
+        return (table, chain) in self.chains
+
+    async def local_ipv6(self) -> list[str]:
+        self._enter("local_ipv6")
+        return list(self.ipv6)
 
     async def git_checkout(self, repo: str, commit: str) -> None:
         self._enter("git_checkout", repo, commit)

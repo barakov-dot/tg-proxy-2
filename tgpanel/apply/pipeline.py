@@ -212,6 +212,9 @@ class _Plan:
     relay_restart: bool
     warnings: list[str]
     nft_table_existed: bool = True
+    # IPs whose owner changed since the last apply: element is deleted and re-added so its
+    # counters restart from zero (the new owner must not inherit the old traffic).
+    nft_recreate: list[str] = field(default_factory=list)
 
     @property
     def noop(self) -> bool:
@@ -221,8 +224,29 @@ class _Plan:
             or self.to_stop
             or self.nft_full
             or any(add or delete for _, add, delete in self.nft_changes)
+            or bool(self.nft_recreate)
             or self.relay_restart
         )
+
+
+KEY_NFT_OWNERS = "apply.nft_owners"  # internal: {ip: owner user id (0 = adopted profile)}
+
+
+def _nft_owners(state: DesiredState) -> dict[str, int]:
+    owners = {ip: 0 for ip in foreign_loopback_ips(state)}
+    owners.update({u.loopback_ip: u.id for u in active_users(state)})
+    return owners
+
+
+def _load_nft_owners(conn: sqlite3.Connection) -> dict[str, int]:
+    raw = repo.get_setting(conn, KEY_NFT_OWNERS)
+    if not raw:
+        return {}
+    try:
+        data = json.loads(raw)
+        return {str(k): int(v) for k, v in data.items()}
+    except (ValueError, TypeError, AttributeError):
+        return {}
 
 
 class _OperationTxn:
@@ -1259,6 +1283,7 @@ class ApplyPipeline:
 
     def _store_hash(self, conn: sqlite3.Connection, plan: _Plan) -> None:
         repo.set_setting(conn, KEY_PROFILES_HASH, profiles_hash(plan.rendered.profiles_json))
+        repo.set_setting(conn, KEY_NFT_OWNERS, json.dumps(_nft_owners(plan.state)))
         names = [e.name for e in parse_profiles(plan.rendered.profiles_json)]
         foreign_names = {json.loads(f).get("name") for f in plan.state.foreign_profiles}
         repo.set_setting(conn, KEY_ALL_NAMES, json.dumps(names))
@@ -1502,18 +1527,28 @@ class ApplyPipeline:
             keep_ips |= set(foreign_loopback_ips(state))  # accounting of adopted profiles stays
             desired_ips = sorted(keep_ips)
             nft_changes: list[tuple[str, list[str], list[str]]] = []
+            nft_recreate: list[str] = []
             table_existed = True
             try:
                 for set_name in ("up", "down"):
                     current = set(await ops.nft_list_set("tgpanel", set_name))
                     want = set(desired_ips)
                     nft_changes.append((set_name, sorted(want - current), sorted(current - want)))
+                    if set_name == "up":
+                        old_owners = _load_nft_owners(conn)
+                        new_owners = _nft_owners(state)
+                        nft_recreate = sorted(
+                            ip
+                            for ip in want & current
+                            if ip in old_owners and old_owners[ip] != new_owners.get(ip)
+                        )
             except SystemOpsError:
                 table_existed = False  # the table is missing: the whole file must be loaded
                 nft_changes = []
             nft_full = force_nft or not table_existed
             if nft_full:
                 nft_changes = []
+                nft_recreate = []
             relay_restart = bool({paths.profiles, paths.config} & changed) or not (
                 await ops.is_active(cfg.relay_unit)
             )
@@ -1535,6 +1570,7 @@ class ApplyPipeline:
             relay_restart=relay_restart,
             warnings=warnings,
             nft_table_existed=table_existed,
+            nft_recreate=nft_recreate,
         )
 
     async def _unit_enabled(self, unit: str) -> bool:
@@ -1675,6 +1711,12 @@ class ApplyPipeline:
             await self._write(plan, paths.nft_file, journal)
         try:
             if not plan.nft_full:
+                if plan.nft_recreate:
+                    for set_name in ("up", "down"):
+                        await ops.nft_delete_elements("tgpanel", set_name, plan.nft_recreate)
+                        journal.nft_deleted.append((set_name, plan.nft_recreate))
+                        await ops.nft_add_elements("tgpanel", set_name, plan.nft_recreate)
+                        journal.nft_added.append((set_name, plan.nft_recreate))
                 for set_name, add, delete in plan.nft_changes:
                     if add:
                         await ops.nft_add_elements("tgpanel", set_name, add)

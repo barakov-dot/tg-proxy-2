@@ -74,6 +74,8 @@ class Collector:
         self._write_timeout_s = write_timeout_s
         self._first_poll_at: datetime | None = None
         self._interval_s = cfg.DEFAULT_POLL_INTERVAL_S
+        # users whose element vanished (state dropped): on return the element is fresh (0)
+        self._vanished: set[int] = set()
 
     # ------------------------------------------------------------------ one poll
 
@@ -111,20 +113,25 @@ class Collector:
         new_since = first_at - timedelta(seconds=2 * self._interval_s)
 
         updates: list[_Update] = []
+        drops: list[int] = []
         for user in users:
+            if user.id in states and user.loopback_ip not in up and user.loopback_ip not in down:
+                drops.append(user.id)  # element gone (disabled, table flushed): forget the base
+                continue
             update = _compute(
                 user,
                 up.get(user.loopback_ip),
                 down.get(user.loopback_ip),
                 states.get(user.id),
                 now=now,
-                new_element=not first and user.id in created and created[user.id] >= new_since,
+                new_element=user.id in self._vanished
+                or (not first and user.id in created and created[user.id] >= new_since),
                 min_bytes=min_bytes,
                 min_packets=min_packets,
             )
             if update is not None:
                 updates.append(update)
-        if not updates:
+        if not updates and not drops:
             return PollResult(skipped=None)
 
         wait_s = (
@@ -133,10 +140,12 @@ class Collector:
             else min(float(self._interval_s), MAX_WRITE_WAIT_S)
         )
         try:
-            await self._pipeline.db_write(_write, updates, now, wait_s=wait_s)
+            await self._pipeline.db_write(_write, updates, drops, now, wait_s=wait_s)
         except DbWriteTimeout:
             log.warning("collector: database busy (apply in progress), sample dropped")
             return PollResult(dropped=True)
+        self._vanished |= set(drops)
+        self._vanished -= {u.user_id for u in updates}
         return PollResult(updated=len(updates))
 
     # ------------------------------------------------------------------ loop
@@ -212,10 +221,14 @@ def _direction(
     return delta.bytes, delta.packets, delta.state, delta.reset
 
 
-def _write(conn: sqlite3.Connection, updates: list[_Update], now: datetime) -> None:
+def _write(
+    conn: sqlite3.Connection, updates: list[_Update], drops: list[int], now: datetime
+) -> None:
     bucket = floor_minute(now)
     with transaction(conn):
         existing = {int(r[0]) for r in conn.execute("SELECT id FROM users")}
+        for uid in drops:
+            repo.delete_counter_state(conn, uid)
         for u in updates:
             if u.user_id not in existing:
                 continue  # deleted while we were polling

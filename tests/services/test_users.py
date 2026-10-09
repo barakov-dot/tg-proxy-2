@@ -382,9 +382,9 @@ async def test_delete_removes_secret_from_pool_and_frees_slot(svc: Svc) -> None:
         ).fetchone()[0]
     )
     assert count == 0  # statistics go with the user
-    # the freed address and slot are reused
+    # the freed slot is reused; the address stays quarantined for 24 h
     new = await make(svc, 1)
-    assert (await svc.users.get(new[0])).loopback_ip == victim.loopback_ip  # type: ignore[union-attr]
+    assert (await svc.users.get(new[0])).loopback_ip != victim.loopback_ip  # type: ignore[union-attr]
     assert (await svc.users.get(new[0])).pool_id == 1  # type: ignore[union-attr]
 
 
@@ -587,3 +587,16 @@ async def test_s6_link_before_start_raises_instead_of_reading_the_db(tmp_path: P
         assert "server=h.example.com" in ctx.users.link(_dummy_user())
     finally:
         ctx.close()
+
+
+async def test_deleted_users_address_is_quarantined(svc: Svc) -> None:
+    (a,) = await make(svc)
+    ip_a = svc.ctx.db.call(repo.get_user, a).loopback_ip  # type: ignore[union-attr]
+    res = await svc.users.delete([a], "web:admin")
+    assert res.ok
+    (b,) = await make(svc)
+    assert svc.ctx.db.call(repo.get_user, b).loopback_ip != ip_a  # type: ignore[union-attr]
+    # after 24 h the address may be handed out again
+    svc.clock.now += timedelta(hours=25)
+    (c,) = await make(svc)
+    assert svc.ctx.db.call(repo.get_user, c).loopback_ip == ip_a  # type: ignore[union-attr]

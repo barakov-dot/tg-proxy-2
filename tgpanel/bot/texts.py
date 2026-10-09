@@ -39,6 +39,7 @@ MENU_MODE = "Режим выдачи"
 MENU_APPLY = "Статус apply"
 MENU_BACKUP = "Бэкап сейчас"
 MENU_BROADCAST = "Рассылка"
+MENU_BLACKLIST = "Чёрный список"
 
 TERM_BUTTONS = {"1d": "1 день", "1m": "1 месяц", "1y": "1 год", "df": "По умолчанию"}
 EXTEND_BUTTONS = {7: "+7 дней", 30: "+30 дней", 90: "+90 дней", 365: "+1 год"}
@@ -77,18 +78,31 @@ def status_active(expires: str | None, *, imported: bool = False) -> str:
     return f"Ваш доступ активен, {until}.{tail}"
 
 
-def link_message(intro: str, link: str, tg_link: str) -> str:
-    return f"{intro}\n\n<code>{link}</code>\n\nЕсли кнопка не открывается: <code>{tg_link}</code>"
+# Default message templates (settings msg.* override them). Plain text, placeholders:
+# {name} {link} {tg_link} {expires} {days}; the whole text is HTML-escaped when sent.
+DEFAULT_LINK = "{intro}\n\n{link}\n\nЕсли кнопка не открывается: {tg_link}"
+DEFAULT_APPROVED = (
+    "Ваша заявка одобрена. Ваша ссылка:\n\n{link}\n\nЕсли кнопка не открывается: {tg_link}"
+)
+DEFAULT_REJECTED = "Ваша заявка отклонена."
+DEFAULT_WELCOME = START_NO_PROFILE
+DEFAULT_EXPIRING = (
+    "Срок вашего доступа заканчивается {expires} (осталось дней: {days}). "
+    "Для продления обратитесь к администратору."
+)
+DEFAULT_EXPIRED = "Срок вашего доступа истёк. Для продления обратитесь к администратору."
+DEFAULT_BROADCAST = "Здравствуйте, {name}!\nВаша ссылка для подключения:\n{tg_link}"
 
-
-def expiry_notice() -> str:
-    return "Срок вашего доступа истёк. Для продления обратитесь к администратору."
-
-
-def reminder_notice(expires: str) -> str:
-    return (
-        f"Срок вашего доступа заканчивается {expires}. Для продления обратитесь к администратору."
-    )
+TOO_FAST = "Слишком часто, подождите секунду."
+BTN_BLACKLIST = "Чёрный список"
+BLACKLIST_TEXT = "Чёрный список ({count}):\n{ids}"
+BLACKLIST_EMPTY = "пусто"
+BLACKLIST_ADD = "Добавить ID"
+BLACKLIST_REMOVE = "Убрать ID"
+BLACKLIST_ASK_ADD = "Отправьте Telegram ID, который нужно заблокировать, или /cancel."
+BLACKLIST_ASK_REMOVE = "Отправьте Telegram ID, который нужно разблокировать, или /cancel."
+BLACKLIST_BAD_ID = "Нужен положительный Telegram ID из цифр."
+BLACKLIST_USAGE = "Использование: /ban ID или /unban ID"
 
 
 # ------------------------------------------------------------------ admin part
@@ -124,7 +138,6 @@ BROADCAST_ASK = (
     "Отправьте текст рассылки одним сообщением или «-» для текста по умолчанию.\n"
     "Подстановки: {name}, {link}, {tg_link}, {expires}. /cancel для отмены."
 )
-BROADCAST_DEFAULT = "Здравствуйте, {name}!\nВаша ссылка для подключения:\n{tg_link}"
 BROADCAST_NO_DRAFT = "Нет подготовленной рассылки."
 BROADCAST_NO_ONE = "В рассылке некому получать сообщения."
 BROADCAST_NO_SELECTION = "Никто не выбран."

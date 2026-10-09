@@ -49,3 +49,34 @@ def test_validity() -> None:
         "127.064.0.1",
     ):
         assert not is_valid_loopback_ip(bad)
+
+
+def test_quarantined_addresses_are_skipped() -> None:
+    assert allocate_addresses(["127.64.0.1"], 2, quarantined=["127.64.0.2"]) == [
+        "127.64.0.3",
+        "127.64.0.4",
+    ]
+
+
+def test_quarantine_roundtrip_and_ttl() -> None:
+    from datetime import UTC, datetime, timedelta
+
+    from tgpanel.domain.addresses import parse_quarantine, quarantine_released
+
+    t0 = datetime(2026, 3, 10, 12, 0, tzinfo=UTC)
+    raw = quarantine_released(None, ["127.64.0.5"], t0)
+    raw = quarantine_released(raw, ["127.64.0.6"], t0 + timedelta(hours=20))
+    assert set(parse_quarantine(raw, t0 + timedelta(hours=23))) == {"127.64.0.5", "127.64.0.6"}
+    assert set(parse_quarantine(raw, t0 + timedelta(hours=25))) == {"127.64.0.6"}
+    # expired entries are pruned when the value is rewritten
+    raw2 = quarantine_released(raw, ["127.64.0.7"], t0 + timedelta(hours=25))
+    assert "127.64.0.5" not in raw2
+
+
+@pytest.mark.parametrize("raw", [None, "", "not json", "[]", '{"x": "y"}', '{"127.64.0.1": "bad"}'])
+def test_malformed_quarantine_is_ignored(raw: str | None) -> None:
+    from datetime import UTC, datetime
+
+    from tgpanel.domain.addresses import parse_quarantine
+
+    assert parse_quarantine(raw, datetime(2026, 1, 1, tzinfo=UTC)) == {}

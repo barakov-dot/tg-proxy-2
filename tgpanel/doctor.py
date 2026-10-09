@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import shlex
+import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -36,7 +37,8 @@ CADDY_DROPIN_DIR = "/etc/systemd/system/caddy.service.d"
 CADDY_STORAGE_CERTS = "/var/lib/caddy/.local/share/caddy/certificates"
 VERIFIED_RELAY_FILE = "/opt/tgpanel/deploy/verified-relay.sha256"
 PROBE_TABLE = "tgpanel_probe"
-PROBE_FILE = "/run/tgpanel-probe.nft"
+PROBE_DIR = "/run/tgpanel"
+PROBE_FILE = f"{PROBE_DIR}/probe.nft"
 MIN_DISK_WARN = 1024**3
 MIN_DISK_FAIL = 200 * 1024**2
 
@@ -147,6 +149,16 @@ async def read_caddy_env(ops: SystemOps, config: ApplyConfig) -> dict[str, str]:
             continue
         for raw in text.splitlines():
             line = raw.strip()
+            if line.startswith("EnvironmentFile="):
+                target = line[len("EnvironmentFile=") :].strip().lstrip("-")
+                if target.startswith("/"):
+                    try:
+                        env.update(
+                            parse_env_text((await ops.read_file(target)).decode("utf-8", "replace"))
+                        )
+                    except SystemOpsError:
+                        pass
+                continue
             if not line.startswith("Environment="):
                 continue
             try:
@@ -228,24 +240,28 @@ async def wait_for_certificate(
     interval_s: float = 5.0,
     clock: Callable[[], datetime] | None = None,
     sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+    monotonic: Callable[[], float] = time.monotonic,
 ) -> CertWait:
-    """Poll https://<domain>/ (chain + name verified) until a valid certificate is served."""
+    """Poll https://<domain>/ (chain + name verified) until a valid certificate is served.
+
+    The deadline is monotonic (real elapsed time, probes included), not a sum of intervals.
+    """
     now_fn = clock or (lambda: datetime.now(UTC))
-    waited = 0.0
+    started = monotonic()
     while True:
         cert: CertInfo | None
         try:
             cert = await ops.tls_cert_info(domain)
         except SystemOpsError:
             cert = None
+        waited = monotonic() - started
         if cert is not None and cert.valid_chain:
             end = _parse_dt(cert.not_after)
             if end is None or end > now_fn():
                 return CertWait(cert, waited, _reused(cert, stored_before, now_fn()))
         if waited >= timeout_s:
             return CertWait(None, waited, None)
-        await sleep(interval_s)
-        waited += interval_s
+        await sleep(min(interval_s, max(timeout_s - waited, 0.1)))
 
 
 def _reused(cert: CertInfo, stored_before: bool | None, now: datetime) -> bool | None:
@@ -396,6 +412,7 @@ async def probe_nft_counters(ops: SystemOps) -> tuple[bool, str]:
         "\t\telements = { 127.64.255.254 }\n\t}\n}\n"
     )
     try:
+        await ops.ensure_dir(PROBE_DIR, 0o700, "root", "root")
         await ops.write_atomic(PROBE_FILE, text.encode(), mode=0o600, owner="root", group="root")
         await ops.nft_load_file(PROBE_FILE)
         await ops.nft_list_set(PROBE_TABLE, "s")
@@ -418,6 +435,18 @@ async def check_nft(env: DoctorEnv, report: DoctorReport) -> None:
         report.add("Таблица nft inet tgpanel", Status.OK)
     except SystemOpsError:
         report.add("Таблица nft inet tgpanel", Status.FAIL, "отсутствует (tgpanel repair)")
+    try:
+        guard = await env.tools.nft_chain_exists("tgpanel", "guard")
+    except SystemOpsError:
+        guard = False
+    if guard:
+        report.add("Цепочка nft guard (закрытые порты пулов)", Status.OK)
+    else:
+        report.add(
+            "Цепочка nft guard (закрытые порты пулов)",
+            Status.FAIL,
+            "отсутствует: порты пулов доступны снаружи (tgpanel repair)",
+        )
     ok, detail = await probe_nft_counters(ops)
     report.add("nftables: счётчики элементов", Status.OK if ok else Status.FAIL, detail)
 
@@ -493,15 +522,29 @@ async def check_dns(env: DoctorEnv, report: DoctorReport, install_env: dict[str,
     except SystemOpsError as exc:
         report.add("DNS домена панели", Status.WARN, scrub(str(exc), 200))
         return
-    problems = dns_problems(a_records, aaaa_records, public)
+    try:
+        local6 = await env.tools.local_ipv6()
+    except SystemOpsError:
+        local6 = []
+    problems = dns_problems(a_records, aaaa_records, public, local6)
     if problems:
         report.add("DNS домена панели", Status.WARN, "; ".join(problems))
     else:
         report.add("DNS домена панели", Status.OK, f"A → {public}")
 
 
-def dns_problems(a_records: list[str], aaaa_records: list[str], public_ip: str | None) -> list[str]:
-    """Reasons why Let's Encrypt validation would fail (PLAN 3.8); empty list = fine."""
+def dns_problems(
+    a_records: list[str],
+    aaaa_records: list[str],
+    public_ip: str | None,
+    local_ipv6: list[str] | None = None,
+) -> list[str]:
+    """Reasons why Let's Encrypt validation would fail (PLAN 3.8); empty list = fine.
+
+    Same rules as install.sh: A must contain this server's public IPv4; AAAA must be absent or
+    point at one of this host's own global IPv6 addresses (v4-mapped ``::ffff:`` entries that
+    the resolver synthesises are ignored).
+    """
     problems: list[str] = []
     if public_ip is None:
         problems.append("не удалось определить публичный IPv4 сервера")
@@ -511,10 +554,14 @@ def dns_problems(a_records: list[str], aaaa_records: list[str], public_ip: str |
         problems.append(
             f"A-запись ({', '.join(a_records)}) не указывает на этот сервер ({public_ip})"
         )
-    if aaaa_records:
+    mine = {a.lower() for a in (local_ipv6 or [])}
+    foreign = [
+        a for a in aaaa_records if not a.lower().startswith("::ffff:") and a.lower() not in mine
+    ]
+    if foreign:
         problems.append(
-            "есть AAAA-запись (" + ", ".join(aaaa_records) + "): если она не ведёт на этот "
-            "сервер, выпуск сертификата сломается — удалите её или направьте на сервер"
+            "AAAA-запись (" + ", ".join(foreign) + ") не ведёт на этот сервер: выпуск "
+            "сертификата сломается — удалите её или направьте на сервер"
         )
     return problems
 

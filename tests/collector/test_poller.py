@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from datetime import timedelta
 
 import pytest
@@ -73,7 +74,7 @@ async def test_counter_reset_no_negative_no_spike(cenv: CEnv) -> None:
     assert sum(p.bytes_up for p in cenv.traffic(ip)) == 5000 + 40
 
 
-async def test_missing_element_keeps_state(cenv: CEnv) -> None:
+async def test_vanished_element_drops_state_and_returns_from_zero(cenv: CEnv) -> None:
     ip = cenv.add_user(1)
     await cenv.collector.poll_once(T0)
     cenv.fake.add_traffic(ip, up_bytes=900, up_packets=3)
@@ -82,8 +83,90 @@ async def test_missing_element_keeps_state(cenv: CEnv) -> None:
     del cenv.fake.nft_sets[("tgpanel", "down")][ip]
     res = await cenv.collector.poll_once(at(60))
     assert res.updated == 0
-    st = cenv.state(ip)
-    assert st is not None and st.up.bytes == 900 and st.updated_at == at(30)
+    assert cenv.state(ip) is None  # base dropped
+    assert sum(p.bytes_up for p in cenv.traffic(ip)) == 900
+    # enabled again: apply re-adds the element (counter starts at 0) and 700 bytes pass
+    for name in ("up", "down"):
+        cenv.fake.nft_sets[("tgpanel", name)][ip] = SetCounter(0, 0)
+    cenv.fake.add_traffic(ip, up_bytes=700, up_packets=5)
+    await cenv.collector.poll_once(at(90))
+    assert sum(p.bytes_up for p in cenv.traffic(ip)) == 900 + 700  # neither lost nor doubled
+    cenv.fake.add_traffic(ip, up_bytes=100, up_packets=1)
+    await cenv.collector.poll_once(at(120))
+    assert sum(p.bytes_up for p in cenv.traffic(ip)) == 1700
+
+
+async def test_vanished_and_returned_with_bigger_counter_counts_from_zero_base(
+    cenv: CEnv,
+) -> None:
+    ip = cenv.add_user(1)
+    await cenv.collector.poll_once(T0)
+    cenv.fake.add_traffic(ip, up_bytes=100, up_packets=2)
+    await cenv.collector.poll_once(at(30))
+    for name in ("up", "down"):
+        del cenv.fake.nft_sets[("tgpanel", name)][ip]
+    await cenv.collector.poll_once(at(60))
+    for name in ("up", "down"):  # returned with a counter bigger than the one before
+        cenv.fake.nft_sets[("tgpanel", name)][ip] = SetCounter(5000, 50)
+    await cenv.collector.poll_once(at(90))
+    assert sum(p.bytes_up + p.bytes_down for p in cenv.traffic(ip)) == 100 + 10000
+
+
+async def test_table_flush_during_polling_no_spike(cenv: CEnv) -> None:
+    ips = [cenv.add_user(n) for n in (1, 2, 3)]
+    await cenv.collector.poll_once(T0)
+    for ip in ips:
+        cenv.fake.add_traffic(ip, up_bytes=10_000, up_packets=40)
+    await cenv.collector.poll_once(at(30))
+    totals = [sum(p.bytes_up for p in cenv.traffic(ip)) for ip in ips]
+    assert totals == [10_000] * 3
+    # nft flush set: every element disappears, then the firewall service reloads the rules
+    saved = {n: dict(cenv.fake.nft_sets[("tgpanel", n)]) for n in ("up", "down")}
+    for n in ("up", "down"):
+        cenv.fake.nft_sets[("tgpanel", n)].clear()
+    await cenv.collector.poll_once(at(60))
+    for n in ("up", "down"):
+        cenv.fake.nft_sets[("tgpanel", n)] = {ip: SetCounter(0, 0) for ip in saved[n]}
+    await cenv.collector.poll_once(at(90))
+    # table deleted outright and reloaded: counters restart, no negative / no spike
+    for n in ("up", "down"):
+        cenv.fake.nft_sets[("tgpanel", n)] = {ip: SetCounter(50, 1) for ip in saved[n]}
+    await cenv.collector.poll_once(at(120))
+    for n in ("up", "down"):
+        cenv.fake.nft_sets[("tgpanel", n)] = {ip: SetCounter(60, 2) for ip in saved[n]}
+    await cenv.collector.poll_once(at(150))
+    for ip in ips:
+        assert sum(p.bytes_up for p in cenv.traffic(ip)) <= 10_000 + 50 + 10
+        assert all(p.bytes_up >= 0 for p in cenv.traffic(ip))
+
+
+async def test_reused_ip_with_recreated_element_counts_zero_for_new_owner(cenv: CEnv) -> None:
+    ip = cenv.add_user(1)
+    await cenv.collector.poll_once(T0)
+    cenv.fake.add_traffic(ip, up_bytes=900_000, up_packets=900, down_bytes=10**6, down_packets=999)
+    await cenv.collector.poll_once(at(30))
+    # A deleted, B created with the same IP in one apply; the apply recreated the element
+    cenv.db.call(repo.delete_users, [cenv.uid(ip)])
+    for n in ("up", "down"):
+        cenv.fake.nft_sets[("tgpanel", n)][ip] = SetCounter(0, 0)
+    assert cenv.add_user(1, created_at=at(35), element=False) == ip
+    await cenv.collector.poll_once(at(60))
+    assert cenv.traffic(ip) == []
+    cenv.fake.add_traffic(ip, up_bytes=300, up_packets=3)
+    await cenv.collector.poll_once(at(90))
+    assert sum(p.bytes_up for p in cenv.traffic(ip)) == 300
+
+
+async def test_load_300_users_poll_is_fast(cenv: CEnv) -> None:
+    ips = [cenv.add_user(n) for n in range(1, 301)]
+    await cenv.collector.poll_once(T0)
+    for ip in ips:
+        cenv.fake.add_traffic(ip, up_bytes=5000, up_packets=20, down_bytes=100, down_packets=1)
+    t = time.perf_counter()
+    res = await cenv.collector.poll_once(at(30))
+    elapsed = time.perf_counter() - t
+    assert res.updated == 300
+    assert elapsed < 1.0, elapsed
 
 
 @pytest.mark.parametrize(

@@ -123,7 +123,7 @@ class Web:
     traffic: FakeTraffic
     requests: FakeRequests
     broadcast: FakeBroadcast
-    logins: list[str] = field(default_factory=list)
+    env_writes: list[tuple[str, str]] = field(default_factory=list)
 
     def u(self, path: str) -> str:
         return ROOT + path
@@ -193,6 +193,7 @@ async def build(tmp_path: Path, variant: str) -> AsyncIterator[Web]:
     assert out.ok, out.error
     await ctx.users.load_hostname()
     traffic, requests, broadcast = FakeTraffic(), FakeRequests(), FakeBroadcast()
+    env_writes: list[tuple[str, str]] = []
     web = WebContext(
         app=ctx,
         traffic=traffic,
@@ -202,11 +203,13 @@ async def build(tmp_path: Path, variant: str) -> AsyncIterator[Web]:
         password_hasher=hasher,
         limiter=LoginLimiter(lambda: float(clock.now.timestamp())),
         trusted_proxies=frozenset({"127.0.0.1"}),
+        extra_hosts=frozenset({"testserver"}),
+        write_env=lambda key, value: env_writes.append((key, value)),
     )
     app = create_app(web, ROOT)
     transport = httpx.ASGITransport(app=app, client=("203.0.113.9", 4000))
     async with httpx.AsyncClient(transport=transport, base_url="https://testserver") as client:
-        yield Web(client, ctx, web, fake, clock, traffic, requests, broadcast)
+        yield Web(client, ctx, web, fake, clock, traffic, requests, broadcast, env_writes)
     ctx.close()
 
 

@@ -154,3 +154,63 @@ async def test_register_start_binds_existing_user(svc: Svc, rs: RequestService) 
     extra = svc.ctx.db.call(repo.get_user_extra, uid)
     assert extra and extra.can_message
     assert (await svc.users.get(uid)).status is UserStatus.ACTIVE  # type: ignore[union-attr]
+
+
+# ------------------------------------------------------------------ review fixes
+
+
+def test_parse_ids_ascii_only() -> None:
+    from tgpanel.services.requests import parse_ids
+
+    assert parse_ids("1, 22;333  ٤٤ ² x5 " + "7" * 40) == {1, 22, 333}
+
+
+async def test_blacklist_edit_and_garbage(svc: Svc, rs: RequestService) -> None:
+    set_setting(svc, "bot_blacklist", "١٢٣ 5")
+    assert await rs.blacklist_ids() == [5]
+    assert await rs.blacklist_edit(6, True, "bot:1") == [5, 6]
+    assert await rs.blacklist_edit(5, False, "bot:1") == [6]
+    from tgpanel.apply.errors import OperationRejected
+
+    with pytest.raises(OperationRejected):
+        await rs.blacklist_edit(0, True, "bot:1")
+    assert (await rs.submit(6, None, "x")).kind is RequestKind.BLACKLISTED
+    assert "blacklist.add" in svc.audit_text()
+
+
+async def test_open_mode_global_hourly_limit_falls_back_to_approval(
+    svc: Svc, rs: RequestService
+) -> None:
+    set_setting(svc, "issuance_mode", "open")
+    set_setting(svc, "open_mode_max_per_hour", "2")
+    kinds = [(await rs.submit(tg, None, f"n{tg}")).kind for tg in (10, 11, 12)]
+    assert kinds == [RequestKind.ISSUED, RequestKind.ISSUED, RequestKind.CREATED]
+    assert len(await rs.list_pending()) == 1
+    svc.clock.now += timedelta(hours=2)  # the window has passed
+    assert (await rs.submit(13, None, "n13")).kind is RequestKind.ISSUED
+
+
+async def test_open_mode_limit_counts_concurrent_requests(svc: Svc, rs: RequestService) -> None:
+    set_setting(svc, "issuance_mode", "open")
+    set_setting(svc, "open_mode_max_per_hour", "3")
+    outs = await asyncio.gather(*(rs.submit(100 + i, None, f"c{i}") for i in range(8)))
+    assert sum(o.kind is RequestKind.ISSUED for o in outs) == 3
+    assert len(svc.ctx.db.call(repo.all_users)) == 3
+
+
+async def test_concurrent_open_requests_share_applies(svc: Svc, rs: RequestService) -> None:
+    set_setting(svc, "issuance_mode", "open")
+    set_setting(svc, "open_mode_max_per_hour", "50")
+    before = len(svc.runs())
+    outs = await asyncio.gather(*(rs.submit(200 + i, None, f"c{i}") for i in range(6)))
+    assert all(o.kind is RequestKind.ISSUED and o.link for o in outs)
+    # the pipeline coalesces operations queued together: far fewer applies than requests
+    assert len(svc.runs()) - before < 6
+
+
+async def test_locks_are_released(svc: Svc, rs: RequestService) -> None:
+    out = await rs.submit(10, None, "Bob")
+    assert out.request
+    await asyncio.gather(*(rs.approve(out.request.id, None, "bot:1") for _ in range(3)))
+    await rs.reject(out.request.id, "bot:1")
+    assert rs._locks == {}

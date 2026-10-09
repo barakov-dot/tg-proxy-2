@@ -42,6 +42,19 @@ def good_cert(days: int = 80, issued_days_ago: int = 10) -> CertInfo:
     )
 
 
+class FakeTime:
+    """Monotonic clock advanced only by (fake) sleeping: deterministic certificate waits."""
+
+    def __init__(self) -> None:
+        self.t = 0.0
+
+    def monotonic(self) -> float:
+        return self.t
+
+    async def sleep(self, seconds: float) -> None:
+        self.t += seconds
+
+
 async def no_sleep(_: float) -> None:
     return None
 
@@ -53,6 +66,7 @@ class Ops:
         self.tools = FakeShellTools()
         self.db = str(tmp_path / "ops.db")
         self.answers: list[str] = []
+        self.time = FakeTime()
         fake = self.fake
         fake.put_file(
             "/etc/tgpanel/tgpanel.env",
@@ -95,17 +109,18 @@ class Ops:
             config=FAST,
             input_fn=lambda _prompt: self.answers.pop(0),
             out=out,
-            sleep=no_sleep,
+            sleep=self.time.sleep,
             clock=lambda: NOW,
+            monotonic=self.time.monotonic,
         )
         return code, out.getvalue()
 
     def install(self) -> None:
         """What install.sh does, step by step (without the shell parts)."""
         assert self("pre-install-backup")[0] == 0
-        assert self("bootstrap", "--domain", DOMAIN, "--login", "admin", "--admin-id", "42")[0] == 0
+        assert self("bootstrap", f"--domain={DOMAIN}", "--login=admin", "--admin-id=42")[0] == 0
         self.fake.files.pop("/etc/systemd/system/tgpanel.service", None)
-        assert self("caddy-install", "--domain", DOMAIN, "--path", PANEL_PATH)[0] == 0
+        assert self("caddy-install", f"--domain={DOMAIN}", f"--path={PANEL_PATH}")[0] == 0
         from tgpanel import cli
 
         buf = io.StringIO()

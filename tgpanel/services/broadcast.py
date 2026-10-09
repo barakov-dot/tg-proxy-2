@@ -9,8 +9,6 @@ a crash may be repeated once). Message texts and links are never stored or logge
 from __future__ import annotations
 
 import asyncio
-import html
-import re
 import sqlite3
 import time
 from collections.abc import Awaitable, Callable, Sequence
@@ -33,6 +31,8 @@ from tgpanel.services.notifier import (
     MessageSender,
     Messenger,
     RateLimiter,
+    message_values,
+    render_message,
 )
 
 MAX_TEMPLATE = 3000
@@ -47,8 +47,6 @@ EXCLUSION_TEXT = {
     "cannot_message": "бот заблокирован пользователем",
     "user_deleted": "пользователь удалён",
 }
-
-_PLACEHOLDER = re.compile(r"\{(name|link|tg_link|expires)\}")
 
 
 @dataclass(frozen=True, slots=True)
@@ -141,10 +139,7 @@ def check_template(template: str) -> str:
 
 def render_template(template: str, values: dict[str, str]) -> str:
     """HTML-safe text: template and values are escaped; only the known placeholders expand."""
-    return _PLACEHOLDER.sub(
-        lambda m: html.escape(values[m.group(1)], quote=False),
-        html.escape(template, quote=False),
-    )
+    return render_message(template, values)
 
 
 class BroadcastService:
@@ -155,6 +150,7 @@ class BroadcastService:
         users: UserService,
         sender: MessageSender,
         *,
+        messenger: Messenger | None = None,
         rate: float = RATE_PER_SECOND,
         monotonic: Callable[[], float] = time.monotonic,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
@@ -162,7 +158,9 @@ class BroadcastService:
         self._pipeline = pipeline
         self._db = db
         self._users = users
-        self._messenger = Messenger(
+        # Pass the application-wide Messenger so that broadcasts, notices and reminders share
+        # ONE rate limiter (<= 20 messages per second in total).
+        self._messenger = messenger or Messenger(
             sender,
             pipeline,
             limiter=RateLimiter(rate, clock=monotonic, sleep=sleep),
@@ -170,6 +168,9 @@ class BroadcastService:
         )
         self._cancelled: set[int] = set()
         self._running: dict[int, asyncio.Lock] = {}
+
+    def is_running(self, broadcast_id: int) -> bool:
+        return broadcast_id in self._running
 
     # ------------------------------------------------------------------ preview / create
 
@@ -248,9 +249,21 @@ class BroadcastService:
         *,
         on_progress: Callable[[int, int], Awaitable[None]] | None = None,
     ) -> BroadcastReport:
-        lock = self._running.setdefault(broadcast_id, asyncio.Lock())
-        if lock.locked():
+        if broadcast_id in self._running:
             return await self.report(broadcast_id)
+        lock = self._running[broadcast_id] = asyncio.Lock()
+        try:
+            await self._run_locked(lock, broadcast_id, on_progress)
+        finally:
+            self._running.pop(broadcast_id, None)
+        return await self.report(broadcast_id)
+
+    async def _run_locked(
+        self,
+        lock: asyncio.Lock,
+        broadcast_id: int,
+        on_progress: Callable[[int, int], Awaitable[None]] | None,
+    ) -> None:
         async with lock:
             self._cancelled.discard(broadcast_id)
             cfg = await self._db.run(read_settings)
@@ -269,7 +282,6 @@ class BroadcastService:
                 if on_progress is not None:
                     await on_progress(done + 1, total)
             self._cancelled.discard(broadcast_id)
-        return await self.report(broadcast_id)
 
     @staticmethod
     def _template(conn: sqlite3.Connection, broadcast_id: int) -> str:
@@ -298,13 +310,8 @@ class BroadcastService:
             tg_link = self._users.tg_link(user)
         except Exception:
             return "error:NoLink"
-        expires = (
-            "без срока"
-            if user.expires_at is None
-            else user.expires_at.astimezone(zone).strftime("%d.%m.%Y %H:%M")
-        )
-        text = render_template(
-            template, {"name": user.name, "link": link, "tg_link": tg_link, "expires": expires}
+        text = render_message(
+            template, message_values(user, link, tg_link, zone.key, self._pipeline.now())
         )
         return await self._messenger.deliver(tg_id, text, LinkButton(BUTTON_TEXT, link))
 

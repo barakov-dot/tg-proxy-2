@@ -13,6 +13,7 @@ from tgpanel.apply.importer import (
     RowEdit,
 )
 from tgpanel.domain.import_ import DEFAULT_ID_REGEX
+from tgpanel.web.inputs import parse_uint
 from tgpanel.web.routes.common import (
     HttpError,
     auth_of,
@@ -47,7 +48,8 @@ async def import_form(request: Request) -> Response:
 def _edit_lines(form: FormData) -> tuple[list[str], dict[str, RowEdit], list[str]]:
     """Per-row inputs -> (csv lines for 'recalculate', edits for 'confirm', errors)."""
     n_raw = fstr(form, "n")
-    n = int(n_raw) if n_raw.isdigit() and int(n_raw) <= MAX_ROWS else 0
+    n = parse_uint(n_raw, max_digits=5) or 0
+    n = n if n <= MAX_ROWS else 0
     lines: list[str] = []
     edits: dict[str, RowEdit] = {}
     errors: list[str] = []
@@ -62,10 +64,11 @@ def _edit_lines(form: FormData) -> tuple[list[str], dict[str, RowEdit], list[str
         cm = fstr(form, f"cm_{i}")
         ocm = fstr(form, f"ocm_{i}")
         skip = fstr(form, f"skip_{i}") == "1"
-        if tg_raw and (not tg_raw.isdigit() or len(tg_raw) > 16):
+        tg_value = parse_uint(tg_raw, max_digits=16) if tg_raw else None
+        if tg_raw and (tg_value is None or tg_value == 0):
             errors.append(T["import_bad_tg"].format(name=src))
             continue
-        tg_id = int(tg_raw) if tg_raw and tg_raw != orig_tg else None
+        tg_id = tg_value if tg_raw and tg_raw != orig_tg else None
         changed_dn = dn if dn and dn != odn else None
         changed_cm = cm if cm != ocm else None
         if skip or tg_id is not None or changed_dn is not None or changed_cm is not None:

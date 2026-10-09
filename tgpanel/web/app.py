@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import logging
 import re
+import traceback
 from pathlib import Path
 
 from fastapi import FastAPI, Request, Response
@@ -22,7 +23,10 @@ from jinja2 import Environment, FileSystemLoader, StrictUndefined
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.templating import Jinja2Templates
 
+from tgpanel.db import repo
+from tgpanel.system.validation import scrub
 from tgpanel.web.deps import WebContext
+from tgpanel.web.guards import BodyLimit, HostGuard
 from tgpanel.web.routes import admin, auth, create, dashboard, imports, users
 from tgpanel.web.routes.common import HttpError, LoginRequired, get_web, render, root_of
 from tgpanel.web.security import Signer
@@ -65,13 +69,23 @@ def create_app(ctx: WebContext, root_path: str) -> FastAPI:
     app.state.signer = Signer(ctx.secret_key)
     app.state.root_path = root
     app.state.templates = make_templates()
+    app.state.failure_audit = {}
+
+    async def allowed_hosts() -> set[str]:
+        name = await ctx.app.db.run(repo.get_setting, "panel_hostname", "")
+        return {h.lower() for h in ctx.extra_hosts} | ({name.lower()} if name else set())
+
+    app.add_middleware(BodyLimit)
+    app.add_middleware(HostGuard, allowed=allowed_hosts)
 
     @app.middleware("http")
     async def security_headers(request: Request, call_next):  # type: ignore[no-untyped-def]
         try:
             response: Response = await call_next(request)
         except Exception as exc:
-            log.error("unhandled error: %s", type(exc).__name__)
+            summary = scrub(f"{type(exc).__name__}: {exc}", 300)
+            trace = scrub("".join(traceback.format_exception(exc)), 6000)
+            log.error("unhandled error: %s\n%s", summary, trace)
             response = await _error_page(request, 500, T["server_error"])
         h = response.headers
         h["Content-Security-Policy"] = CSP
