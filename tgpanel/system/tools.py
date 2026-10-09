@@ -165,7 +165,7 @@ class RealShellTools:
 
     async def migrate_database(self, python: str, repo: str, db_path: str) -> str:
         res = await run_command(
-            [python, "-I", "-m", "tgpanel.ops_cli", "migrate", "--db", db_path],
+            [python, "-m", "tgpanel.ops_cli", "--db", db_path, "migrate"],
             env={"HOME": "/root", "PYTHONPATH": repo},
             timeout_s=self._timeout,
         )
