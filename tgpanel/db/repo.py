@@ -6,6 +6,7 @@ whitelists; request input is never interpolated into SQL.
 
 from __future__ import annotations
 
+import re
 import sqlite3
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
@@ -18,7 +19,7 @@ from tgpanel.db.connection import transaction
 from tgpanel.db.times import from_db, from_db_opt, to_db, to_db_opt
 from tgpanel.domain.counters import Counter
 from tgpanel.domain.models import CarrierMode, PoolRecord, UserRecord, UserStatus
-from tgpanel.services.api import UserListQuery
+from tgpanel.domain.queries import PER_PAGE_CHOICES, UserListQuery
 
 
 def _rowid(cur: sqlite3.Cursor) -> int:
@@ -257,7 +258,20 @@ def pool_occupancy(conn: sqlite3.Connection) -> dict[int, int]:
 
 # ------------------------------------------------------------------ user list query
 
-_ONLINE = "(COALESCE(cs.active_last, 0) = 1 AND COALESCE(cs.active_prev, 0) = 1)"
+ONLINE_FRESHNESS = timedelta(seconds=90)
+
+
+def _online_sql(cutoff: datetime) -> str:
+    """Online = active in two last polls AND counter_state refreshed within the window.
+
+    The cutoff literal comes from ``to_db`` (fixed-width digits), never from user input.
+    """
+    return (
+        "(COALESCE(cs.active_last, 0) = 1 AND COALESCE(cs.active_prev, 0) = 1"
+        f" AND COALESCE(cs.updated_at, '') >= '{to_db(cutoff)}')"
+    )
+
+
 _TRAFFIC = "(COALESCE(t.up, 0) + COALESCE(t.down, 0))"
 
 # sort name -> (SQL expression, nullable, text). Never built from request input.
@@ -268,7 +282,7 @@ SORT_EXPRESSIONS: dict[str, tuple[str, bool, bool]] = {
     "tg_id": ("u.tg_id", True, False),
     "tg_username": ("u.tg_username", True, True),
     "status": ("u.status", False, False),
-    "online": (_ONLINE, False, False),
+    "online": ("", False, False),  # built per call: depends on the freshness cutoff
     "created_at": ("u.created_at", False, False),
     "expires_at": ("u.expires_at", True, False),
     "first_seen_at": ("u.first_seen_at", True, False),
@@ -319,44 +333,105 @@ def _py_lower(value: Any) -> Any:
     return value.lower() if isinstance(value, str) else value
 
 
+def _traffic_for_users(
+    conn: sqlite3.Connection, ids: Sequence[int], since: datetime | None
+) -> dict[int, tuple[int, int]]:
+    """(up, down) per user id over the three tiers, for the given ids only."""
+    if not ids:
+        return {}
+    marks = ",".join("?" * len(ids))
+    parts: list[str] = []
+    params: list[Any] = []
+    for table in TRAFFIC_TIERS.values():
+        sql = f"SELECT user_id, bytes_up, bytes_down FROM {table} WHERE user_id IN ({marks})"  # noqa: S608
+        params += list(ids)
+        if since is not None:
+            sql += " AND bucket_ts >= ?"
+            params.append(times.to_epoch(since))
+        parts.append(sql)
+    rows = conn.execute(
+        "SELECT user_id, SUM(bytes_up) AS up, SUM(bytes_down) AS down FROM ("  # noqa: S608
+        + " UNION ALL ".join(parts)
+        + ") GROUP BY user_id",
+        params,
+    )
+    return {int(r["user_id"]): (int(r["up"]), int(r["down"])) for r in rows}
+
+
+def _online_for_users(
+    conn: sqlite3.Connection, ids: Sequence[int], cutoff: datetime
+) -> dict[int, bool]:
+    if not ids:
+        return {}
+    rows = conn.execute(
+        "SELECT user_id, active_last, active_prev, updated_at FROM counter_state"  # noqa: S608
+        f" WHERE user_id IN ({','.join('?' * len(ids))})",
+        list(ids),
+    )
+    result: dict[int, bool] = {}
+    for r in rows:
+        updated = from_db_opt(r["updated_at"])
+        result[int(r["user_id"])] = bool(
+            r["active_last"] and r["active_prev"] and updated is not None and updated >= cutoff
+        )
+    return result
+
+
 def list_users(
-    conn: sqlite3.Connection, query: UserListQuery, now: datetime
+    conn: sqlite3.Connection,
+    query: UserListQuery,
+    now: datetime,
+    online_freshness: timedelta = ONLINE_FRESHNESS,
 ) -> tuple[list[UserListRow], int]:
     """Filtered, sorted, paginated user list with traffic over ``query.period``.
 
     Traffic is the sum over the minute, hour and day tiers (tiers are non-overlapping:
-    rollup moves data). Returns (rows of the requested page, total matching count).
+    rollup moves data). Traffic/counter tables are joined only when sorting or filtering
+    needs them; otherwise the page is selected first and traffic/online are computed for
+    just its ids. A user is online only if counter_state was refreshed within
+    ``online_freshness`` of ``now`` (a dead collector means nobody is online).
+    Returns (rows of the requested page, total matching count).
     """
     if query.sort not in SORT_EXPRESSIONS:
         raise ValueError(f"unknown sort field: {query.sort!r}")
     if query.period not in PERIOD_DELTAS:
         raise ValueError(f"unknown period: {query.period!r}")
-    if query.page < 1 or query.per_page < 1:
-        raise ValueError("page and per_page must be >= 1")
+    if query.page < 1:
+        raise ValueError("page must be >= 1")
+    if query.per_page not in PER_PAGE_CHOICES:
+        raise ValueError(f"per_page must be one of {PER_PAGE_CHOICES}")
     conn.create_function("py_lower", 1, _py_lower, deterministic=True)
 
-    delta = PERIOD_DELTAS[query.period]
-    tier_params: list[Any] = []
-    parts: list[str] = []
-    for table in TRAFFIC_TIERS.values():
-        if delta is None:
-            parts.append(f"SELECT user_id, bytes_up, bytes_down FROM {table}")  # noqa: S608
-        else:
-            parts.append(
-                f"SELECT user_id, bytes_up, bytes_down FROM {table} WHERE bucket_ts >= ?"  # noqa: S608
-            )
-            tier_params.append(times.to_epoch(now - delta))
-    traffic = (
-        "SELECT user_id, SUM(bytes_up) AS up, SUM(bytes_down) AS down FROM ("  # noqa: S608
-        + " UNION ALL ".join(parts)
-        + ") GROUP BY user_id"
-    )
-    from_sql = (
-        "FROM users u LEFT JOIN counter_state cs ON cs.user_id = u.id"
-        f" LEFT JOIN ({traffic}) t ON t.user_id = u.id"
-    )
-
     f = query.filter
+    cutoff = now - online_freshness
+    online_sql = _online_sql(cutoff)
+    delta = PERIOD_DELTAS[query.period]
+    since = None if delta is None else now - delta
+
+    need_traffic = query.sort == "traffic" or f.traffic_min is not None or f.traffic_max is not None
+    need_cs = query.sort == "online" or f.online is not None
+
+    from_sql = "FROM users u"
+    tier_params: list[Any] = []
+    if need_cs:
+        from_sql += " LEFT JOIN counter_state cs ON cs.user_id = u.id"
+    if need_traffic:
+        parts: list[str] = []
+        for table in TRAFFIC_TIERS.values():
+            if since is None:
+                parts.append(f"SELECT user_id, bytes_up, bytes_down FROM {table}")  # noqa: S608
+            else:
+                parts.append(
+                    f"SELECT user_id, bytes_up, bytes_down FROM {table} WHERE bucket_ts >= ?"  # noqa: S608
+                )
+                tier_params.append(times.to_epoch(since))
+        traffic = (
+            "SELECT user_id, SUM(bytes_up) AS up, SUM(bytes_down) AS down FROM ("  # noqa: S608
+            + " UNION ALL ".join(parts)
+            + ") GROUP BY user_id"
+        )
+        from_sql += f" LEFT JOIN ({traffic}) t ON t.user_id = u.id"
+
     where: list[str] = []
     params: list[Any] = []
     if f.query:
@@ -371,7 +446,7 @@ def list_users(
         where.append(f"u.status IN ({','.join('?' * len(f.statuses))})")
         params += [UserStatus(s).value for s in f.statuses]
     if f.online is not None:
-        where.append(_ONLINE if f.online else f"NOT {_ONLINE}")
+        where.append(online_sql if f.online else f"NOT {online_sql}")
     if f.imported is not None:
         where.append("u.imported = ?")
         params.append(int(f.imported))
@@ -407,6 +482,8 @@ def list_users(
     where_sql = (" WHERE " + " AND ".join(where)) if where else ""
 
     expr, nullable, text = SORT_EXPRESSIONS[query.sort]
+    if query.sort == "online":
+        expr = online_sql
     if text:
         expr = f"py_lower({expr})"
     direction = "DESC" if query.descending else "ASC"
@@ -421,20 +498,23 @@ def list_users(
             [*tier_params, *params],
         ).fetchone()[0]
     )
-    sql = (
-        f"SELECT u.*, {_ONLINE} AS online, COALESCE(t.up, 0) AS t_up,"
-        f" COALESCE(t.down, 0) AS t_down {from_sql}{where_sql}{order_sql} LIMIT ? OFFSET ?"
-    )
     limit_params = [query.per_page, (query.page - 1) * query.per_page]
+    page = conn.execute(
+        f"SELECT u.* {from_sql}{where_sql}{order_sql} LIMIT ? OFFSET ?",
+        [*tier_params, *params, *limit_params],
+    ).fetchall()
+    ids = [int(r["id"]) for r in page]
+    traffic_by_id = _traffic_for_users(conn, ids, since)
+    online_by_id = _online_for_users(conn, ids, cutoff)
     rows = [
         UserListRow(
             user=user_from_row(r),
             extra=extra_from_row(r),
-            online=bool(r["online"]),
-            bytes_up=int(r["t_up"]),
-            bytes_down=int(r["t_down"]),
+            online=online_by_id.get(int(r["id"]), False),
+            bytes_up=traffic_by_id.get(int(r["id"]), (0, 0))[0],
+            bytes_down=traffic_by_id.get(int(r["id"]), (0, 0))[1],
         )
-        for r in conn.execute(sql, [*tier_params, *params, *limit_params])
+        for r in page
     ]
     return rows, total
 
@@ -497,6 +577,14 @@ class AuditEntry:
     details: str
 
 
+_SECRET_LIKE = re.compile(r"(?i)(?:dd)?[0-9a-f]{32}")
+
+
+def _redact(text: str) -> str:
+    """Replace anything that looks like a proxy secret (32 hex, optionally dd-prefixed)."""
+    return _SECRET_LIKE.sub("[redacted]", text)
+
+
 def add_audit(
     conn: sqlite3.Connection,
     ts: datetime,
@@ -507,7 +595,7 @@ def add_audit(
 ) -> int:
     cur = conn.execute(
         "INSERT INTO audit_log (ts, actor, action, target, details) VALUES (?, ?, ?, ?, ?)",
-        (to_db(ts), actor, action, target, details),
+        (to_db(ts), actor, action, _redact(target), _redact(details)),
     )
     return _rowid(cur)
 

@@ -82,3 +82,11 @@ def test_choose_granularity() -> None:
     assert choose_granularity(NOW - timedelta(days=100), NOW - timedelta(days=99), NOW) == "hour"
     assert choose_granularity(NOW - timedelta(days=20), NOW - timedelta(days=19), NOW) == "hour"
     assert DEFAULT_RETENTION.minute_days == 14
+
+
+def test_new_element_counts_first_delta() -> None:
+    d = compute_delta(None, Counter(500, 7), new_element=True)
+    assert (d.bytes, d.packets, d.state, d.reset) == (500, 7, Counter(500, 7), False)
+    assert compute_delta(None, Counter(500, 7)).bytes == 0
+    # an existing element ignores the flag
+    assert compute_delta(Counter(100, 5), Counter(150, 6), new_element=True).bytes == 50

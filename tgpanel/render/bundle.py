@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from tgpanel.domain.invariants import compute_relay_limits
 from tgpanel.domain.models import DesiredState
 from tgpanel.render.config import patch_config
 from tgpanel.render.errors import RenderError
@@ -21,19 +22,6 @@ class RenderedFiles:
     nft_file: bytes
     pools_to_run: tuple[int, ...]
     pools_to_stop: tuple[int, ...]
-
-
-def compute_relay_limits(state: DesiredState, profile_count: int) -> dict[str, int]:
-    """Relay limits written into config.json (PLAN 3.7)."""
-    sessions = state.relay_limits.max_sessions_global
-    return {
-        "max_profiles": max(32, profile_count + 16),
-        "max_sessions_global": sessions,
-        "new_sessions_burst": sessions,
-        "max_bootstraps_global": sessions,
-        "new_bootstraps_burst": sessions,
-        "max_streams_global": state.relay_limits.max_streams_global,
-    }
 
 
 def render_all(state: DesiredState, existing_config: bytes, facts: MtproxyFacts) -> RenderedFiles:

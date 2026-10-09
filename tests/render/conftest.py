@@ -64,8 +64,10 @@ def golden() -> Callable[[str, bytes | str], None]:
     def check(name: str, actual: bytes | str) -> None:
         data = actual.encode() if isinstance(actual, str) else actual
         path = GOLDEN / name
-        if os.environ.get("UPDATE_GOLDEN") == "1" or not path.exists():
+        if os.environ.get("UPDATE_GOLDEN") == "1":
             path.write_bytes(data)
+        elif not path.exists():
+            pytest.fail(f"golden file missing: {name} (create it with UPDATE_GOLDEN=1)")
         assert path.read_bytes() == data, f"golden mismatch: {name}"
 
     return check

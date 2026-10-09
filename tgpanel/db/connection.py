@@ -21,12 +21,28 @@ from tgpanel.db.migrations import MIGRATIONS
 
 def connect(path: str | Path = ":memory:") -> sqlite3.Connection:
     """Open a connection: WAL, foreign keys, Row factory, autocommit (explicit transactions)."""
-    conn = sqlite3.connect(str(path), check_same_thread=False, isolation_level=None, timeout=10.0)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys = ON")
-    conn.execute("PRAGMA journal_mode = WAL")
-    conn.execute("PRAGMA synchronous = NORMAL")
-    conn.execute("PRAGMA busy_timeout = 10000")
+    on_disk = str(path) not in ("", ":memory:") and not str(path).startswith("file:")
+    old_umask = os.umask(0o077)  # new db/-wal/-shm files are born 0600
+    try:
+        if on_disk:
+            parent = Path(path).parent
+            if not parent.exists():
+                parent.mkdir(mode=0o700, parents=True)
+                os.chmod(parent, 0o700)
+        conn = sqlite3.connect(
+            str(path), check_same_thread=False, isolation_level=None, timeout=10.0
+        )
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA foreign_keys = ON")
+        conn.execute("PRAGMA journal_mode = WAL")
+        conn.execute("PRAGMA synchronous = NORMAL")
+        conn.execute("PRAGMA busy_timeout = 10000")
+    finally:
+        os.umask(old_umask)
+    if on_disk:
+        for suffix in ("", "-wal", "-shm"):
+            with contextlib.suppress(FileNotFoundError):
+                os.chmod(f"{path}{suffix}", 0o600)
     return conn
 
 
@@ -40,7 +56,9 @@ def transaction(conn: sqlite3.Connection) -> Iterator[sqlite3.Connection]:
     try:
         yield conn
     except BaseException:
-        conn.execute("ROLLBACK")
+        # A failing ROLLBACK must not mask the original exception.
+        with contextlib.suppress(sqlite3.Error):
+            conn.execute("ROLLBACK")
         raise
     else:
         conn.execute("COMMIT")

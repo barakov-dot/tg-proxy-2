@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import hashlib
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from tgpanel.domain.models import DesiredState, PoolRecord, UserRecord, UserStatus
+from tgpanel.domain.pools import sentinel_host_pool, sentinel_slot_needed
 from tgpanel.render.errors import RenderError
 
 SENTINEL_NAME = "_tgpanel_sentinel"
@@ -16,7 +17,7 @@ SENTINEL_NAME = "_tgpanel_sentinel"
 @dataclass(frozen=True, slots=True)
 class ProfileEntry:
     name: str
-    secret: str
+    secret: str = field(repr=False)
     backend: str
     carrier_mode: str | None
     has_limits: bool
@@ -34,19 +35,20 @@ def pool_by_id(state: DesiredState, pool_id: int) -> PoolRecord:
 
 
 def sentinel_pool(state: DesiredState) -> PoolRecord:
-    """Pool that hosts the sentinel secret: first managed pool with a free slot, else the first."""
-    managed = sorted((p for p in state.pools if p.managed), key=lambda p: p.id)
-    if not managed:
+    """Pool hosting the sentinel secret: first managed pool with a free slot (never over spp).
+
+    The caller must create a pool beforehand (``ensure_sentinel_capacity``) if none is free.
+    """
+    if not any(p.managed for p in state.pools):
         raise RenderError("no managed pools: cannot render the sentinel profile")
-    for pool in managed:
-        used = sum(1 for u in state.users if u.pool_id == pool.id)
-        if used < state.secrets_per_process:
-            return pool
-    return managed[0]
+    pool = sentinel_host_pool(state.pools, state.users, state.secrets_per_process)
+    if pool is None:
+        raise RenderError("no managed pool has a free slot for the sentinel profile")
+    return pool
 
 
 def needs_sentinel(state: DesiredState) -> bool:
-    return not any(u.status is UserStatus.ACTIVE for u in state.users)
+    return sentinel_slot_needed(state.users)
 
 
 def render_profiles(state: DesiredState) -> bytes:

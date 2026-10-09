@@ -8,14 +8,16 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 
 from tgpanel.domain.models import DesiredState, PoolRecord
+from tgpanel.domain.pools import MAX_SECRETS_PER_PROCESS
+from tgpanel.domain.secrets_ import base_secret
 from tgpanel.render.errors import RenderError
 from tgpanel.render.profiles import needs_sentinel, sentinel_pool
 
-MAX_SECRETS_HARD_LIMIT = 16
-_HEX32 = re.compile(r"^[0-9a-f]{32}$")
-_SAFE_ARG = re.compile(r"^[A-Za-z0-9_.:/@=+,-]+$")
-_SAFE_PATH = re.compile(r"^/[A-Za-z0-9_.+@/-]*$")
-_SAFE_USER = re.compile(r"^[a-z_][a-z0-9_-]{0,31}$")
+MAX_SECRETS_HARD_LIMIT = MAX_SECRETS_PER_PROCESS
+_HEX32 = re.compile(r"[0-9a-f]{32}")
+_SAFE_ARG = re.compile(r"[A-Za-z0-9_.:/@=+,-]+")
+_SAFE_PATH = re.compile(r"/[A-Za-z0-9_.+@/-]*")
+_SAFE_USER = re.compile(r"[a-z_][a-z0-9_-]{0,31}")
 
 
 @dataclass(frozen=True, slots=True)
@@ -26,6 +28,8 @@ class MtproxyFacts:
     proxy_multi_conf: str
     nat_args: str = ""
     working_directory: str | None = None
+    # ExecStart references $MTPROXY_NAT_ARGS but no value was found: callers should warn.
+    nat_args_unresolved: bool = False
 
 
 # ---------------------------------------------------------------- env files
@@ -36,11 +40,19 @@ def pool_secrets(state: DesiredState, pool: PoolRecord) -> list[str]:
 
     The sentinel secret is appended to the pool that hosts it when no user is active.
     """
-    secrets = [
-        u.mtproxy_secret for u in sorted(state.users, key=lambda u: u.id) if u.pool_id == pool.id
-    ]
+    try:
+        secrets = [
+            u.mtproxy_secret
+            for u in sorted(state.users, key=lambda u: u.id)
+            if u.pool_id == pool.id
+        ]
+    except ValueError as exc:
+        raise RenderError(f"pool {pool.id}: invalid user secret format") from exc
     if needs_sentinel(state) and sentinel_pool(state).id == pool.id:
-        secrets.append(state.sentinel_secret)
+        try:
+            secrets.append(base_secret(state.sentinel_secret))
+        except ValueError as exc:
+            raise RenderError("sentinel secret has invalid format") from exc
     return secrets
 
 
@@ -58,7 +70,7 @@ def render_pool_env(
             f"{MAX_SECRETS_HARD_LIMIT}"
         )
     for secret in secret_list:
-        if not _HEX32.match(secret):
+        if not _HEX32.fullmatch(secret):
             raise RenderError(f"pool {pool.id}: invalid MTProxy secret (need 32 lowercase hex)")
     if any(c in nat_args for c in "\"'$\\`\n\r%"):
         raise RenderError("NAT arguments contain forbidden characters")
@@ -172,14 +184,26 @@ def _expand(token: str, env: dict[str, str], what: str) -> str:
     return _VAR.sub(repl, token)
 
 
-def extract_mtproxy_facts(unit_text: str, dropin_texts: list[str], env_text: str) -> MtproxyFacts:
-    """Extract the few facts we reuse from the installed ``mtproxy.service``."""
+def extract_mtproxy_facts(
+    unit_text: str,
+    dropin_texts: list[str],
+    env_text: str,
+    environment_file_texts: list[str] | None = None,
+) -> MtproxyFacts:
+    """Extract the few facts we reuse from the installed ``mtproxy.service``.
+
+    ``environment_file_texts``: contents of every existing ``EnvironmentFile=`` named in the
+    unit/drop-ins (phase 2 reads and passes them); their KEY=VALUE lines are searched too,
+    so ``MTPROXY_NAT_ARGS`` defined there is found. Later files override earlier ones.
+    """
     view = _UnitView()
     environment: dict[str, str] = {}
     for text in [unit_text, *dropin_texts]:
         _scan_unit(text, view, environment)
     # Per systemd, EnvironmentFile= values override Environment= values.
     environment.update(_parse_env_text(env_text))
+    for extra in environment_file_texts or []:
+        environment.update(_parse_env_text(extra))
 
     if not view.exec_start:
         raise RenderError("mtproxy.service: no ExecStart= found")
@@ -222,15 +246,16 @@ def extract_mtproxy_facts(unit_text: str, dropin_texts: list[str], env_text: str
     binary = _expand(binary, environment, "binary")
     nat = environment.get("MTPROXY_NAT_ARGS")
     nat_args = nat.strip() if nat is not None else " ".join(inline_nat)
+    unresolved = nat is None and not inline_nat and "MTPROXY_NAT_ARGS" in view.exec_start
     workdir = view.working_directory
-    return MtproxyFacts(binary, user, aes_pwd, multi, nat_args, workdir)
+    return MtproxyFacts(binary, user, aes_pwd, multi, nat_args, workdir, unresolved)
 
 
 # ------------------------------------------------------------------- unit
 
 
 def _check_path(value: str, what: str) -> None:
-    if not _SAFE_PATH.match(value):
+    if not _SAFE_PATH.fullmatch(value):
         raise RenderError(f"unsafe {what} for unit file: {value!r}")
 
 
@@ -238,7 +263,7 @@ def render_pool_unit(facts: MtproxyFacts) -> bytes:
     _check_path(facts.binary, "binary path")
     _check_path(facts.aes_pwd, "--aes-pwd path")
     _check_path(facts.proxy_multi_conf, "proxy-multi.conf path")
-    if not _SAFE_USER.match(facts.user):
+    if not _SAFE_USER.fullmatch(facts.user):
         raise RenderError(f"unsafe user for unit file: {facts.user!r}")
     workdir_line = ""
     if facts.working_directory:

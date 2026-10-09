@@ -26,13 +26,17 @@ class Delta:
     reset: bool = False
 
 
-def compute_delta(prev: Counter | None, current: Counter) -> Delta:
+def compute_delta(prev: Counter | None, current: Counter, new_element: bool = False) -> Delta:
     """Delta since the previous poll.
 
     No previous state or a decreasing counter (reboot, rules reload) means the current
-    value is the new base and the delta is 0. Never negative.
+    value is the new base and the delta is 0. Never negative. With ``new_element=True``
+    and no previous state (a set element that appeared since the last poll) the base is
+    Counter(0, 0), so the first delta counts in full.
     """
     if prev is None:
+        if new_element:
+            return Delta(current.bytes, current.packets, current, reset=False)
         return Delta(0, 0, current, reset=False)
     if current.bytes < prev.bytes or current.packets < prev.packets:
         return Delta(0, 0, current, reset=True)

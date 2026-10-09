@@ -39,3 +39,11 @@ def test_parse_rejects_invalid() -> None:
         parse_imported_secret("nope")
     with pytest.raises(ValueError):
         base_secret("nope")
+
+
+def test_uppercase_dd_prefix_and_repr_hidden() -> None:
+    assert is_valid_secret("DD" + HEX.upper())
+    assert base_secret("DD" + HEX.upper()) == HEX
+    p = parse_imported_secret("DD" + HEX.upper())
+    assert p.has_dd_prefix and p.base == HEX
+    assert HEX not in repr(p) and HEX.upper() not in repr(p)

@@ -81,3 +81,23 @@ def test_unmanaged_pool_ignored() -> None:
 def test_invalid_config_propagates() -> None:
     with pytest.raises(RenderError):
         render_all(make_state((make_user(1),)), b"[]", FACTS)
+
+
+@pytest.mark.parametrize("spp", [15, 16])
+def test_full_pool_zero_active_users_is_render_error(spp: int) -> None:
+    users = tuple(make_user(i, status=UserStatus.DISABLED) for i in range(1, spp + 1))
+    one_pool = (PoolRecord(1, 2400, 8900),)
+    with pytest.raises(RenderError):
+        render_all(make_state(users, one_pool, secrets_per_process=spp), b"{}", FACTS)
+    # a second pool with a free slot hosts the sentinel; no pool exceeds spp
+    two = (*one_pool, PoolRecord(2, 2401, 8901))
+    r = render_all(make_state(users, two, secrets_per_process=spp), b"{}", FACTS)
+    assert r.pool_envs[1].decode().count("-S ") == spp
+    assert r.pool_envs[2].decode().count("-S ") == 1
+
+
+def test_disabled_users_do_not_inflate_max_profiles() -> None:
+    users = tuple(make_user(i, status=UserStatus.DISABLED) for i in range(1, 16))
+    users += (make_user(20, pool_id=2),)
+    r = render_all(make_state(users), b"{}", FACTS)
+    assert json.loads(r.config_json)["limits"]["max_profiles"] == 32

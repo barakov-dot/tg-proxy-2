@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from dataclasses import replace
 
 import pytest
 
@@ -40,6 +41,7 @@ def test_extract_clean() -> None:
         proxy_multi_conf="/etc/mtproxy/proxy-multi.conf",
         nat_args="",
         working_directory="/var/lib/mtproxy",
+        nat_args_unresolved=True,  # ExecStart uses $MTPROXY_NAT_ARGS, nothing defines it
     )
 
 
@@ -161,3 +163,40 @@ def test_pool_secrets_sentinel() -> None:
     state = make_state((make_user(1, status=UserStatus.DISABLED),))
     assert pool_secrets(state, state.pools[0]) == [secret(1), SENTINEL]
     assert pool_secrets(state, state.pools[1]) == []
+
+
+def test_pool_secrets_lowercase_for_uppercase_and_sentinel() -> None:
+    upper = "DD" + secret(1).upper()
+    state = make_state((make_user(1, status=UserStatus.DISABLED, sec=upper),))
+    state = replace(state, sentinel_secret="AB" * 16)
+    assert pool_secrets(state, state.pools[0]) == [secret(1), "ab" * 16]
+
+
+def test_pool_secrets_invalid_sentinel_is_render_error() -> None:
+    state = replace(make_state((make_user(1, status=UserStatus.DISABLED),)), sentinel_secret="zz")
+    with pytest.raises(RenderError):
+        pool_secrets(state, state.pools[0])
+
+
+def test_env_trailing_newline_secret_rejected_by_fullmatch() -> None:
+    with pytest.raises(RenderError):
+        render_pool_env(POOL, [secret(1) + "\n"], 1, 1, "")
+    with pytest.raises(RenderError):
+        render_pool_unit(MtproxyFacts("/x/m", "m\n", "/a", "/b"))
+
+
+def test_nat_args_from_environment_file_texts() -> None:
+    unit = fixture_text("owner", "mtproxy.service")
+    drop = fixture_text("owner", "mtproxy.service.d/nat.conf")
+    env_file = 'MTPROXY_NAT_ARGS="--nat-info 9.9.9.9:8.8.8.8"\n'
+    facts = extract_mtproxy_facts(unit, [drop], "", [env_file])
+    assert facts.nat_args == "--nat-info 9.9.9.9:8.8.8.8" and not facts.nat_args_unresolved
+
+
+def test_nat_args_unresolved_flag() -> None:
+    unit = fixture_text("clean", "mtproxy.service")  # ExecStart uses $MTPROXY_NAT_ARGS
+    assert extract_mtproxy_facts(unit, [], "").nat_args_unresolved
+    resolved = extract_mtproxy_facts(unit, [], "", ['MTPROXY_NAT_ARGS=""\n'])
+    assert not resolved.nat_args_unresolved
+    no_ref = "[Service]\nExecStart=/x/mtproto-proxy -u m --aes-pwd /a/s /a/proxy-multi.conf\n"
+    assert not extract_mtproxy_facts(no_ref, [], "").nat_args_unresolved

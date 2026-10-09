@@ -124,3 +124,29 @@ def test_missing_carrier_mode_is_none_and_modes_preserved() -> None:
 def test_parse_mtproxy_secrets_text() -> None:
     text = f"{secret_for(1)}\n\n# c\n  dd{secret_for(2).upper()} \n"
     assert parse_mtproxy_secrets_text(text) == {secret_for(1), secret_for(2)}
+
+
+def test_bad_regex_is_reported_not_raised() -> None:
+    plan = plan_import(fifteen(), id_regex="([unclosed")
+    assert plan.blocked and any("regex" in e for e in plan.errors)
+
+
+def test_regex_without_group_and_non_digit_group() -> None:
+    plan = plan_import([prof("user_123456", 1)], id_regex=r"^user_\d+$")
+    assert plan.blocked and any("capture group" in e for e in plan.errors)
+    assert plan.rows[0].tg_id is None
+    plan = plan_import([prof("user_abc", 1)], id_regex=r"^user_(\w+)$")
+    assert not plan.blocked
+    assert plan.rows[0].tg_id is None and any("not recognized" in w for w in plan.warnings)
+
+
+def test_pathological_regex_length_rejected() -> None:
+    plan = plan_import([prof("user_123456", 1)], id_regex="(" + "a" * 300 + ")")
+    assert plan.blocked and any("longer" in e for e in plan.errors)
+
+
+def test_import_plan_repr_hides_secrets() -> None:
+    p = prof("user_93455871", 1)
+    plan = plan_import([p])
+    assert p.secret not in repr(p)
+    assert p.secret not in repr(plan.rows[0])

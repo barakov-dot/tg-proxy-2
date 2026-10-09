@@ -6,6 +6,8 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from enum import StrEnum
 
+from tgpanel.domain.secrets_ import base_secret
+
 
 class UserStatus(StrEnum):
     ACTIVE = "active"
@@ -32,7 +34,7 @@ class PoolRecord:
 class UserRecord:
     id: int
     name: str
-    secret: str  # as stored: 32 hex, or "dd"+32 hex for imported users
+    secret: str = field(repr=False)  # as stored: 32 hex, or "dd"+32 hex for imported users
     status: UserStatus
     pool_id: int
     loopback_ip: str  # 127.64.x.y
@@ -49,9 +51,8 @@ class UserRecord:
 
     @property
     def mtproxy_secret(self) -> str:
-        """Base secret passed to MTProxy (no 'dd' prefix)."""
-        s = self.secret
-        return s[2:] if len(s) == 34 and s.startswith("dd") else s
+        """Base secret passed to MTProxy: lowercase, no 'dd' prefix."""
+        return base_secret(self.secret)
 
 
 @dataclass(frozen=True, slots=True)
@@ -66,7 +67,7 @@ class DesiredState:
 
     users: tuple[UserRecord, ...]
     pools: tuple[PoolRecord, ...]
-    sentinel_secret: str  # used only when no user is ACTIVE
+    sentinel_secret: str = field(repr=False)  # used only when no user is ACTIVE
     default_carrier_mode: CarrierMode = CarrierMode.HTTPS
     relay_limits: RelayLimits = field(default_factory=RelayLimits)
     secrets_per_process: int = 16

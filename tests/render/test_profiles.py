@@ -98,3 +98,10 @@ def test_hash_ignores_formatting_but_not_content() -> None:
     changed = raw.replace(b"2398", b"2399")
     assert profiles_hash(changed) != profiles_hash(raw)
     assert len(profiles_hash(raw)) == 64
+
+
+def test_profile_entry_repr_hides_secret() -> None:
+    from tgpanel.render.profiles import ProfileEntry
+
+    entry = ProfileEntry("u1", "ab" * 16, "127.0.0.1:2400", None, False)
+    assert "ab" * 16 not in repr(entry)

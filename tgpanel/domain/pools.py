@@ -10,7 +10,7 @@ from __future__ import annotations
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 
-from tgpanel.domain.models import PoolRecord, UserRecord
+from tgpanel.domain.models import PoolRecord, UserRecord, UserStatus
 
 POOL_LIMIT = 64
 CLIENT_PORT_BASE = 2400
@@ -100,6 +100,43 @@ def allocate_pools(
         counts[pool.id] += 1
         assigned.append(pool.id)
     return PoolAllocation(pool_ids=tuple(assigned), new_pools=tuple(new_pools))
+
+
+def sentinel_slot_needed(users: Iterable[UserRecord]) -> bool:
+    """The sentinel secret occupies a pool slot exactly when no user is ACTIVE (PLAN 3.3)."""
+    return not any(u.status is UserStatus.ACTIVE for u in users)
+
+
+def sentinel_host_pool(
+    pools: Iterable[PoolRecord], users: Iterable[UserRecord], secrets_per_process: int
+) -> PoolRecord | None:
+    """First managed pool (by id) with a free slot, or None. Single source of truth."""
+    pools = tuple(pools)
+    counts = occupancy(pools, users)
+    for pool in sorted((p for p in pools if p.managed), key=lambda p: p.id):
+        if counts[pool.id] < secrets_per_process:
+            return pool
+    return None
+
+
+def ensure_sentinel_capacity(
+    pools: Sequence[PoolRecord], users: Iterable[UserRecord], secrets_per_process: int
+) -> PoolRecord | None:
+    """New pool to create so the sentinel secret has a slot, or None if nothing is needed.
+
+    Needed only when no user is active and no managed pool has a free slot.
+    """
+    check_secrets_per_process(secrets_per_process)
+    users = tuple(users)
+    if not sentinel_slot_needed(users):
+        return None
+    if sentinel_host_pool(pools, users, secrets_per_process) is not None:
+        return None
+    used = {pool_index(p) for p in pools}
+    free = next((i for i in range(POOL_LIMIT) if i not in used), None)
+    if free is None:
+        raise PoolExhaustedError("all 64 MTProxy pools are full")
+    return pool_for_index(max((p.id for p in pools), default=0) + 1, free)
 
 
 def empty_pools(

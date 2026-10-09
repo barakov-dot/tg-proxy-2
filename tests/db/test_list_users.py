@@ -310,3 +310,63 @@ def test_row_values_online_and_traffic() -> None:
 
 def test_stable_order_ties_broken_by_id() -> None:
     assert run(sort="pool_id") == ["alpha", "charlie", "echo", "Bravo", "delta"]
+
+
+def test_online_requires_fresh_counter_state() -> None:
+    seed()
+    rows, _ = repo.list_users(CONN, UserListQuery(), NOW)
+    assert {r.user.name for r in rows if r.online} == {"alpha", "delta"}
+    later = NOW + timedelta(minutes=10)  # collector stopped 10 minutes ago
+    rows, _ = repo.list_users(CONN, UserListQuery(), later)
+    assert not any(r.online for r in rows)
+    q = UserListQuery(filter=UserFilter(online=True))
+    assert repo.list_users(CONN, q, later)[1] == 0
+    q = UserListQuery(filter=UserFilter(online=False))
+    assert repo.list_users(CONN, q, later)[1] == 5
+    # a wide freshness window brings them back
+    rows, _ = repo.list_users(CONN, UserListQuery(), later, online_freshness=timedelta(hours=1))
+    assert sum(r.online for r in rows) == 2
+
+
+def test_per_page_validated() -> None:
+    seed()
+    with pytest.raises(ValueError):
+        repo.list_users(CONN, UserListQuery(per_page=7), NOW)  # type: ignore[arg-type]
+    for n in (50, 100, 200):
+        repo.list_users(CONN, UserListQuery(per_page=n), NOW)
+
+
+def test_page_traffic_matches_with_and_without_join() -> None:
+    seed()
+    plain = {
+        r.user.name: (r.bytes_up, r.bytes_down)
+        for r in repo.list_users(CONN, UserListQuery(), NOW)[0]
+    }
+    sorted_ = UserListQuery(sort="traffic")
+    joined = {
+        r.user.name: (r.bytes_up, r.bytes_down) for r in repo.list_users(CONN, sorted_, NOW)[0]
+    }
+    assert plain == joined and plain["alpha"] == (1000, 500)
+
+
+def test_list_users_load_300_users_14_days_of_minutes() -> None:
+    import time
+
+    conn = fresh_db()
+    for i in range(1, 301):
+        add_user(conn, i, name=f"load{i}", loopback_ip=f"127.64.{i // 250}.{i % 250 + 1}")
+    start = NOW - 14 * D
+    minutes = 14 * 24 * 60
+    conn.execute(
+        "WITH RECURSIVE m(n) AS (SELECT 0 UNION ALL SELECT n + 1 FROM m WHERE n < ?)"
+        " INSERT INTO traffic_minute (user_id, bucket_ts, bytes_up, bytes_down)"
+        " SELECT u.id, ? + m.n * 60, 1000, 2000 FROM users u, m",
+        (minutes - 1, int(start.timestamp())),
+    )
+    assert conn.execute("SELECT COUNT(*) FROM traffic_minute").fetchone()[0] == 300 * minutes
+    t0 = time.perf_counter()
+    page, total = repo.list_users(conn, UserListQuery(per_page=50), NOW)
+    elapsed = time.perf_counter() - t0
+    assert total == 300 and len(page) == 50
+    assert page[0].bytes_up == 1000 * minutes
+    assert elapsed < 0.5, f"list page took {elapsed:.3f}s"

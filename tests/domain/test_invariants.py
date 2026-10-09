@@ -2,11 +2,13 @@ from dataclasses import replace
 
 from tests.domain.helpers import make_pool, make_state, make_user, secret_for
 from tgpanel.domain.invariants import (
+    capacity_warnings,
     compute_max_profiles,
     compute_relay_limits,
+    rendered_profile_count,
     validate_desired_state,
 )
-from tgpanel.domain.models import RelayLimits, UserStatus
+from tgpanel.domain.models import PoolRecord, RelayLimits, UserStatus
 
 
 def test_valid_state() -> None:
@@ -82,7 +84,7 @@ def test_max_profiles() -> None:
 
 def test_relay_limits_keys_and_bursts() -> None:
     state = make_state([make_user(1)], relay_limits=RelayLimits(2000, 32768))
-    limits = compute_relay_limits(state)
+    limits = compute_relay_limits(state, 1)
     assert set(limits) == {
         "max_profiles",
         "max_sessions_global",
@@ -99,4 +101,42 @@ def test_relay_limits_keys_and_bursts() -> None:
     big = make_state(
         [make_user(i, 1 + i // 16, ip=f"127.64.{i // 250}.{i % 250 + 1}") for i in range(1, 301)]
     )
-    assert compute_relay_limits(big)["max_profiles"] == 316
+    assert compute_relay_limits(big, 300)["max_profiles"] == 316
+
+
+def test_disabled_users_do_not_inflate_max_profiles() -> None:
+    users = [make_user(i, 1 + i // 16, UserStatus.DISABLED) for i in range(1, 101)]
+    users.append(make_user(200, 20))
+    pools = [make_pool(n) for n in range(20)]
+    state = make_state(users, pools)
+    assert compute_relay_limits(state, rendered_profile_count(state))["max_profiles"] == 32
+    assert rendered_profile_count(make_state([users[0]])) == 1  # sentinel only
+
+
+def test_stream_capacity_is_a_warning_not_an_error() -> None:
+    state = make_state([make_user(1)], relay_limits=RelayLimits(1024, 16384))
+    assert validate_desired_state(state) == []  # warning only, never blocks apply
+    assert any("max connections" in w for w in capacity_warnings(state))
+    pools = [make_pool(n) for n in range(4)]
+    assert capacity_warnings(make_state([make_user(1)], pools, relay_limits=RelayLimits())) == []
+
+
+def test_pool_port_pairs_must_match() -> None:
+    bad = PoolRecord(1, 2401, 8900)
+    assert any("mismatch" in e for e in validate_desired_state(make_state([make_user(1)], [bad])))
+
+
+def test_uppercase_and_dd_secrets_compare_by_lowercase_base() -> None:
+    u1 = make_user(1)
+    u2 = make_user(2, secret="DD" + u1.secret.upper())
+    assert any("duplicate secrets" in e for e in validate_desired_state(make_state([u1, u2])))
+    assert u2.mtproxy_secret == u1.secret
+    sent = replace(make_state([u1]), sentinel_secret=u1.secret.upper())
+    assert any("duplicate secrets" in e for e in validate_desired_state(sent))
+
+
+def test_secrets_not_in_repr() -> None:
+    u = make_user(1)
+    state = make_state([u])
+    assert u.secret not in repr(u)
+    assert state.sentinel_secret not in repr(state)

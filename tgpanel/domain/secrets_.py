@@ -4,10 +4,10 @@ from __future__ import annotations
 
 import re
 import secrets
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 _HEX32 = re.compile(r"[0-9a-fA-F]{32}")
-_DD_HEX32 = re.compile(r"dd[0-9a-fA-F]{32}")
+_DD_HEX32 = re.compile(r"[dD]{2}[0-9a-fA-F]{32}")
 
 
 def generate_secret() -> str:
@@ -30,8 +30,8 @@ def base_secret(value: str) -> str:
 
 @dataclass(frozen=True, slots=True)
 class ParsedSecret:
-    raw: str  # kept exactly as imported (link depends on it)
-    base: str  # lowercase 32 hex for MTProxy
+    raw: str = field(repr=False)  # kept exactly as imported (link depends on it)
+    base: str = field(repr=False)  # lowercase 32 hex for MTProxy
     has_dd_prefix: bool
 
 

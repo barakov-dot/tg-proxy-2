@@ -8,6 +8,7 @@ from tgpanel.domain.models import (
     CarrierMode,
     DesiredState,
     PoolRecord,
+    RelayLimits,
     UserRecord,
     UserStatus,
 )
@@ -56,6 +57,8 @@ def make_state(
     pools: list[PoolRecord] | None = None,
     **kwargs: object,
 ) -> DesiredState:
+    # single-pool test states must satisfy: pools * mtp_max_connections >= max_streams_global
+    kwargs.setdefault("relay_limits", RelayLimits(1024, 4096))
     return DesiredState(
         users=tuple(users),
         pools=tuple(pools if pools is not None else [make_pool(0)]),

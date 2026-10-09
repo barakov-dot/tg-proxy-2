@@ -13,6 +13,7 @@ from tgpanel.domain.pools import (
     MIN_SECRETS_PER_PROCESS,
     POOL_LIMIT,
     STATS_PORT_BASE,
+    sentinel_host_pool,
 )
 from tgpanel.domain.secrets_ import base_secret, is_valid_secret
 
@@ -20,16 +21,25 @@ PROFILE_NAME_RE = re.compile(r"u[1-9][0-9]*")
 MIN_MAX_PROFILES = 32
 
 
-def compute_max_profiles(user_count: int) -> int:
-    """max(32, users + 16)."""
-    return max(MIN_MAX_PROFILES, user_count + 16)
+def compute_max_profiles(profile_count: int) -> int:
+    """max(32, profiles + 16), where profiles = profiles actually rendered."""
+    return max(MIN_MAX_PROFILES, profile_count + 16)
 
 
-def compute_relay_limits(state: DesiredState) -> dict[str, int]:
-    """`limits` keys to write into config.json. Never contains per-profile limits."""
+def rendered_profile_count(state: DesiredState) -> int:
+    """Active users, or 1 (the sentinel) when none is active."""
+    active = sum(1 for u in state.users if u.status is UserStatus.ACTIVE)
+    return active if active else 1
+
+
+def compute_relay_limits(state: DesiredState, profile_count: int) -> dict[str, int]:
+    """`limits` keys to write into config.json. Never contains per-profile limits.
+
+    ``profile_count`` = number of profiles actually rendered (disabled users do not count).
+    """
     sessions = state.relay_limits.max_sessions_global
     return {
-        "max_profiles": compute_max_profiles(len(state.users)),
+        "max_profiles": compute_max_profiles(profile_count),
         "max_sessions_global": sessions,
         "new_sessions_burst": sessions,
         "max_bootstraps_global": sessions,
@@ -61,6 +71,8 @@ def validate_desired_state(state: DesiredState) -> list[str]:
             errors.append(f"pool {p.id}: port {p.port} out of range")
         if not STATS_PORT_BASE <= p.stats_port < STATS_PORT_BASE + POOL_LIMIT:
             errors.append(f"pool {p.id}: stats port {p.stats_port} out of range")
+        if p.port - CLIENT_PORT_BASE != p.stats_port - STATS_PORT_BASE:
+            errors.append(f"pool {p.id}: port {p.port} and stats port {p.stats_port} mismatch")
     pools_by_id = {p.id: p for p in state.pools}
 
     for d in _dups([u.name for u in state.users]):
@@ -98,14 +110,27 @@ def validate_desired_state(state: DesiredState) -> list[str]:
             errors.append(f"pool {pool_id}: {n} secrets exceed secrets_per_process {spp}")
 
     active = sum(1 for u in state.users if u.status is UserStatus.ACTIVE)
-    total = active
     if active == 0:
-        total = 1  # sentinel profile
         if not is_valid_secret(state.sentinel_secret):
             errors.append("no active users and sentinel secret is missing")
         if not state.pools:
             errors.append("no active users and no pool for the sentinel profile")
-    max_profiles = compute_max_profiles(len(state.users))
+        elif sentinel_host_pool(state.pools, state.users, spp) is None:
+            errors.append("no active users and no managed pool has a free slot for the sentinel")
+    total = rendered_profile_count(state)
+    max_profiles = compute_relay_limits(state, total)["max_profiles"]
     if not 1 <= total <= max_profiles:
         errors.append(f"profile count {total} outside 1..{max_profiles}")
     return errors
+
+
+def capacity_warnings(state: DesiredState) -> list[str]:
+    """Non-blocking capacity hints (PLAN 3.7): pool -C budget vs max_streams_global."""
+    managed = sum(1 for p in state.pools if p.managed)
+    capacity = state.mtp_max_connections * managed
+    if capacity < state.relay_limits.max_streams_global:
+        return [
+            f"sum of pool max connections {capacity} is below max_streams_global "
+            f"{state.relay_limits.max_streams_global}"
+        ]
+    return []

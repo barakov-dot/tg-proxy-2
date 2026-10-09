@@ -5,7 +5,7 @@ from __future__ import annotations
 import re
 from collections import Counter
 from collections.abc import Collection, Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from tgpanel.domain.models import CarrierMode
 from tgpanel.domain.secrets_ import ParsedSecret, parse_imported_secret
@@ -14,6 +14,7 @@ SENTINEL_NAME = "_tgpanel_sentinel"
 DEFAULT_ID_REGEX = r"^user_(\d{5,15})$"
 IMPORT_COMMENT = "import"
 SKIP_KNOWN = "secret already known"
+MAX_REGEX_LENGTH = 200
 
 
 @dataclass(frozen=True, slots=True)
@@ -21,7 +22,7 @@ class SourceProfile:
     """A profile from the proxy's profiles.json (its `limits` block is dropped by the caller)."""
 
     name: str
-    secret: str
+    secret: str = field(repr=False)
     carrier_mode: str | None
     backend: str
 
@@ -40,8 +41,8 @@ class PlanRow:
     tg_id: int | None
     display_name: str
     comment: str
-    secret: str  # kept as-is (with 'dd' prefix if it had one)
-    base_secret: str
+    secret: str = field(repr=False)  # kept as-is (with 'dd' prefix if it had one)
+    base_secret: str = field(repr=False)
     carrier_mode: CarrierMode | None
     source_backend: str
     skip_reason: str | None = None
@@ -121,7 +122,21 @@ def plan_import(
 ) -> ImportPlan:
     """Build the import plan. ``mtproxy_secrets`` = union of mtproxy.secrets and
     MTPROXY_SECRET, or None when unavailable (no reconciliation)."""
-    pattern = re.compile(id_regex)
+    pattern: re.Pattern[str] | None = None
+    regex_error: str | None = None
+    if len(id_regex) > MAX_REGEX_LENGTH:
+        regex_error = f"id regex is longer than {MAX_REGEX_LENGTH} characters"
+    else:
+        try:
+            pattern = re.compile(id_regex)
+        except re.error as exc:
+            regex_error = f"id regex is invalid: {exc}"
+        else:
+            if pattern.groups < 1:
+                regex_error = "id regex must contain a capture group for the telegram id"
+                pattern = None
+    existing_tg_set = set(existing_tg_ids)
+    mtproxy_norm = None if mtproxy_secrets is None else {_norm(s) for s in mtproxy_secrets}
     csv_by_name = {r.profile_name: r for r in csv_rows}
     known = {_norm(s) for s in existing_secrets}
     warnings: list[str] = []
@@ -130,6 +145,8 @@ def plan_import(
     sentinel_ignored = False
     seen_profile_bases: set[str] = set()
     parsed: list[tuple[SourceProfile, ParsedSecret]] = []
+    if regex_error is not None:
+        errors.append(regex_error)
 
     for prof in profiles:
         if prof.name == SENTINEL_NAME:
@@ -154,10 +171,11 @@ def plan_import(
         if csv is not None and csv.tg_id is not None:
             tg_id = csv.tg_id
         else:
-            m = pattern.search(prof.name)
-            if m and m.groups():
-                tg_id = int(m.group(1))
-            elif prof.name != SENTINEL_NAME:
+            m = pattern.search(prof.name) if pattern is not None else None
+            g = m.group(1) if m else None
+            if g is not None and g.isascii() and g.isdigit():
+                tg_id = int(g)
+            elif pattern is not None:
                 warnings.append(f"{prof.name}: telegram id not recognized")
         mode: CarrierMode | None = None
         if prof.carrier_mode:
@@ -170,11 +188,7 @@ def plan_import(
         if csv and csv.comment:
             comment = f"{IMPORT_COMMENT}; {csv.comment}"
         skip = SKIP_KNOWN if sec.base in known else None
-        if (
-            skip is None
-            and mtproxy_secrets is not None
-            and sec.base not in {_norm(s) for s in mtproxy_secrets}
-        ):
+        if skip is None and mtproxy_norm is not None and sec.base not in mtproxy_norm:
             warnings.append(f"{prof.name}: secret not found in MTProxy, profile probably broken")
         rows.append(
             PlanRow(
@@ -202,15 +216,12 @@ def plan_import(
             names = ", ".join(r.source_name for r in active_rows if r.tg_id == tg)
             errors.append(f"duplicate telegram id {tg}: {names}")
     for r in active_rows:
-        if r.tg_id is not None and r.tg_id in set(existing_tg_ids):
+        if r.tg_id is not None and r.tg_id in existing_tg_set:
             errors.append(f"{r.source_name}: telegram id {r.tg_id} already belongs to a user")
 
     unused: tuple[str, ...] = ()
-    if mtproxy_secrets is not None:
-        unused = tuple(
-            mask_secret(s)
-            for s in sorted({_norm(s) for s in mtproxy_secrets} - seen_profile_bases - known)
-        )
+    if mtproxy_norm is not None:
+        unused = tuple(mask_secret(s) for s in sorted(mtproxy_norm - seen_profile_bases - known))
         for masked in unused:
             warnings.append(f"MTProxy secret {masked} is unused by any profile, not imported")
 

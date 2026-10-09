@@ -9,9 +9,23 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Literal, Protocol
+from typing import Protocol
 
-from tgpanel.domain.models import CarrierMode, UserRecord, UserStatus
+from tgpanel.domain.models import CarrierMode, UserRecord
+from tgpanel.domain.queries import Period, SortField, UserFilter, UserListQuery
+
+__all__ = [
+    "Actor",
+    "NewUser",
+    "OperationResult",
+    "Period",
+    "SortField",
+    "UserFilter",
+    "UserListQuery",
+    "UserPage",
+    "UserRow",
+    "UserService",
+]
 
 Actor = str  # "web:<login>" | "bot:<tg_id>" | "system"
 
@@ -32,53 +46,6 @@ class OperationResult:
     error: str | None = None  # human-readable (Russian), no secrets
     apply_run_id: int | None = None
     links: dict[int, str] = field(default_factory=dict)  # user_id -> https link, success only
-
-
-SortField = Literal[
-    "id",
-    "name",
-    "comment",
-    "tg_id",
-    "tg_username",
-    "status",
-    "online",
-    "created_at",
-    "expires_at",
-    "first_seen_at",
-    "last_seen_at",
-    "traffic",
-    "pool_id",
-    "bot_started",
-]
-Period = Literal["24h", "7d", "30d", "all"]
-
-
-@dataclass(frozen=True, slots=True)
-class UserFilter:
-    query: str | None = None
-    statuses: tuple[UserStatus, ...] = ()
-    online: bool | None = None
-    imported: bool | None = None
-    has_tg_id: bool | None = None
-    bot_started: bool | None = None
-    expires_within_days: int | None = None
-    created_from: datetime | None = None
-    created_to: datetime | None = None
-    last_seen_from: datetime | None = None
-    last_seen_to: datetime | None = None
-    traffic_min: int | None = None
-    traffic_max: int | None = None
-    comment_contains: str | None = None
-
-
-@dataclass(frozen=True, slots=True)
-class UserListQuery:
-    filter: UserFilter = UserFilter()
-    sort: SortField = "id"
-    descending: bool = False
-    period: Period = "30d"
-    page: int = 1
-    per_page: Literal[50, 100, 200] = 50
 
 
 @dataclass(frozen=True, slots=True)
@@ -103,7 +70,10 @@ class UserService(Protocol):
     async def set_expiry(
         self, ids: list[int], expires_at: datetime | None, actor: Actor
     ) -> OperationResult: ...
-    async def extend(self, ids: list[int], days: int, actor: Actor) -> OperationResult: ...
+    async def extend(self, ids: list[int], days: int, actor: Actor) -> OperationResult:
+        """Disabled users stay disabled on extend: deliberate deviation from PLAN 7."""
+        ...
+
     async def reissue_secret(self, user_id: int, actor: Actor) -> OperationResult: ...
     async def set_carrier_mode(
         self, ids: list[int], mode: CarrierMode | None, actor: Actor
