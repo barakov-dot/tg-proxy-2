@@ -9,7 +9,7 @@ import pytest
 from tests.apply.conftest import PROFILES, RELAY, Env, add_users, assert_only_allowed_writes
 from tgpanel.apply.importer import OLD_BOT_WARNING, Importer, RowEdit
 from tgpanel.db import repo
-from tgpanel.domain.models import UserStatus
+from tgpanel.domain.models import PoolRecord, UserStatus
 from tgpanel.render.links import https_link
 
 FIXTURES = Path(__file__).resolve().parents[1] / "fixtures" / "upstream"
@@ -237,7 +237,7 @@ async def test_name_conflict_with_existing_user(clean: Env) -> None:
 
     # a panel user already named "default"
     def mk(conn):  # type: ignore[no-untyped-def]
-        ids = add_users(clean.clock, 1)(conn)
+        ids = add_users(clean.clock, 1, new_pool=PoolRecord(1, 2400, 8900))(conn)
         repo.update_user(conn, ids[0], name="default")
 
     assert (await clean.pipeline.run_operation(mk, reason="x")).ok
@@ -278,10 +278,10 @@ async def test_external_change_with_baseline_is_a_warning_in_preview(owner: Env)
     prev = await Importer(owner.pipeline).preview()
     assert prev.drift and "late" in prev.drift
     assert any("вне панели" in w for w in prev.warnings)
-    assert prev.importable == 1  # the new foreign profile can be imported
+    assert prev.importable == 16  # the 15 pass-through profiles plus the new foreign one
     res = await Importer(owner.pipeline).confirm(prev)
     assert res.ok
-    assert [u.source_profile_name for u in owner.users()] == ["late"]
+    assert "late" in [u.source_profile_name for u in owner.users()]
 
 
 async def test_profiles_changed_between_preview_and_confirm(owner: Env) -> None:

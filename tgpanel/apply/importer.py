@@ -53,6 +53,7 @@ class RowEdit:
     tg_id: int | None = None
     display_name: str | None = None
     comment: str | None = None
+    skip: bool = False  # do not import: the profile stays an unmanaged pass-through entry
 
 
 @dataclass(frozen=True, slots=True)
@@ -245,14 +246,18 @@ class Importer:
         actor: str = "system",
     ) -> ImportResult:
         """ONE operation: pools -> users -> profiles.json -> relay. Idempotent."""
-        sources = preview.sources
+        skipped_names = {n for n, e in (edits or {}).items() if e.skip}
+        sources = replace(
+            preview.sources,
+            profiles=tuple(p for p in preview.sources.profiles if p.name not in skipped_names),
+        )
         overrides = self._overrides(preview.plan.rows, edits or {})
         # Re-plan with the user's edits; the mutation re-plans once more in the transaction.
         replanned = await self._build_preview(sources, [], overrides)
         if replanned.blocked:
             return ImportResult(ok=False, error="; ".join(replanned.errors))
         todo = replanned.importable
-        skipped = len(replanned.rows) - todo
+        skipped = len(replanned.rows) - todo + len(skipped_names)
         if todo == 0:
             return ImportResult(ok=True, imported=0, skipped=skipped, warnings=replanned.warnings)
 

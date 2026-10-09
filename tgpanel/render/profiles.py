@@ -48,7 +48,7 @@ def sentinel_pool(state: DesiredState) -> PoolRecord:
 
 
 def needs_sentinel(state: DesiredState) -> bool:
-    return sentinel_slot_needed(state.users)
+    return sentinel_slot_needed(state.users) and not state.foreign_profiles
 
 
 def render_profiles(state: DesiredState) -> bytes:
@@ -64,7 +64,12 @@ def render_profiles(state: DesiredState) -> bytes:
                 "carrier_mode": str(mode),
             }
         )
-    if not entries:
+    foreign = [json.loads(raw) for raw in state.foreign_profiles]
+    taken = {e["name"] for e in entries} | {SENTINEL_NAME}
+    for entry in foreign:
+        if not isinstance(entry, dict) or entry.get("name") in taken:
+            raise RenderError("unmanaged profile collides with a managed profile")
+    if not entries and not foreign:
         if not state.sentinel_secret:
             raise RenderError("sentinel secret is required when no user is active")
         pool = sentinel_pool(state)
@@ -76,7 +81,9 @@ def render_profiles(state: DesiredState) -> bytes:
                 "carrier_mode": str(state.default_carrier_mode),
             }
         )
-    return (json.dumps({"profiles": entries}, indent=2) + "\n").encode()
+    return (
+        json.dumps({"profiles": [*entries, *foreign]}, indent=2, ensure_ascii=False) + "\n"
+    ).encode()
 
 
 def _load(data: bytes) -> Any:

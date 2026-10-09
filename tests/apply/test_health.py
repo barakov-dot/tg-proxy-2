@@ -8,6 +8,7 @@ from tests.apply.conftest import (
     Env,
     add_users,
     assert_only_allowed_writes,
+    drop_foreign,
     no_sleep,
 )
 from tgpanel.apply.config import ApplyConfig, ApplyTiming
@@ -63,6 +64,7 @@ async def test_healthz_wait_is_bounded(env: Env) -> None:
 async def test_in_memory_database_fallback_still_rolls_back(tmp_path: Path) -> None:
     fake = FakeSystemOps()
     fake.seed_upstream("clean")
+    drop_foreign(fake)
     db = Database(":memory:")
     db.call(repo.set_setting, "proxy_hostname", "proxy.example.com")
     pipe = ApplyPipeline(

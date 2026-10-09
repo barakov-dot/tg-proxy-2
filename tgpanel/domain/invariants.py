@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 from collections import Counter
 
@@ -27,9 +28,10 @@ def compute_max_profiles(profile_count: int) -> int:
 
 
 def rendered_profile_count(state: DesiredState) -> int:
-    """Active users, or 1 (the sentinel) when none is active."""
+    """Active users plus unmanaged profiles, or 1 (the sentinel) when there are none."""
     active = sum(1 for u in state.users if u.status is UserStatus.ACTIVE)
-    return active if active else 1
+    total = active + len(state.foreign_profiles)
+    return total if total else 1
 
 
 def compute_relay_limits(state: DesiredState, profile_count: int) -> dict[str, int]:
@@ -50,6 +52,24 @@ def compute_relay_limits(state: DesiredState, profile_count: int) -> dict[str, i
 
 def _dups(values: list[str]) -> list[str]:
     return [v for v, n in Counter(values).items() if n > 1]
+
+
+def _foreign_names(state: DesiredState, errors: list[str]) -> set[str]:
+    names: set[str] = set()
+    for raw in state.foreign_profiles:
+        try:
+            entry = json.loads(raw)
+        except ValueError:
+            errors.append("unmanaged profile is not valid JSON")
+            continue
+        name = entry.get("name") if isinstance(entry, dict) else None
+        if not isinstance(name, str):
+            errors.append("unmanaged profile has no name")
+            continue
+        if name in names:
+            errors.append("duplicate unmanaged profile name")
+        names.add(name)
+    return names
 
 
 def validate_desired_state(state: DesiredState) -> list[str]:
@@ -110,7 +130,11 @@ def validate_desired_state(state: DesiredState) -> list[str]:
             errors.append(f"pool {pool_id}: {n} secrets exceed secrets_per_process {spp}")
 
     active = sum(1 for u in state.users if u.status is UserStatus.ACTIVE)
-    if active == 0:
+    foreign_names = _foreign_names(state, errors)
+    ours = {u.profile_name for u in state.users} | {"_tgpanel_sentinel"}
+    for name in sorted(foreign_names & ours):
+        errors.append(f"unmanaged profile {name} collides with a managed profile name")
+    if active == 0 and not state.foreign_profiles:
         if not is_valid_secret(state.sentinel_secret):
             errors.append("no active users and sentinel secret is missing")
         if not state.pools:

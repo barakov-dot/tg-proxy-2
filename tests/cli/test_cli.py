@@ -58,7 +58,7 @@ def test_status_fresh_server_reports_foreign_profiles(run: Run) -> None:
     code, out = run("status")
     assert code == 0
     assert "Состояние tgpanel" in out and "tproxy-server: работает" in out
-    assert "ИЗМЕНЁН ВНЕ ПАНЕЛИ" in out and "default" in out
+    assert "изменений вне панели нет" in out
     assert "Применений ещё не было" in out
     assert not SECRET_RE.search(out)
 
@@ -69,18 +69,21 @@ def test_status_unhealthy_relay_exit_code(run: Run) -> None:
     assert code == 1 and "нет ответа" in out
 
 
-def test_apply_refuses_foreign_profiles_then_force(run: Run) -> None:
-    before = run.fake.files[PROFILES].data
+def test_apply_passes_foreign_profiles_through_then_detects_edits(run: Run) -> None:
     code, out = run("apply")
-    assert code == 3 and "--force-external" in out and "tgpanel import" in out
-    assert run.fake.files[PROFILES].data == before
-    code, out = run("apply", "--force-external")
     assert code == 0 and "Готово" in out
+    assert json.loads(run.fake.files[PROFILES].data)["profiles"][0]["name"] == "default"
     code, out = run("apply")
     assert code == 0 and "Изменений нет" in out
     code, out = run("apply", "--reload-nft")
+    assert code == 0 and run.fake.calls_of("nft_load_file")
+    doc = json.loads(run.fake.files[PROFILES].data)
+    doc["profiles"][0]["backend"] = "127.0.0.1:2399"
+    run.fake.files[PROFILES].data = json.dumps(doc).encode()
+    code, out = run("apply")
+    assert code == 3 and "--force-external" in out
+    code, out = run("apply", "--force-external")
     assert code == 0
-    assert run.fake.calls_of("nft_load_file")
     code, out = run("status")
     assert "Последнее применение" in out and "success" in out and "изменений вне панели нет" in out
 

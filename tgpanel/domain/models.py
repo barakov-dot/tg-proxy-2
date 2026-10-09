@@ -74,3 +74,5 @@ class DesiredState:
     mtp_workers: int = 1
     mtp_max_connections: int = 4096
     panel_hostname: str = ""
+    # Unmanaged profiles of the relay (JSON objects, kept verbatim and rendered after ours).
+    foreign_profiles: tuple[str, ...] = field(default=(), repr=False)

@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from tests.apply.conftest import SECRET_RE, Clock, no_sleep
+from tests.apply.conftest import SECRET_RE, Clock, drop_foreign, no_sleep
 from tgpanel.apply.config import ApplyConfig, ApplyTiming
 from tgpanel.db import repo
 from tgpanel.services.container import AppContext, build_context
@@ -66,6 +66,7 @@ class Svc:
 async def svc(tmp_path: Path) -> AsyncIterator[Svc]:
     fake = FakeSystemOps()
     fake.seed_upstream("clean")
+    drop_foreign(fake)
     clock = Clock()
     config = ApplyConfig(
         timing=ApplyTiming(

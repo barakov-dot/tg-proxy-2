@@ -16,11 +16,12 @@ from tgpanel.apply.settings_spec import (
     read_settings,
 )
 from tgpanel.db import repo
-from tgpanel.domain.models import DesiredState, PoolRecord, RelayLimits
+from tgpanel.domain.models import DesiredState, PoolRecord, RelayLimits, UserRecord
 from tgpanel.domain.pools import ensure_sentinel_capacity
-from tgpanel.domain.secrets_ import generate_secret, is_valid_secret
+from tgpanel.domain.secrets_ import base_secret, generate_secret, is_valid_secret
 from tgpanel.render.errors import RenderError
 from tgpanel.render.pools import MtproxyFacts, extract_mtproxy_facts
+from tgpanel.render.profiles import SENTINEL_NAME
 from tgpanel.system.ops import SystemOps, SystemOpsError
 
 _ENV_FILE_RE = re.compile(r"^\s*EnvironmentFile\s*=\s*-?\s*(/\S+)\s*$", re.MULTILINE)
@@ -36,8 +37,58 @@ def _sentinel_secret(conn: sqlite3.Connection) -> str:
     return fresh
 
 
+def stored_names(conn: sqlite3.Connection, key: str) -> set[str]:
+    raw = repo.get_setting(conn, key)
+    if not raw:
+        return set()
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        return set()
+    return {n for n in data if isinstance(n, str)} if isinstance(data, list) else set()
+
+
+def split_foreign(
+    data: bytes | None, users: list[UserRecord], our_names: set[str]
+) -> tuple[str, ...]:
+    """Entries of the current profiles.json that the panel does not manage.
+
+    Ours: ``u<id>`` of a known user, the sentinel, names we wrote last time, and any entry whose
+    secret belongs to a known user (an imported profile that still has its old name). Everything
+    else is passed through verbatim.
+    """
+    if not data:
+        return ()
+    try:
+        root = json.loads(data)
+    except ValueError:
+        return ()
+    items = root.get("profiles") if isinstance(root, dict) else None
+    if not isinstance(items, list):
+        return ()
+    known = {u.profile_name for u in users} | our_names | {SENTINEL_NAME}
+    bases: set[str] = set()
+    for u in users:
+        bases.add(u.mtproxy_secret)
+    out: list[str] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        name = item.get("name")
+        if name in known:
+            continue
+        secret = item.get("secret")
+        if isinstance(secret, str) and is_valid_secret(secret) and base_secret(secret) in bases:
+            continue
+        out.append(json.dumps(item, ensure_ascii=False))
+    return tuple(out)
+
+
 def load_desired_state(
-    conn: sqlite3.Connection, now: datetime, settings: AppSettings | None = None
+    conn: sqlite3.Connection,
+    now: datetime,
+    settings: AppSettings | None = None,
+    foreign: tuple[str, ...] = (),
 ) -> DesiredState:
     """Desired state from the DB (call inside the operation transaction).
 
@@ -47,7 +98,9 @@ def load_desired_state(
     cfg = settings or read_settings(conn)
     pools = repo.list_pools(conn)
     users = repo.all_users(conn)
-    new_pool = ensure_sentinel_capacity(pools, users, cfg.secrets_per_process)
+    new_pool = ensure_sentinel_capacity(
+        pools, users, cfg.secrets_per_process, has_foreign=bool(foreign)
+    )
     if new_pool is not None:
         repo.insert_pool(conn, new_pool, now)
         pools.append(new_pool)
@@ -61,6 +114,7 @@ def load_desired_state(
         mtp_workers=cfg.mtp_workers,
         mtp_max_connections=cfg.mtp_max_connections,
         panel_hostname=cfg.panel_hostname,
+        foreign_profiles=foreign,
     )
 
 

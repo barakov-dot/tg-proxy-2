@@ -120,7 +120,11 @@ def sentinel_host_pool(
 
 
 def ensure_sentinel_capacity(
-    pools: Sequence[PoolRecord], users: Iterable[UserRecord], secrets_per_process: int
+    pools: Sequence[PoolRecord],
+    users: Iterable[UserRecord],
+    secrets_per_process: int,
+    *,
+    has_foreign: bool = False,
 ) -> PoolRecord | None:
     """New pool to create so the sentinel secret has a slot, or None if nothing is needed.
 
@@ -128,8 +132,8 @@ def ensure_sentinel_capacity(
     """
     check_secrets_per_process(secrets_per_process)
     users = tuple(users)
-    if not sentinel_slot_needed(users):
-        return None
+    if has_foreign or not sentinel_slot_needed(users):
+        return None  # unmanaged profiles keep the relay's profile list non-empty
     if sentinel_host_pool(pools, users, secrets_per_process) is not None:
         return None
     used = {pool_index(p) for p in pools}

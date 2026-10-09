@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import logging
 import re
 import sqlite3
@@ -36,8 +37,21 @@ from tgpanel.apply.errors import (
     OperationRejected,
     SettingsError,
 )
-from tgpanel.apply.settings_spec import KEY_MTPROXY_FACTS, KEY_PROFILES_HASH, read_settings
-from tgpanel.apply.state import facts_to_json, load_desired_state, read_live_facts, resolve_facts
+from tgpanel.apply.settings_spec import (
+    KEY_ALL_NAMES,
+    KEY_MTPROXY_FACTS,
+    KEY_OUR_NAMES,
+    KEY_PROFILES_HASH,
+    read_settings,
+)
+from tgpanel.apply.state import (
+    facts_to_json,
+    load_desired_state,
+    read_live_facts,
+    resolve_facts,
+    split_foreign,
+    stored_names,
+)
 from tgpanel.db import repo
 from tgpanel.db.connection import Database, connect, transaction
 from tgpanel.domain.invariants import capacity_warnings, validate_desired_state
@@ -388,9 +402,13 @@ class ApplyPipeline:
             )
         snapshot = archive.db_snapshot
         current_hash = await self._current_profiles_hash()
+        current_names = await self._current_profile_names()
 
         def mutation(conn: sqlite3.Connection) -> None:
             backup_mod.restore_db_snapshot(conn, snapshot)
+            # the file on disk is what we wrote: its managed names stay "ours" after the restore
+            repo.set_setting(conn, KEY_ALL_NAMES, json.dumps(current_names[0]))
+            repo.set_setting(conn, KEY_OUR_NAMES, json.dumps(current_names[1]))
             if current_hash is None:
                 repo.delete_setting(conn, KEY_PROFILES_HASH)
             else:
@@ -440,8 +458,9 @@ class ApplyPipeline:
                     users = await self._profiles_on_legacy()
                     if users:
                         raise OperationRejected(
-                            f"{users} профилей relay всё ещё используют старый процесс MTProxy "
-                            f"(порт {cfg.legacy_port}). Сначала выполните импорт."
+                            f"{users} профилей relay (в том числе не импортированные) всё ещё "
+                            f"используют старый процесс MTProxy (порт {cfg.legacy_port}). "
+                            "Сначала импортируйте их или используйте --force."
                         )
                 # Remember the facts before the unit disappears (a masked unit is empty).
                 with contextlib.suppress(RenderError, SystemOpsError):
@@ -481,6 +500,17 @@ class ApplyPipeline:
             return 0
         port = f":{self.config.legacy_port}"
         return sum(1 for e in entries if e.backend.endswith(port) and e.name != SENTINEL_NAME)
+
+    async def _current_profile_names(self) -> tuple[list[str], list[str]]:
+        """(all names, names matching our own u<id>/sentinel pattern) of the current file."""
+        try:
+            names = [
+                e.name for e in parse_profiles(await self.ops.read_file(self.config.paths.profiles))
+            ]
+        except (SystemOpsError, RenderError):
+            return [], []
+        ours = [n for n in names if n == SENTINEL_NAME or _USER_PROFILE_RE.fullmatch(n)]
+        return names, ours
 
     async def _current_profiles_hash(self) -> str | None:
         try:
@@ -560,17 +590,7 @@ class ApplyPipeline:
         except RenderError:
             return DriftReport("profiles.json имеет неожиданную структуру"), current
         if stored is None:
-            foreign = [n for n in names if n != SENTINEL_NAME and not _USER_PROFILE_RE.fullmatch(n)]
-            if not foreign:
-                return None, current
-            return (
-                DriftReport(
-                    f"в profiles.json {len(foreign)} профилей, не созданных панелью "
-                    f"({self._names(foreign)}); выполните импорт (tgpanel import)",
-                    no_baseline=True,
-                ),
-                current,
-            )
+            return None, current  # first apply: unmanaged profiles are passed through
         expected = await self.db.run(self._expected_names)
         added = sorted(set(names) - expected)
         missing = sorted(expected - set(names))
@@ -590,6 +610,9 @@ class ApplyPipeline:
 
     @staticmethod
     def _expected_names(conn: sqlite3.Connection) -> set[str]:
+        written = stored_names(conn, KEY_ALL_NAMES)
+        if written:
+            return written
         users = repo.all_users(conn)
         active = {u.profile_name for u in users if u.status is UserStatus.ACTIVE}
         return active or {SENTINEL_NAME}
@@ -766,6 +789,12 @@ class ApplyPipeline:
 
     def _store_hash(self, conn: sqlite3.Connection, plan: _Plan) -> None:
         repo.set_setting(conn, KEY_PROFILES_HASH, profiles_hash(plan.rendered.profiles_json))
+        names = [e.name for e in parse_profiles(plan.rendered.profiles_json)]
+        foreign_names = {json.loads(f).get("name") for f in plan.state.foreign_profiles}
+        repo.set_setting(conn, KEY_ALL_NAMES, json.dumps(names))
+        repo.set_setting(
+            conn, KEY_OUR_NAMES, json.dumps([n for n in names if n not in foreign_names])
+        )
 
     # ------------------------------------------------------------------ failure handling
 
@@ -909,7 +938,11 @@ class ApplyPipeline:
         now = self._clock()
         try:
             settings = read_settings(conn)
-            state = load_desired_state(conn, now, settings)
+            profiles_snap = await self._snap(paths.profiles)
+            foreign = split_foreign(
+                profiles_snap.data, repo.all_users(conn), stored_names(conn, KEY_OUR_NAMES)
+            )
+            state = load_desired_state(conn, now, settings, foreign)
             errors = validate_desired_state(state)
             if errors:
                 raise ApplyError("validate", "; ".join(errors[:5]))
@@ -929,7 +962,7 @@ class ApplyPipeline:
             return snap.stat.mode, snap.stat.owner, snap.stat.group
 
         snaps: dict[str, _Snap] = {paths.config: config_snap}
-        snaps[paths.profiles] = await self._snap(paths.profiles)
+        snaps[paths.profiles] = profiles_snap
         targets: dict[str, _Target] = {}
         pm, po, pg = keep_or(snaps[paths.profiles], (0o400, "root", cfg.tproxy_group))
         targets[paths.profiles] = _Target(paths.profiles, rendered.profiles_json, pm, po, pg)

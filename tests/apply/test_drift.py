@@ -4,33 +4,17 @@ import json
 from collections.abc import Callable
 
 from tests.apply.conftest import PROFILES, Env, add_users
-from tgpanel.apply.errors import ExternalChangeDetected
 
 FOREIGN_SECRET = "abcdefabcdefabcdefabcdefabcdefab"
 
 
-async def test_foreign_profiles_without_baseline_block_apply(make: Callable[..., Env]) -> None:
+async def test_foreign_profiles_without_baseline_are_not_drift(make: Callable[..., Env]) -> None:
     env = make("clean")
-    original = env.fake.files[PROFILES].data
-    before_tables = env.tables()
-    out = await env.pipeline.run_operation(add_users(env.clock, 1), reason="x")
-    assert not out.ok and out.status == "external_change"
-    assert isinstance(out.external, ExternalChangeDetected) and out.external.no_baseline
-    assert "default" in out.external.description
-    assert "импорт" in out.external.description
-    assert env.fake.files[PROFILES].data == original  # NOT overwritten
-    assert env.tables() == before_tables
-    assert env.fake.calls_of("systemctl") == []
-    run = env.runs()[0]
-    assert run.status == "failed" and "profiles.json" in (run.error or "")
-    assert "apply.external_change" in env.audit_text()
-
-
-async def test_detect_drift_for_doctor(make: Callable[..., Env]) -> None:
-    env = make("clean")
-    report = await env.pipeline.detect_drift()
-    assert report is not None and report.no_baseline
-    assert isinstance(report.exception(), ExternalChangeDetected)
+    assert await env.pipeline.detect_drift() is None
+    out = await env.pipeline.apply_now("first")  # no force needed: foreign entries pass through
+    assert out.ok
+    assert env.setting("apply.profiles_hash")
+    assert await env.pipeline.detect_drift() is None
 
 
 async def test_force_external_overwrites_and_sets_baseline(make: Callable[..., Env]) -> None:
@@ -98,18 +82,13 @@ async def test_formatting_only_change_is_not_drift(env: Env) -> None:
 async def test_force_external_overrides_drift(env: Env) -> None:
     await env.pipeline.run_operation(add_users(env.clock, 1), reason="seed")
     doc = env.fake.get_json(PROFILES)
-    doc["profiles"].append(
-        {
-            "name": "x",
-            "secret": FOREIGN_SECRET,
-            "backend": "127.0.0.1:2398",
-            "carrier_mode": "https",
-        }
-    )
+    doc["profiles"][0]["secret"] = FOREIGN_SECRET  # someone edited OUR entry
     env.fake.files[PROFILES].data = json.dumps(doc).encode()
+    assert await env.pipeline.detect_drift() is not None
     out = await env.pipeline.apply_now("fix", force_external=True)
     assert out.ok
     assert [p["name"] for p in env.fake.get_json(PROFILES)["profiles"]] == ["u1"]
+    assert FOREIGN_SECRET not in env.fake.get_text(PROFILES)
     assert await env.pipeline.detect_drift() is None
 
 

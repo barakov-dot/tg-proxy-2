@@ -19,6 +19,8 @@ from tgpanel.domain.models import CarrierMode
 KEY_SENTINEL_SECRET = "sentinel_secret"  # noqa: S105 - setting name, not a secret
 KEY_PROFILES_HASH = "apply.profiles_hash"
 KEY_MTPROXY_FACTS = "mtproxy_facts"
+KEY_OUR_NAMES = "apply.our_names"
+KEY_ALL_NAMES = "apply.all_names"
 
 _HOST_RE = re.compile(r"^(?=.{1,253}$)([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$")
 

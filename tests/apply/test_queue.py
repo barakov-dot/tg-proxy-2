@@ -7,7 +7,7 @@ import sqlite3
 from collections.abc import Callable
 from typing import Any
 
-from tests.apply.conftest import PROFILES, RELAY, Env, add_users, make_env
+from tests.apply.conftest import PROFILES, RELAY, Env, add_users, drop_foreign, make_env
 from tgpanel.apply.errors import OperationRejected
 from tgpanel.db import repo
 from tgpanel.system.fake import FakeSystemOps
@@ -49,6 +49,7 @@ async def _env(make: Callable[..., Env]) -> tuple[Env, GatedFake]:
     fake = GatedFake()
     fake.block_next = False
     env = make("clean", fake=fake)
+    drop_foreign(fake)
     assert (await env.pipeline.apply_now("init", force_external=True)).ok
     fake.block_next = True
     fake.clear_calls()

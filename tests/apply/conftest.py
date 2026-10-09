@@ -160,6 +160,7 @@ def make(tmp_path: Path) -> Iterator[Callable[..., Env]]:
 async def env(make: Callable[..., Env]) -> Env:
     """Clean upstream server with the panel baseline applied (sentinel profile, pool 1 up)."""
     e = make("clean")
+    drop_foreign(e.fake)
     out = await e.pipeline.apply_now("init", force_external=True)
     assert out.ok, out.error
     e.fake.clear_calls()
@@ -230,3 +231,12 @@ def assert_only_allowed_writes(fake: FakeSystemOps) -> None:
     assert b"tgpanel" not in fake.files["/etc/caddy/Caddyfile"].data
     for path in ("/etc/mtproxy/mtproxy.env", "/etc/systemd/system/mtproxy.service"):
         assert not [c for c in fake.calls_of("write_atomic") if c[1] == path]
+
+
+def drop_foreign(fake: FakeSystemOps) -> None:
+    """Replace the legacy "default" profile with a sentinel-like entry (no unmanaged profiles)."""
+    fake.files[PROFILES].data = (
+        b'{"profiles": [{"name": "_tgpanel_sentinel", "secret": "'
+        + b"f" * 32
+        + b'", "backend": "127.0.0.1:2400"}]}'
+    )

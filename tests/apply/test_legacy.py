@@ -21,7 +21,7 @@ async def _imported(make: Callable[..., Env]) -> Env:
 
 async def test_off_refused_while_profiles_use_the_legacy_port(make: Callable[..., Env]) -> None:
     env = make("owner")
-    with pytest.raises(OperationRejected, match="Сначала выполните импорт"):
+    with pytest.raises(OperationRejected, match="Сначала импортируйте"):
         await Importer(env.pipeline).legacy_mtproxy(False)
     assert env.fake.calls_of("systemctl", "mask") == []
 
