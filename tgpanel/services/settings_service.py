@@ -78,6 +78,14 @@ class SettingsServiceImpl:
                     raise OperationRejected(
                         f"Нельзя поставить {spp}: в одном из пулов уже {busiest} секретов"
                     )
+            minute_days = int(
+                canonical.get("retention_minute_days") or current.get("retention_minute_days") or 14
+            )
+            hour_days = int(
+                canonical.get("retention_hour_days") or current.get("retention_hour_days") or 180
+            )
+            if hour_days < minute_days:
+                raise OperationRejected("Почасовая статистика должна храниться не меньше минутной")
             for key, value in canonical.items():
                 if current.get(key) != value:
                     repo.set_setting(conn, key, value)

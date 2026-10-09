@@ -14,6 +14,7 @@ from datetime import UTC, date, datetime
 from tgpanel.apply.errors import OperationRejected
 from tgpanel.apply.pipeline import ApplyPipeline
 from tgpanel.apply.settings_spec import AppSettings, read_settings
+from tgpanel.collector._config import online_freshness
 from tgpanel.db import repo
 from tgpanel.db.connection import Database, transaction
 from tgpanel.domain.addresses import (
@@ -420,7 +421,10 @@ class UserServiceImpl:
     # ------------------------------------------------------------------ queries / links
 
     async def list(self, query: UserListQuery) -> UserPage:
-        rows, total = await self._db.run(repo.list_users, query, self._now())
+        settings = await self._db.run(repo.all_settings)
+        rows, total = await self._db.run(
+            repo.list_users, query, self._now(), online_freshness(settings)
+        )
         return UserPage(
             rows=tuple(
                 UserRow(r.user, r.online, r.bytes_up, r.bytes_down, r.first_seen_at, r.last_seen_at)

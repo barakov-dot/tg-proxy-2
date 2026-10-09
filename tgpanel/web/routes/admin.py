@@ -228,6 +228,14 @@ FIELD_TYPES = {
     "mtp_workers": "number",
     "backup_keep_last": "number",
     "backup_keep_days": "number",
+    "poll_interval_s": "number",
+    "retention_minute_days": "number",
+    "retention_hour_days": "number",
+    "activity_min_bytes": "number",
+    "activity_min_packets": "number",
+    "open_mode_max_per_hour": "number",
+    "reminder_days": "number",
+    "backup_hour": "number",
 }
 
 

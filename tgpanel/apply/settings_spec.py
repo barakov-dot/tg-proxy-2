@@ -167,6 +167,62 @@ SPECS: dict[str, SettingSpec] = dict(
             False,
             "Режим выдачи доступа",
         ),
+        _spec(
+            "poll_interval_s",
+            "30",
+            _int_range(5, 3600, "Интервал опроса счётчиков, с"),
+            False,
+            "Интервал опроса счётчиков, с",
+        ),
+        _spec(
+            "retention_minute_days",
+            "14",
+            _int_range(1, 3650, "Минутные данные, дней"),
+            False,
+            "Хранить минутную статистику, дней",
+        ),
+        _spec(
+            "retention_hour_days",
+            "180",
+            _int_range(1, 36500, "Почасовые данные, дней"),
+            False,
+            "Хранить почасовую статистику, дней",
+        ),
+        _spec(
+            "activity_min_bytes",
+            "2048",
+            _int_range(0, 10**9, "Порог активности, байт"),
+            False,
+            "Порог активности за интервал, байт",
+        ),
+        _spec(
+            "activity_min_packets",
+            "10",
+            _int_range(0, 10**9, "Порог активности, пакетов"),
+            False,
+            "Порог активности за интервал, пакетов",
+        ),
+        _spec(
+            "open_mode_max_per_hour",
+            "20",
+            _int_range(1, 10_000, "Выдач в час в открытом режиме"),
+            False,
+            "Лимит выдач в час (открытый режим)",
+        ),
+        _spec(
+            "reminder_days",
+            "3",
+            _int_range(1, 60, "Напоминание за, дней"),
+            False,
+            "Напоминать об окончании срока за, дней",
+        ),
+        _spec(
+            "backup_hour",
+            "3",
+            _int_range(0, 23, "Час ежедневного бэкапа"),
+            False,
+            "Час ежедневного бэкапа (по часовому поясу)",
+        ),
     ]
 )
 
@@ -197,6 +253,14 @@ class AppSettings:
     proxy_hostname: str
     panel_hostname: str
     issuance_mode: str
+    poll_interval_s: int
+    retention_minute_days: int
+    retention_hour_days: int
+    activity_min_bytes: int
+    activity_min_packets: int
+    open_mode_max_per_hour: int
+    reminder_days: int
+    backup_hour: int
 
 
 def read_settings(conn: sqlite3.Connection) -> AppSettings:
@@ -209,4 +273,7 @@ def read_settings(conn: sqlite3.Connection) -> AppSettings:
         except SettingsError as exc:
             raise SettingsError(f"Сохранено некорректное значение настройки {key}: {exc}") from None
     values["carrier_mode_default"] = CarrierMode(values["carrier_mode_default"])
+    values["retention_hour_days"] = max(
+        values["retention_hour_days"], values["retention_minute_days"]
+    )
     return AppSettings(**values)

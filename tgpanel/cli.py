@@ -1,7 +1,8 @@
 """tgpanel command line interface.
 
-Implemented here: status, apply, import, backup, restore, legacy-mtproxy. Other subcommands
-(doctor, repair, update, uninstall, show-url, reset-password) belong to other tasks.
+Implemented here: status, apply, import, backup, restore, legacy-mtproxy. The operations
+commands (doctor, repair, update, uninstall, show-url, reset-password and the internal helpers
+used by install.sh) live in ``ops_cli`` and are registered into the same parser by ``main``.
 
 User-facing output is Russian. ``main`` accepts a SystemOps so tests run on FakeSystemOps.
 """
@@ -13,12 +14,14 @@ import asyncio
 import contextlib
 import os
 import sys
-from collections.abc import Callable, Sequence
+import time
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import replace
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import TextIO
 
+from tgpanel import ops_cli
 from tgpanel.apply.backup import BackupError
 from tgpanel.apply.config import ApplyConfig, ApplyPaths
 from tgpanel.apply.errors import OperationRejected
@@ -28,6 +31,7 @@ from tgpanel.domain.import_ import DEFAULT_ID_REGEX
 from tgpanel.domain.models import UserStatus
 from tgpanel.services.container import AppContext, build_context
 from tgpanel.system.ops import SystemOps, SystemOpsError
+from tgpanel.system.tools import RealShellTools, ShellTools
 
 DEFAULT_DB = "/var/lib/tgpanel/tgpanel.db"
 ACTOR = "system"
@@ -38,7 +42,14 @@ EXIT_USAGE = 2
 EXIT_EXTERNAL = 3
 
 
-def build_parser() -> argparse.ArgumentParser:
+def build_parser(
+    ctx_factory: Callable[[], AppContext] | None = None,
+    *,
+    tools_factory: Callable[[], ShellTools] = RealShellTools,
+    sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+    clock: Callable[[], datetime] = lambda: datetime.now(UTC),
+    monotonic: Callable[[], float] = time.monotonic,
+) -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="tgpanel", description="Панель управления tproxy-server")
     parser.add_argument("--db", help="путь к базе SQLite (или переменная TGPANEL_DB)")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -82,6 +93,15 @@ def build_parser() -> argparse.ArgumentParser:
     p_leg = sub.add_parser("legacy-mtproxy", help="включить/выключить старый процесс MTProxy")
     p_leg.add_argument("state", choices=["on", "off"])
     p_leg.add_argument("--force", action="store_true", help="выключить, даже если он используется")
+    if ctx_factory is not None:
+        ops_cli.register(
+            sub,
+            ctx_factory,
+            tools_factory=tools_factory,
+            sleep=sleep,
+            clock=clock,
+            monotonic=monotonic,
+        )
     return parser
 
 
@@ -318,16 +338,43 @@ def main(
     config: ApplyConfig | None = None,
     input_fn: Callable[[str], str] = input,
     out: TextIO | None = None,
+    tools: ShellTools | None = None,
+    sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+    clock: Callable[[], datetime] = lambda: datetime.now(UTC),
+    monotonic: Callable[[], float] = time.monotonic,
 ) -> int:
     stream = out or sys.stdout
-    args = build_parser().parse_args(argv)
-    db_path = resolve_db_path(args.db)
     cfg = config or config_from_env()
-    if ops is None:
-        from tgpanel.system.real import RealSystemOps
+    holder: dict[str, SystemOps] = {}
 
-        ops = RealSystemOps()
-    ctx = build_context(ops, db_path, config=cfg)
+    def system() -> SystemOps:
+        if ops is not None:
+            return ops
+        if "ops" not in holder:
+            from tgpanel.system.real import RealSystemOps
+
+            holder["ops"] = RealSystemOps()
+        return holder["ops"]
+
+    db_arg: list[str] = []
+
+    def ops_context() -> AppContext:
+        return build_context(system(), resolve_db_path(db_arg[0] if db_arg else None), config=cfg)
+
+    parser = build_parser(
+        ops_context,
+        tools_factory=(lambda: tools) if tools is not None else RealShellTools,
+        sleep=sleep,
+        clock=clock,
+        monotonic=monotonic,
+    )
+    args = parser.parse_args(argv)
+    db_path = resolve_db_path(args.db)
+    if getattr(args, "ops_run", None) is not None:
+        db_arg.append(db_path)
+        args.db = db_path
+        return int(args.ops_run(args, stream, input_fn))
+    ctx = build_context(system(), db_path, config=cfg)
     try:
         return asyncio.run(_run(ctx, args, stream, input_fn))
     except SystemOpsError as exc:

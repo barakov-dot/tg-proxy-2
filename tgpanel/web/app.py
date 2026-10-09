@@ -134,6 +134,11 @@ def create_app(ctx: WebContext, root_path: str) -> FastAPI:
     async def _validation(request: Request, exc: RequestValidationError) -> Response:
         return await _error_page(request, 400, T["bad_request"])
 
+    @app.get("/healthz", include_in_schema=False)
+    async def healthz() -> JSONResponse:
+        # unauthenticated liveness probe: answers only that the process serves requests
+        return JSONResponse({"ok": True})
+
     app.mount("/static", StaticFiles(directory=BASE / "static"), name="static")
     app.include_router(auth.router)
     app.include_router(dashboard.router)

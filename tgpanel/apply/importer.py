@@ -16,7 +16,7 @@ from tgpanel.apply.errors import OperationRejected
 from tgpanel.apply.pipeline import ApplyPipeline
 from tgpanel.apply.settings_spec import read_settings
 from tgpanel.db import repo
-from tgpanel.domain.addresses import allocate_addresses
+from tgpanel.domain.addresses import QUARANTINE_KEY, allocate_addresses, parse_quarantine
 from tgpanel.domain.import_ import (
     DEFAULT_ID_REGEX,
     CsvRow,
@@ -189,7 +189,10 @@ class Importer:
             importable = [r for r in plan.rows if r.will_import]
             alloc = allocate_pools(pools, users, len(importable), cfg.secrets_per_process)
             by_id = {p.id: p for p in [*pools, *alloc.new_pools]}
-            ips = allocate_addresses(repo.used_loopback_ips(conn), len(importable))
+            quarantined = parse_quarantine(
+                repo.get_setting(conn, QUARANTINE_KEY), self._pipeline.now()
+            )
+            ips = allocate_addresses(repo.used_loopback_ips(conn), len(importable), quarantined)
             existing_names = {u.name for u in users}
             new_ids = {p.id for p in alloc.new_pools}
             rows: list[PreviewRow] = []
@@ -332,7 +335,8 @@ class Importer:
         alloc = allocate_pools(pools, users, len(rows), cfg.secrets_per_process)
         for pool in alloc.new_pools:
             repo.insert_pool(conn, pool, now)
-        ips = allocate_addresses(repo.used_loopback_ips(conn), len(rows))
+        quarantined = parse_quarantine(repo.get_setting(conn, QUARANTINE_KEY), now)
+        ips = allocate_addresses(repo.used_loopback_ips(conn), len(rows), quarantined)
         taken = {u.name for u in users}
         ids: list[int] = []
         for row, pool_id, ip in zip(rows, alloc.pool_ids, ips, strict=True):
