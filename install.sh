@@ -322,7 +322,7 @@ check_domain_differs() {
 
 verified_list() {
   local here=""
-  here="$(cd "$(dirname "${BASH_SOURCE[0]:-.}")" 2>/dev/null && pwd || true)"
+  if ! here="$(cd "$(dirname "${BASH_SOURCE[0]:-.}")" 2>/dev/null && pwd)"; then here=""; fi
   if [ -n "${TGPANEL_VERIFIED_LIST:-}" ]; then printf '%s' "$TGPANEL_VERIFIED_LIST"
   elif [ -f "$INSTALL_DIR/deploy/verified-relay.sha256" ]; then
     printf '%s' "$INSTALL_DIR/deploy/verified-relay.sha256"
@@ -781,8 +781,9 @@ main() {
     [ "$ASSUME_YES" = 1 ] || die "нет терминала (/dev/tty): добавьте --yes"
     if [ "$UPDATE" = 0 ]; then
       [ -n "$IMPORT_MODE" ] || die "нет терминала: укажите --import или --no-import"
-      [ -n "$PANEL_DOMAIN" ] && [ -n "$BOT_TOKEN" ] && [ -n "$ADMIN_ID" ] ||
+      if [ -z "$PANEL_DOMAIN" ] || [ -z "$BOT_TOKEN" ] || [ -z "$ADMIN_ID" ]; then
         die "нет терминала: нужны --panel-domain, токен бота (--bot-token-file или TGPANEL_INSTALL_BOT_TOKEN) и --admin-id"
+      fi
     fi
   fi
   acquire_install_lock
