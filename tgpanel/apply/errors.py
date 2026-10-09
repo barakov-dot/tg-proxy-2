@@ -7,6 +7,10 @@ class OperationRejected(Exception):
     """Business-level refusal raised by a mutation. The message is shown to the user (Russian)."""
 
 
+class DbWriteTimeout(OperationRejected):
+    """A DB write waited too long for the running apply to finish (nothing was written)."""
+
+
 class ApplyError(Exception):
     """A pipeline step failed. ``stage`` is a short machine name, ``detail`` is secret-free."""
 

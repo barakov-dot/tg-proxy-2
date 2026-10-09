@@ -10,7 +10,7 @@ import ipaddress
 
 from tgpanel.domain.models import DesiredState, UserRecord
 from tgpanel.render.errors import RenderError
-from tgpanel.render.profiles import active_users
+from tgpanel.render.profiles import active_users, foreign_loopback_ips
 
 POOL_PORTS = "2400-2463"
 STATS_PORTS = "8900-8963"
@@ -52,6 +52,7 @@ def _elements(ips: list[str]) -> str:
 def render_nft(state: DesiredState) -> bytes:
     """Main variant: one set per direction, counters on set elements."""
     ips = [_ip(u) for u in active_users(state)]
+    ips += [i for i in dict.fromkeys(foreign_loopback_ips(state)) if i not in ips]
     elems = _elements(ips)
     text = (
         _HEADER

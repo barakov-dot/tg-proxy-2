@@ -13,6 +13,9 @@ Python 3.12+, FastAPI, aiogram 3, SQLite (WAL), Jinja2 + HTMX. Deploy target: Ub
 ## Rules
 - Locally only unit tests and linters run. Never start tproxy-server/MTProxy/Caddy/nftables/systemd here.
 - All system access goes through `SystemOps` (real + fake). `domain` and `render` are pure.
+- DB writes outside apply operations go ONLY through `await pipeline.db_write(fn, ...)` (it takes the
+  lock held by the apply transaction; 30 s timeout -> `DbWriteTimeout`); reads may use `db.run`.
+  Proxy-affecting changes use `pipeline.run_operation(mutation, ...)`. See `tgpanel/db/__init__.py`.
 - Layers: services are the only API for web/bot/scheduler; they must not touch the system directly.
 - After each task with green ruff/mypy/pytest/shellcheck: conventional commit, then `git push origin main`.
 - Code, identifiers, comments, commit messages in English; UI texts in Russian (single texts module).

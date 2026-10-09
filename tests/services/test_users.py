@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import itertools
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 
 import pytest
 
@@ -537,3 +538,52 @@ async def test_audit_never_contains_secrets_after_a_full_lifecycle(svc: Svc) -> 
     bad = await svc.users.set_status([ids[0]], False, "x")
     svc.assert_clean(bad.error or "")
     assert to_db(svc.clock.now)  # keep helper import used
+
+
+# ------------------------------------------------------------------ review fixes: S6
+
+
+async def test_s6_link_does_not_touch_the_database(
+    svc: Svc, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (uid,) = await make(svc)
+    user = await svc.users.get(uid)
+    assert user
+
+    def boom(*a: object, **k: object) -> object:
+        raise AssertionError("link() must not call the database")
+
+    monkeypatch.setattr(svc.ctx.db, "call", boom)
+    monkeypatch.setattr(svc.ctx.db, "run", boom)
+    assert (
+        svc.users.link(user)
+        == f"https://t.me/webproxy?server=proxy.example.com&secret={user.secret}"
+    )
+    assert svc.users.tg_link(user).startswith("tg://webproxy?server=proxy.example.com")
+
+
+async def test_s6_cache_is_refreshed_when_the_setting_changes(svc: Svc) -> None:
+    (uid,) = await make(svc)
+    user = await svc.users.get(uid)
+    assert user
+    assert (await svc.ctx.settings.set("proxy_hostname", "other.example.com", "web:admin")).ok
+    assert "server=other.example.com" in svc.users.link(user)
+    assert (await svc.ctx.settings.set("proxy_hostname", "", "web:admin")).ok
+    with pytest.raises(UserServiceError):
+        svc.users.link(user)
+
+
+async def test_s6_link_before_start_raises_instead_of_reading_the_db(tmp_path: Path) -> None:
+    from tests.apply.conftest import Clock, no_sleep
+    from tgpanel.services.container import build_context
+    from tgpanel.system.fake import FakeSystemOps
+
+    ctx = build_context(FakeSystemOps(), tmp_path / "x.db", clock=Clock(), sleep=no_sleep)
+    try:
+        ctx.db.call(repo.set_setting, "proxy_hostname", "h.example.com")
+        with pytest.raises(UserServiceError):
+            ctx.users.link(_dummy_user())
+        await ctx.users.load_hostname()
+        assert "server=h.example.com" in ctx.users.link(_dummy_user())
+    finally:
+        ctx.close()

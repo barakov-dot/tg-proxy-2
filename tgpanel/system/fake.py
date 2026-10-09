@@ -15,7 +15,7 @@ import ipaddress
 import json
 import posixpath
 import re
-from collections.abc import Callable
+from collections.abc import Callable, Collection, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
@@ -25,12 +25,15 @@ from tgpanel.system.ops import (
     CheckResult,
     FileStat,
     HttpResult,
+    LocalFile,
     LockHandle,
     SetCounter,
     SystemOpsError,
 )
 from tgpanel.system.validation import (
     build_tar_gz,
+    extract_tar_member_to_file,
+    iter_tar_members,
     normalize_unit,
     parse_tar_gz,
     validate_env,
@@ -394,16 +397,33 @@ class FakeSystemOps:
         self._enter("remove", path)
         self.files.pop(path, None)
 
-    async def make_tar_gz(self, dest: str, members: dict[str, bytes]) -> None:
+    async def make_tar_gz(self, dest: str, members: Mapping[str, bytes | LocalFile]) -> None:
         validate_path(dest)
         self._enter("make_tar_gz", dest, tuple(sorted(members)))
-        blob = build_tar_gz(members)
+        blob = build_tar_gz(members)  # LocalFile members are streamed from their local path
         self.put_file(dest, blob, mode=0o600)
 
     async def read_tar_gz(self, path: str) -> dict[str, bytes]:
         validate_path(path)
         self._enter("read_tar_gz", path)
         return parse_tar_gz(self._get(path).data)
+
+    async def read_tar_members(
+        self, path: str, names: Collection[str] | None = None
+    ) -> dict[str, bytes]:
+        validate_path(path)
+        self._enter("read_tar_members", path, tuple(sorted(names)) if names is not None else None)
+        return iter_tar_members(self._get(path).data, names)
+
+    async def extract_tar_member(self, path: str, name: str, dest: str) -> bool:
+        validate_path(path)
+        self._enter("extract_tar_member", path, name)
+        return extract_tar_member_to_file(self._get(path).data, name, dest)
+
+    async def ensure_dir(self, path: str, mode: int, owner: str, group: str) -> None:
+        validate_path(path)
+        self._enter("ensure_dir", path, mode, owner, group)
+        self.mkdir(path)
 
     # ===================================================================================
     # systemd
@@ -628,6 +648,12 @@ class FakeSystemOps:
     async def nft_list_set(self, table: str, set_name: str) -> dict[str, SetCounter]:
         self._enter("nft_list_set", table, set_name)
         return dict(self._set(table, set_name))
+
+    async def nft_delete_table(self, table: str) -> None:
+        validate_nft_ident(table, "table")
+        self._enter("nft_delete_table", table)
+        for key in [k for k in self.nft_sets if k[0] == table]:
+            del self.nft_sets[key]
 
     async def nft_add_elements(self, table: str, set_name: str, ips: list[str]) -> None:
         self._enter("nft_add_elements", table, set_name, tuple(ips))

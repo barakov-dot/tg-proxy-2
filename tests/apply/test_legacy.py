@@ -68,8 +68,35 @@ async def test_legacy_off_without_unit_cache_fails_apply_cleanly(make: Callable[
     assert not out.ok and "MTProxy" in (out.error or "")
 
 
-async def test_mask_failure_is_reported(make: Callable[..., Env]) -> None:
+async def test_mask_failure_falls_back_to_dropin_and_on_removes_it(
+    make: Callable[..., Env],
+) -> None:
     env = await _imported(make)
     env.fake.fail_on("systemctl", "mask-now")
+    imp = Importer(env.pipeline)
+    dropin = "/etc/systemd/system/mtproxy.service.d/tgpanel-off.conf"
+    reloads = env.fake.daemon_reloads
+    text = await imp.legacy_mtproxy(False)
+    assert "drop-in" in text
+    assert env.fake.systemctl_calls("stop", "mtproxy") == [("stop", "mtproxy")]
+    assert env.fake.systemctl_calls("disable", "mtproxy") == [("disable", "mtproxy")]
+    assert env.fake.get_text(dropin) == (
+        "[Unit]\nConditionPathExists=/nonexistent-tgpanel-disabled\n"
+    )
+    assert env.fake.files[dropin].mode == 0o644
+    assert env.fake.daemon_reloads == reloads + 1
+    assert "mtproxy" not in env.fake.active and "mtproxy" not in env.fake.masked
+    # `on` removes the drop-in, reloads and starts the unit again
+    await imp.legacy_mtproxy(True)
+    assert dropin not in env.fake.files
+    assert env.fake.daemon_reloads == reloads + 2
+    assert "mtproxy" in env.fake.active
+
+
+async def test_off_fails_cleanly_when_even_the_fallback_fails(make: Callable[..., Env]) -> None:
+    env = await _imported(make)
+    env.fake.fail_on("systemctl", "mask-now")
+    env.fake.fail_on("systemctl", "stop mtproxy")
     with pytest.raises(OperationRejected):
         await Importer(env.pipeline).legacy_mtproxy(False)
+    assert "/etc/systemd/system/mtproxy.service.d/tgpanel-off.conf" not in env.fake.files

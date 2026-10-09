@@ -22,7 +22,7 @@ async def test_baseline_writes_sentinel_and_starts_pool(env: Env) -> None:
     prof = env.fake.get_json(PROFILES)["profiles"]
     assert [p["name"] for p in prof] == ["_tgpanel_sentinel"]
     assert prof[0]["backend"] == "127.0.0.1:2400"
-    assert env.fake.is_locked("/run/tgpanel/apply.lock") is False
+    assert env.fake.is_locked("/var/lib/tgpanel/apply.lock") is False
     assert POOL1 in env.fake.active
     assert env.fake.get_text("/etc/tgpanel/mtproxy/1.env").count("-S ") == 1
     assert [r.status for r in env.runs()] == ["success"]
@@ -151,6 +151,7 @@ async def test_only_allowed_paths_are_written(env: Env) -> None:
         POOL_UNIT,
         "/var/backups/tgpanel/",
         "/etc/tproxy-server/.tgpanel-check-",
+        "/var/lib/tgpanel/apply.journal",
     )
     for call in env.fake.calls_of("write_atomic") + env.fake.calls_of("remove"):
         assert str(call[1]).startswith(allowed_prefixes), call

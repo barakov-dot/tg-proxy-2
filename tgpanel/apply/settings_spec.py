@@ -20,6 +20,7 @@ KEY_SENTINEL_SECRET = "sentinel_secret"  # noqa: S105 - setting name, not a secr
 KEY_PROFILES_HASH = "apply.profiles_hash"
 KEY_MTPROXY_FACTS = "mtproxy_facts"
 KEY_OUR_NAMES = "apply.our_names"
+KEY_ADOPTED = "apply.adopted"
 KEY_ALL_NAMES = "apply.all_names"
 
 _HOST_RE = re.compile(r"^(?=.{1,253}$)([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$")
@@ -81,12 +82,19 @@ class SettingSpec:
     parse: Callable[[str], Any]
     affects_proxy: bool
     title: str
+    sensitive: bool = False  # value must never be written to the audit log
 
 
 def _spec(
-    key: str, default: str, parse: Callable[[str], Any], affects_proxy: bool, title: str
+    key: str,
+    default: str,
+    parse: Callable[[str], Any],
+    affects_proxy: bool,
+    title: str,
+    *,
+    sensitive: bool = False,
 ) -> tuple[str, SettingSpec]:
-    return key, SettingSpec(key, default, parse, affects_proxy, title)
+    return key, SettingSpec(key, default, parse, affects_proxy, title, sensitive)
 
 
 SPECS: dict[str, SettingSpec] = dict(

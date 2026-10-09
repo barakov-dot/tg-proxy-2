@@ -216,6 +216,7 @@ ALLOWED_WRITE_PREFIXES = (
     POOL_UNIT,
     "/var/backups/tgpanel/",
     "/etc/tproxy-server/.tgpanel-check-",
+    "/var/lib/tgpanel/apply.journal",
 )
 
 

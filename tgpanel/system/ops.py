@@ -6,6 +6,7 @@ Real implementation runs commands as argument lists (never a shell). Fake implem
 
 from __future__ import annotations
 
+from collections.abc import Collection, Mapping
 from dataclasses import dataclass
 from typing import Protocol
 
@@ -44,6 +45,13 @@ class CertInfo:
     valid_chain: bool
 
 
+@dataclass(frozen=True, slots=True)
+class LocalFile:
+    """A local file whose content is streamed into an archive (never loaded into memory)."""
+
+    path: str
+
+
 class SystemOpsError(Exception):
     """Any failed system operation. Message must not contain secrets."""
 
@@ -61,11 +69,27 @@ class SystemOps(Protocol):
         ...
 
     async def remove(self, path: str) -> None: ...
-    async def make_tar_gz(self, dest: str, members: dict[str, bytes]) -> None:
-        """Create 0600 archive: archive-name -> content."""
+    async def make_tar_gz(self, dest: str, members: Mapping[str, bytes | LocalFile]) -> None:
+        """Create a 0600 archive atomically: archive-name -> content (``LocalFile`` is streamed)."""
         ...
 
-    async def read_tar_gz(self, path: str) -> dict[str, bytes]: ...
+    async def read_tar_gz(self, path: str) -> dict[str, bytes]:
+        """All members in memory (small archives only; size is capped while streaming)."""
+        ...
+
+    async def read_tar_members(
+        self, path: str, names: Collection[str] | None = None
+    ) -> dict[str, bytes]:
+        """Stream the archive and return only the named regular members (all if None)."""
+        ...
+
+    async def extract_tar_member(self, path: str, name: str, dest: str) -> bool:
+        """Stream one member into the local file ``dest`` (0600). False if it is absent."""
+        ...
+
+    async def ensure_dir(self, path: str, mode: int, owner: str, group: str) -> None:
+        """Create the directory (and parents) if needed and set mode/owner/group on it."""
+        ...
 
     # --- systemd ---
     async def systemctl(self, action: str, unit: str) -> None:
@@ -97,6 +121,10 @@ class SystemOps(Protocol):
     async def nft_load_file(self, path: str) -> None: ...
     async def nft_list_set(self, table: str, set_name: str) -> dict[str, SetCounter]:
         """ip -> counter. Parsed from `nft -j list set inet <table> <set>`."""
+        ...
+
+    async def nft_delete_table(self, table: str) -> None:
+        """`nft delete table inet <table>`; a missing table is not an error."""
         ...
 
     async def nft_add_elements(self, table: str, set_name: str, ips: list[str]) -> None: ...

@@ -111,12 +111,15 @@ async def test_queued_batch_failure_fails_every_member_and_rolls_back_all(
     second = asyncio.create_task(env.pipeline.run_operation(add_users(env.clock, 1), reason="B"))
     third = asyncio.create_task(env.pipeline.run_operation(add_users(env.clock, 1), reason="C"))
     await asyncio.sleep(0)
-    fake.fail_on("systemctl", f"restart {RELAY}", skip=1)  # fails the combined second apply
+    # the relay config check keeps failing after A: the combined apply AND both retries fail
+    fake.fail_check("tproxy_check", "rejected", times=None)
     fake.gate.set()
     a, b, c = await asyncio.gather(first, second, third)
     assert a.ok
     assert not b.ok and not c.ok
-    assert b.apply_run_id == c.apply_run_id
+    assert "Групповое применение не удалось" in (b.error or "")
+    assert "Групповое применение не удалось" in (c.error or "")
+    assert b.apply_run_id != c.apply_run_id  # each was retried in its own apply
     assert len(env.users()) == 1  # only A survived; B and C left no trace in the DB
     assert [p["name"] for p in fake.get_json(PROFILES)["profiles"]] == ["u1"]
 
@@ -148,8 +151,8 @@ async def test_sequential_operations_do_not_share_an_apply(env: Env) -> None:
 
 async def test_cross_process_lock_is_taken_for_every_batch(env: Env) -> None:
     await env.pipeline.run_operation(add_users(env.clock, 1), reason="x")
-    assert env.fake.calls_of("acquire_lock", "/run/tgpanel/apply.lock")
-    assert not env.fake.is_locked("/run/tgpanel/apply.lock")
+    assert env.fake.calls_of("acquire_lock", "/var/lib/tgpanel/apply.lock")
+    assert not env.fake.is_locked("/var/lib/tgpanel/apply.lock")
 
 
 async def test_lock_timeout_fails_cleanly(make: Callable[..., Env]) -> None:

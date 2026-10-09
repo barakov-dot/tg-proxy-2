@@ -10,7 +10,8 @@ from pathlib import Path
 
 from tgpanel.apply.config import ApplyConfig
 from tgpanel.apply.importer import Importer
-from tgpanel.apply.pipeline import ApplyFailure, ApplyPipeline
+from tgpanel.apply.pipeline import ApplyFailure, ApplyPipeline, RecoveryReport
+from tgpanel.apply.runtime import ensure_runtime_dirs
 from tgpanel.db.connection import Database
 from tgpanel.services.settings_service import SettingsServiceImpl
 from tgpanel.services.users import UserServiceImpl
@@ -24,6 +25,17 @@ class AppContext:
     users: UserServiceImpl
     settings: SettingsServiceImpl
     importer: Importer
+
+    async def start(self, *, recover: bool = True) -> RecoveryReport | None:
+        """Service start: runtime directories, crash recovery, cached proxy host name.
+
+        ``recover=False`` (CLI) skips the crash recovery that restores files of an interrupted
+        apply; the service always runs it once before accepting operations.
+        """
+        await ensure_runtime_dirs(self.pipeline.ops, self.pipeline.config.paths)
+        report = await self.pipeline.startup_recovery() if recover else None
+        await self.users.load_hostname()
+        return report
 
     def close(self) -> None:
         self.pipeline.close()
@@ -41,10 +53,15 @@ def build_context(
 ) -> AppContext:
     db = Database(db_path)
     pipeline = ApplyPipeline(ops, db, config, clock=clock, sleep=sleep, on_failure=on_failure)
+    users = UserServiceImpl(pipeline, db)
+
+    async def refresh_hostname() -> None:
+        await users.load_hostname()
+
     return AppContext(
         db=db,
         pipeline=pipeline,
-        users=UserServiceImpl(pipeline, db),
-        settings=SettingsServiceImpl(pipeline, db),
+        users=users,
+        settings=SettingsServiceImpl(pipeline, db, on_change=refresh_hostname),
         importer=Importer(pipeline),
     )

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import os
 import sys
 from collections.abc import Callable, Sequence
@@ -53,6 +54,16 @@ def build_parser() -> argparse.ArgumentParser:
     p_apply.add_argument(
         "--reload-nft", action="store_true", help="полностью перезагрузить таблицу nft"
     )
+    p_apply.add_argument(
+        "--adopt",
+        action="store_true",
+        help="принять текущий profiles.json как базовый (ничего не применять)",
+    )
+    p_apply.add_argument(
+        "--prune-orphans",
+        action="store_true",
+        help="остановить и удалить пулы, неизвестные базе данных",
+    )
 
     p_imp = sub.add_parser("import", help="импорт существующих профилей прокси")
     p_imp.add_argument("--dry-run", action="store_true", help="только показать план")
@@ -87,19 +98,6 @@ def config_from_env() -> ApplyConfig:
     if backups:
         paths = replace(paths, backups_dir=backups)
     return ApplyConfig(paths=paths)
-
-
-def _ensure_real_dirs(config: ApplyConfig) -> None:
-    """Directories the real system needs before the first apply (0700)."""
-    for directory in (
-        str(Path(config.paths.lock).parent),
-        config.paths.backups_dir,
-        config.paths.pools_dir,
-    ):
-        try:
-            Path(directory).mkdir(mode=0o700, parents=True, exist_ok=True)
-        except OSError:
-            pass  # reported later by the failing operation itself
 
 
 def _fmt_dt(value: datetime | None) -> str:
@@ -166,6 +164,16 @@ async def _cmd_status(ctx: AppContext, out: TextIO) -> int:
 
 
 async def _cmd_apply(ctx: AppContext, args: argparse.Namespace, out: TextIO) -> int:
+    if args.adopt:
+        print(await ctx.pipeline.adopt(ACTOR), file=out)
+        return EXIT_OK
+    if args.prune_orphans:
+        pruned = await ctx.pipeline.prune_orphans(ACTOR)
+        if not pruned.ok:
+            print(pruned.error or "Не удалось удалить лишние пулы", file=out)
+            return EXIT_ERROR
+        print("Лишние пулы удалены.", file=out)
+        return EXIT_OK
     print("Применяю конфигурацию…", file=out)
     outcome = await ctx.pipeline.apply_now(
         "cli-apply",
@@ -173,6 +181,9 @@ async def _cmd_apply(ctx: AppContext, args: argparse.Namespace, out: TextIO) -> 
         force_external=args.force_external,
         full_nft_reload=args.reload_nft,
     )
+    if outcome.status == "needs_adoption":
+        print(outcome.error, file=out)
+        return EXIT_EXTERNAL
     if outcome.status == "external_change":
         print(outcome.error or "profiles.json изменён вне панели", file=out)
         print(
@@ -279,7 +290,7 @@ async def _cmd_restore(
         if answer not in ("y", "yes", "д", "да"):
             print("Отменено.", file=out)
             return EXIT_ERROR
-    outcome = await ctx.pipeline.restore_backup(args.file, ACTOR)
+    outcome = await ctx.pipeline.restore_backup(args.file, ACTOR, allow_external_path=True)
     if not outcome.ok:
         print(f"Восстановление не выполнено: {outcome.error}", file=out)
         return EXIT_ERROR
@@ -316,15 +327,22 @@ def main(
         from tgpanel.system.real import RealSystemOps
 
         ops = RealSystemOps()
-        _ensure_real_dirs(cfg)
     ctx = build_context(ops, db_path, config=cfg)
     try:
-        return asyncio.run(_dispatch(ctx, args, stream, input_fn))
+        return asyncio.run(_run(ctx, args, stream, input_fn))
     except SystemOpsError as exc:
         print(f"Ошибка системы: {exc}", file=stream)
         return EXIT_ERROR
     finally:
         ctx.close()
+
+
+async def _run(
+    ctx: AppContext, args: argparse.Namespace, out: TextIO, input_fn: Callable[[str], str]
+) -> int:
+    with contextlib.suppress(SystemOpsError):  # best effort (e.g. `status` as a normal user)
+        await ctx.start(recover=False)
+    return await _dispatch(ctx, args, out, input_fn)
 
 
 async def _dispatch(

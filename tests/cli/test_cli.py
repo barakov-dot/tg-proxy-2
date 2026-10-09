@@ -199,3 +199,35 @@ def test_unknown_command_is_a_usage_error(run: Run) -> None:
     with pytest.raises(SystemExit) as exc:
         run("frobnicate")
     assert exc.value.code == 2
+
+
+def test_empty_db_over_a_live_install_needs_adopt_then_prune(run: Run, tmp_path: Path) -> None:
+    assert run("import", "--yes")[0] == 0  # the clean server now runs pool 1 with user u1
+    assert "tgpanel-mtproxy@1" in run.fake.active
+    files = {p: f.data for p, f in run.fake.files.items() if not p.startswith("/var/backups/")}
+    run.fake.clear_calls()
+    run.db = str(tmp_path / "brand-new.db")  # the database was lost/replaced
+    code, out = run("apply")
+    assert code == 3 and "--adopt" in out and "restore" in out
+    assert run.fake.calls_of("systemctl") == [] and run.fake.calls_of("remove") == []
+    code, out = run("apply", "--adopt")
+    assert code == 0 and "принято" in out
+    code, out = run("apply")
+    assert code == 0 and "Изменений нет" in out
+    assert run.fake.calls_of("systemctl") == []
+    assert {
+        p: f.data for p, f in run.fake.files.items() if not p.startswith("/var/backups/")
+    } == files
+    code, out = run("apply", "--prune-orphans")
+    assert code == 0 and "Лишние пулы удалены" in out
+    assert "tgpanel-mtproxy@1" not in run.fake.active
+    assert run.fake.systemctl_calls("disable-now") == [("disable-now", "tgpanel-mtproxy@1")]
+
+
+def test_restore_accepts_an_external_file_from_the_cli(run: Run) -> None:
+    assert run("import", "--yes")[0] == 0
+    assert run("backup", "--reason", "mine")[0] == 0
+    path = next(p for p in run.fake.files if p.endswith("-mine.tar.gz"))
+    run.fake.put_file("/srv/fixture/copy.tar.gz", run.fake.files[path].data, mode=0o600)
+    code, out = run("restore", "/srv/fixture/copy.tar.gz", "--yes")
+    assert code == 0 and "восстановлено" in out

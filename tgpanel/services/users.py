@@ -86,6 +86,14 @@ class UserServiceImpl:
     def __init__(self, pipeline: ApplyPipeline, db: Database) -> None:
         self._pipeline = pipeline
         self._db = db
+        # ``link()`` is synchronous and runs on the event loop: it must never touch the DB, so
+        # the proxy host name is cached (loaded at start, refreshed on settings changes/create).
+        self._host_cache: str | None = None
+
+    async def load_hostname(self) -> str:
+        host = str(await self._db.run(repo.get_setting, "proxy_hostname", "") or "")
+        self._host_cache = host
+        return host
 
     # ------------------------------------------------------------------ plumbing
 
@@ -106,6 +114,7 @@ class UserServiceImpl:
         ids = tuple(outcome.value or ())
         links: dict[int, str] = {}
         if with_links and ids:
+            await self.load_hostname()
             users = await self._db.run(repo.users_by_ids, list(ids))
             links = {u.id: self.link(u) for u in users}
         return OperationResult(
@@ -139,7 +148,7 @@ class UserServiceImpl:
     async def create(self, users: list[NewUser], actor: Actor) -> OperationResult:
         if not users:
             return OperationResult(ok=False, error="Не указано ни одного пользователя")
-        if not await self._db.run(repo.get_setting, "proxy_hostname", ""):
+        if not await self.load_hostname():
             return OperationResult(ok=False, error="Не задано имя хоста прокси (proxy_hostname)")
 
         def mutation(conn: sqlite3.Connection) -> list[int]:
@@ -408,7 +417,7 @@ class UserServiceImpl:
         return await self._db.run(repo.get_user, user_id)
 
     def _host(self) -> str:
-        host = self._db.call(repo.get_setting, "proxy_hostname", "") or ""
+        host = self._host_cache
         if not host:
             raise UserServiceError("Не задано имя хоста прокси (proxy_hostname)")
         return host

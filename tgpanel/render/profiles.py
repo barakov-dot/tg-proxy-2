@@ -7,6 +7,7 @@ import json
 from dataclasses import dataclass, field
 from typing import Any
 
+from tgpanel.domain.addresses import is_valid_loopback_ip
 from tgpanel.domain.models import DesiredState, PoolRecord, UserRecord, UserStatus
 from tgpanel.domain.pools import sentinel_host_pool, sentinel_slot_needed
 from tgpanel.render.errors import RenderError
@@ -49,6 +50,17 @@ def sentinel_pool(state: DesiredState) -> PoolRecord:
 
 def needs_sentinel(state: DesiredState) -> bool:
     return sentinel_slot_needed(state.users) and not state.foreign_profiles
+
+
+def foreign_loopback_ips(state: DesiredState) -> list[str]:
+    """127.64.x.y addresses used by unmanaged profiles (kept in the accounting sets)."""
+    out: list[str] = []
+    for raw in state.foreign_profiles:
+        backend = json.loads(raw).get("backend")
+        host = backend.rpartition(":")[0] if isinstance(backend, str) else ""
+        if is_valid_loopback_ip(host):
+            out.append(host)
+    return out
 
 
 def render_profiles(state: DesiredState) -> bytes:

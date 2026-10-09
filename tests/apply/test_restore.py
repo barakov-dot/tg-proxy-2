@@ -87,16 +87,22 @@ async def test_restore_rejects_archive_without_db(env: Env) -> None:
         "/srv/fixture/files-only.tar.gz",
         build_tar_gz({"etc/x": b"1", "MANIFEST.json": b'{"format": 1}'}),
     )
-    out = await env.pipeline.restore_backup("/srv/fixture/files-only.tar.gz", "system")
+    out = await env.pipeline.restore_backup(
+        "/srv/fixture/files-only.tar.gz", "system", allow_external_path=True
+    )
     assert not out.ok and "снимка" in (out.error or "")
     assert env.fake.calls_of("systemctl") == []
 
 
 async def test_restore_rejects_garbage(env: Env) -> None:
     env.fake.put_file("/srv/fixture/junk.tar.gz", b"not an archive")
-    out = await env.pipeline.restore_backup("/srv/fixture/junk.tar.gz", "system")
+    out = await env.pipeline.restore_backup(
+        "/srv/fixture/junk.tar.gz", "system", allow_external_path=True
+    )
     assert not out.ok
-    out = await env.pipeline.restore_backup("/srv/fixture/missing.tar.gz", "system")
+    out = await env.pipeline.restore_backup(
+        "/srv/fixture/missing.tar.gz", "system", allow_external_path=True
+    )
     assert not out.ok
 
 
@@ -117,6 +123,8 @@ async def test_restore_rejects_snapshot_with_other_schema(env: Env) -> None:
     mem.close()
     env.fake.put_file("/srv/fixture/other.tar.gz", build_tar_gz(members))
     users_before = len(env.users())
-    out = await env.pipeline.restore_backup("/srv/fixture/other.tar.gz", "system")
+    out = await env.pipeline.restore_backup(
+        "/srv/fixture/other.tar.gz", "system", allow_external_path=True
+    )
     assert not out.ok and "схемы" in (out.error or "")
     assert len(env.users()) == users_before

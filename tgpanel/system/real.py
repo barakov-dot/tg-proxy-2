@@ -17,6 +17,7 @@ import ipaddress
 import json
 import os
 import pwd
+import signal
 import socket
 import ssl
 import stat as stat_mod
@@ -25,7 +26,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -34,12 +35,14 @@ from tgpanel.system.ops import (
     CheckResult,
     FileStat,
     HttpResult,
+    LocalFile,
     LockHandle,
     SetCounter,
     SystemOpsError,
 )
 from tgpanel.system.validation import (
-    build_tar_gz,
+    extract_tar_member_to_file,
+    iter_tar_members,
     parse_tar_gz,
     scrub,
     validate_env,
@@ -49,10 +52,12 @@ from tgpanel.system.validation import (
     validate_property,
     validate_systemctl,
     validate_unit,
+    write_tar_gz,
 )
 
 _MINIMAL_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 _MAX_HTTP_BODY = 8 * 1024 * 1024
+_KILL_GRACE_S = 5.0  # how long to wait for the pipes of a killed command to close
 _DEFAULT_IP_PROBES = (
     "https://api.ipify.org",
     "https://checkip.amazonaws.com",
@@ -87,6 +92,15 @@ def minimal_env(extra: Mapping[str, str] | None = None) -> dict[str, str]:
     return env
 
 
+def _kill_group(proc: asyncio.subprocess.Process) -> None:
+    """SIGKILL the command and everything it started (it runs in its own session)."""
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        with contextlib.suppress(ProcessLookupError):
+            proc.kill()
+
+
 async def run_command(
     argv: Sequence[str],
     *,
@@ -103,6 +117,7 @@ async def run_command(
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             env=minimal_env(env),
+            start_new_session=True,  # own process group: a timeout kills grandchildren too
         )
     except OSError as exc:
         raise SystemOpsError(
@@ -111,13 +126,14 @@ async def run_command(
     try:
         out, err = await asyncio.wait_for(proc.communicate(), timeout_s)
     except TimeoutError:
-        with contextlib.suppress(ProcessLookupError):
-            proc.kill()
-        out, err = await proc.communicate()
+        _kill_group(proc)
+        try:  # a killed child can still hold the pipes open (grandchildren): bound the wait
+            out, err = await asyncio.wait_for(proc.communicate(), _KILL_GRACE_S)
+        except (TimeoutError, OSError):
+            out, err = b"", b""
         return CommandResult(-1, out, err, timed_out=True)
     except BaseException:
-        with contextlib.suppress(ProcessLookupError):
-            proc.kill()
+        _kill_group(proc)
         await proc.wait()
         raise
     return CommandResult(proc.returncode if proc.returncode is not None else -1, out, err)
@@ -166,6 +182,24 @@ def write_atomic_sync(path: str, data: bytes, *, mode: int, uid: int, gid: int) 
         finally:
             os.close(fd)
         os.replace(tmp, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+        raise
+    _fsync_dir(directory)
+
+
+def write_tar_stream_sync(dest: str, members: Mapping[str, bytes | LocalFile]) -> None:
+    """Stream a 0600 tar.gz to a temp file next to ``dest``, fsync, rename."""
+    directory = os.path.dirname(dest)
+    fd, tmp = tempfile.mkstemp(dir=directory, prefix=".tgpanel-", suffix=".tmp")
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "wb") as out:
+            write_tar_gz(out, members)
+            out.flush()
+            os.fsync(out.fileno())
+        os.replace(tmp, dest)
     except BaseException:
         with contextlib.suppress(OSError):
             os.unlink(tmp)
@@ -231,7 +265,7 @@ def _http_get_sync(url: str, timeout_s: float) -> HttpResult:
     parsed = urllib.parse.urlsplit(url)
     if parsed.scheme not in ("http", "https") or not parsed.hostname:
         raise SystemOpsError("only http/https URLs are allowed")
-    opener = urllib.request.build_opener(_NoRedirect)
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect)
     req = urllib.request.Request(url, method="GET")  # noqa: S310
     try:
         with opener.open(req, timeout=timeout_s) as resp:
@@ -244,21 +278,6 @@ def _http_get_sync(url: str, timeout_s: float) -> HttpResult:
         return HttpResult(status=exc.code, body=body)
     except (OSError, http.client.HTTPException, ValueError):
         return HttpResult(status=0)
-
-
-def _decode_cert_der(der: bytes) -> dict[str, Any] | None:
-    """Decode an unverified DER certificate (CPython-private helper, best effort)."""
-    pem = ssl.DER_cert_to_PEM_cert(der)
-    with tempfile.NamedTemporaryFile("w", suffix=".pem") as tmp:
-        tmp.write(pem)
-        tmp.flush()
-        try:
-            from ssl import _ssl  # type: ignore[attr-defined]
-
-            decoded: dict[str, Any] = _ssl._test_decode_cert(tmp.name)
-        except Exception:
-            return None
-    return decoded
 
 
 def _cert_info_from_dict(cert: dict[str, Any], valid_chain: bool) -> CertInfo:
@@ -280,35 +299,44 @@ def _cert_info_from_dict(cert: dict[str, Any], valid_chain: bool) -> CertInfo:
     )
 
 
+def _name_matches(pattern: str, hostname: str) -> bool:
+    pattern, hostname = pattern.lower(), hostname.lower()
+    if pattern.startswith("*."):
+        head, _, rest = hostname.partition(".")
+        return bool(head) and rest == pattern[2:]
+    return pattern == hostname
+
+
+def _cert_covers_host(cert: dict[str, Any], hostname: str) -> bool:
+    sans = [v for k, v in cert.get("subjectAltName", ()) if k == "DNS"]
+    if not sans:
+        for rdn in cert.get("subject", ()):
+            sans += [v for k, v in rdn if k == "commonName"]
+    return any(_name_matches(name, hostname) for name in sans)
+
+
 def _tls_cert_info_sync(hostname: str, port: int, timeout_s: float) -> CertInfo | None:
+    """Public-API only: the chain is verified by the handshake (CERT_REQUIRED); the host name
+    is matched against the verified certificate by hand."""
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_REQUIRED
     try:
-        ctx = ssl.create_default_context()
         with (
             socket.create_connection((hostname, port), timeout=timeout_s) as sock,
             ctx.wrap_socket(sock, server_hostname=hostname) as tls,
         ):
             cert = tls.getpeercert()
-        return _cert_info_from_dict(dict(cert), True) if cert else None
     except ssl.SSLCertVerificationError:
-        pass
-    except (OSError, ssl.SSLError, ValueError, KeyError):
+        return CertInfo(issuer="", not_before="", not_after="", valid_chain=False)
+    except (OSError, ssl.SSLError, ValueError):
         return None
-    # Chain/name verification failed: still report what the server presents.
+    if not cert:
+        return None
     try:
-        insecure = ssl.create_default_context()
-        insecure.check_hostname = False
-        insecure.verify_mode = ssl.CERT_NONE
-        with (
-            socket.create_connection((hostname, port), timeout=timeout_s) as sock,
-            insecure.wrap_socket(sock, server_hostname=hostname) as tls,
-        ):
-            der = tls.getpeercert(binary_form=True)
-        decoded = _decode_cert_der(der) if der else None
-        if decoded:
-            return _cert_info_from_dict(decoded, False)
-    except (OSError, ssl.SSLError, ValueError, KeyError):
+        return _cert_info_from_dict(dict(cert), _cert_covers_host(dict(cert), hostname))
+    except (KeyError, ValueError):
         return None
-    return CertInfo(issuer="", not_before="", not_after="", valid_chain=False)
 
 
 class RealLockHandle:
@@ -409,16 +437,34 @@ class RealSystemOps:
 
         await _fs(_rm)
 
-    async def make_tar_gz(self, dest: str, members: dict[str, bytes]) -> None:
+    async def make_tar_gz(self, dest: str, members: Mapping[str, bytes | LocalFile]) -> None:
         validate_path(dest)
-        blob = await asyncio.to_thread(build_tar_gz, members)
-        await _fs(
-            lambda: write_atomic_sync(dest, blob, mode=0o600, uid=os.geteuid(), gid=os.getegid())
-        )
+        await _fs(lambda: write_tar_stream_sync(dest, members))
 
     async def read_tar_gz(self, path: str) -> dict[str, bytes]:
         validate_path(path)
         return await asyncio.to_thread(parse_tar_gz, path)
+
+    async def read_tar_members(
+        self, path: str, names: Collection[str] | None = None
+    ) -> dict[str, bytes]:
+        validate_path(path)
+        return await asyncio.to_thread(iter_tar_members, path, names)
+
+    async def extract_tar_member(self, path: str, name: str, dest: str) -> bool:
+        validate_path(path)
+        return await asyncio.to_thread(extract_tar_member_to_file, path, name, dest)
+
+    async def ensure_dir(self, path: str, mode: int, owner: str, group: str) -> None:
+        validate_path(path)
+        uid, gid = _resolve_uid(owner), _resolve_gid(group)
+
+        def _mk() -> None:
+            os.makedirs(path, mode=mode, exist_ok=True)
+            os.chmod(path, mode)
+            os.chown(path, uid, gid)
+
+        await _fs(_mk)
 
     # --- systemd -------------------------------------------------------------------------
 
@@ -544,6 +590,14 @@ class RealSystemOps:
             raise SystemOpsError(f"nft list set failed: {res.output}")
         return parse_nft_set_json(res.stdout)
 
+    async def nft_delete_table(self, table: str) -> None:
+        validate_nft_ident(table, "table")
+        res = await run_command(
+            [self._nft, "delete", "table", "inet", table], timeout_s=self._timeout
+        )
+        if not res.ok and "No such file" not in res.output:
+            raise SystemOpsError(f"nft delete table failed: {res.output}")
+
     async def nft_add_elements(self, table: str, set_name: str, ips: list[str]) -> None:
         await self._nft_elements("add", table, set_name, ips)
 
@@ -569,25 +623,23 @@ class RealSystemOps:
     async def acquire_lock(self, path: str, timeout_s: float) -> LockHandle:
         """flock(2) on `path`; polled non-blockingly so waiting is cancellable."""
         validate_path(path)
-        try:
-            fd = await asyncio.to_thread(os.open, path, os.O_RDWR | os.O_CREAT, 0o600)
+        try:  # opened inline (a local, instant call): no thread hand-off that cancellation could
+            fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)  # orphan together with the fd
         except OSError as exc:
             raise SystemOpsError(f"cannot open lock file: {exc.strerror}") from None
-        deadline = time.monotonic() + timeout_s
-        while True:
-            try:
-                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except BlockingIOError:
-                if time.monotonic() >= deadline:
-                    os.close(fd)
-                    raise SystemOpsError("timed out waiting for lock") from None
+        try:
+            deadline = time.monotonic() + timeout_s
+            while True:
                 try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    if time.monotonic() >= deadline:
+                        raise SystemOpsError("timed out waiting for lock") from None
                     await asyncio.sleep(0.05)
-                except BaseException:
-                    os.close(fd)
-                    raise
-            except OSError as exc:
-                os.close(fd)
-                raise SystemOpsError(f"cannot lock: {exc.strerror}") from None
-            else:
-                return RealLockHandle(fd)
+                except OSError as exc:
+                    raise SystemOpsError(f"cannot lock: {exc.strerror}") from None
+                else:
+                    return RealLockHandle(fd)
+        except BaseException:  # timeout, error or cancellation: never leak the descriptor
+            os.close(fd)
+            raise

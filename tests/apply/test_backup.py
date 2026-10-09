@@ -81,8 +81,8 @@ async def test_manual_backup_is_recorded(env: Env) -> None:
 async def test_same_second_backups_get_distinct_names(env: Env) -> None:
     frozen = datetime(2026, 5, 1, 0, 0, 0, tzinfo=UTC)
     paths = ApplyPaths()
-    a = await bk.create_backup(env.fake, paths, reason="x", now=frozen, db_snapshot=None)
-    b = await bk.create_backup(env.fake, paths, reason="x", now=frozen, db_snapshot=None)
+    a = await bk.create_backup(env.fake, paths, reason="x", now=frozen, db_file=None)
+    b = await bk.create_backup(env.fake, paths, reason="x", now=frozen, db_file=None)
     assert a.path != b.path and b.path.endswith("-x.2.tar.gz")
 
 

@@ -8,16 +8,16 @@ import re
 import shutil
 import sqlite3
 import tempfile
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from tgpanel.apply.config import ApplyPaths
 from tgpanel.db import repo
-from tgpanel.db.connection import Database, current_version
+from tgpanel.db.connection import Database, current_version, migrate
 from tgpanel.db.repo import BackupRecord
-from tgpanel.system.ops import SystemOps, SystemOpsError
+from tgpanel.system.ops import FileStat, LocalFile, SystemOps, SystemOpsError
 
 MANIFEST_NAME = "MANIFEST.json"
 DB_MEMBER = "tgpanel.db"
@@ -39,6 +39,7 @@ class BackupInfo:
     created_at: datetime
     reason: str
     size: int
+    slim: bool = False
 
 
 def sanitize_reason(reason: str) -> str:
@@ -87,21 +88,39 @@ async def backup_file_list(ops: SystemOps, paths: ApplyPaths) -> list[str]:
 
 
 async def collect_members(
-    ops: SystemOps, paths: ApplyPaths, *, reason: str, now: datetime, db_snapshot: bytes | None
-) -> dict[str, bytes]:
-    members: dict[str, bytes] = {}
+    ops: SystemOps,
+    paths: ApplyPaths,
+    *,
+    reason: str,
+    now: datetime,
+    db_file: str | None,
+    slim: bool,
+    known: Mapping[str, tuple[bytes, FileStat]] | None = None,
+) -> dict[str, bytes | LocalFile]:
+    """Archive members. ``known`` holds pre-images already read under the lock (not re-read)."""
+    known = known or {}
+    members: dict[str, bytes | LocalFile] = {}
     files_meta: dict[str, dict[str, object]] = {}
     for path in await backup_file_list(ops, paths):
-        st = await ops.stat(path)
-        members[member_name(path)] = await ops.read_file(path)
+        if path in known:
+            data, st = known[path]
+        else:
+            st = await ops.stat(path)
+            data = await ops.read_file(path)
+        members[member_name(path)] = data
         files_meta[member_name(path)] = {"mode": st.mode, "owner": st.owner, "group": st.group}
-    if db_snapshot is not None:
-        members[DB_MEMBER] = db_snapshot
+    for path, (data, st) in known.items():  # pre-images of files that exist but are not listed
+        if member_name(path) not in members:
+            members[member_name(path)] = data
+            files_meta[member_name(path)] = {"mode": st.mode, "owner": st.owner, "group": st.group}
+    if db_file is not None:
+        members[DB_MEMBER] = LocalFile(db_file)  # streamed into the archive, never read whole
     manifest = {
         "format": 1,
         "created_at": now.strftime(_TS_FMT),
         "reason": reason,
-        "has_db": db_snapshot is not None,
+        "has_db": db_file is not None,
+        "slim": slim,
         "files": files_meta,
     }
     members[MANIFEST_NAME] = json.dumps(manifest, sort_keys=True, indent=1).encode()
@@ -124,35 +143,130 @@ async def create_backup(
     *,
     reason: str,
     now: datetime,
-    db_snapshot: bytes | None,
+    db_file: str | None,
+    slim: bool = False,
+    known: Mapping[str, tuple[bytes, FileStat]] | None = None,
 ) -> BackupInfo:
     clean = sanitize_reason(reason)
     try:
-        members = await collect_members(ops, paths, reason=clean, now=now, db_snapshot=db_snapshot)
+        members = await collect_members(
+            ops, paths, reason=clean, now=now, db_file=db_file, slim=slim, known=known
+        )
         dest = await _unique_path(ops, paths.backups_dir, now.strftime(_TS_FMT), clean)
         await ops.make_tar_gz(dest, members)
         size = (await ops.stat(dest)).size
     except SystemOpsError as exc:
         raise BackupError(f"не удалось создать резервную копию: {exc}") from None
-    return BackupInfo(dest, now, clean, size)
+    return BackupInfo(dest, now, clean, size, slim)
 
 
-def db_snapshot_bytes(db: Database) -> bytes:
-    """Consistent copy of the SQLite DB via the backup API, read back as bytes."""
-    tmp_dir = tempfile.mkdtemp(prefix="tgpanel-snap-")
-    try:
-        os.chmod(tmp_dir, 0o700)
-        target = Path(tmp_dir) / "snapshot.db"
-        db.snapshot_to(target)
-        # Make the copy a self-contained single file (no WAL sidecars needed to open it).
-        copy = sqlite3.connect(str(target))
+# ------------------------------------------------------------------------ DB snapshots
+
+# Contents never carried by a slim (pre-apply) snapshot: bulky statistics and history.
+SLIM_EXCLUDED = frozenset(
+    {
+        "traffic_minute",
+        "traffic_hour",
+        "traffic_day",
+        "counter_state",
+        "audit_log",
+        "apply_runs",
+        "backups",
+    }
+)
+
+
+def db_file_of(db: Database) -> str | None:
+    """Filesystem path of the main database, or None for an in-memory one."""
+    rows = db.call(
+        lambda c: [str(r[2]) for r in c.execute("PRAGMA database_list") if r[1] == "main"]
+    )
+    return rows[0] if rows and rows[0] else None
+
+
+def snapshot_database(db: Database, db_path: str | None, dest: Path, *, slim: bool) -> None:
+    """Consistent snapshot of the DB into ``dest`` (a single self-contained 0600 file).
+
+    File databases are read through a SEPARATE read-only connection (WAL snapshot isolation),
+    so neither Database's lock nor the writer are involved. The slim variant creates a fresh
+    database with the current schema and copies only the small tables via ATTACH (an
+    equivalent of VACUUM INTO that skips the traffic/history tables entirely, so its cost does
+    not grow with the statistics). In-memory databases (tests) fall back to the backup API
+    plus DELETE.
+    """
+    fd = os.open(dest, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    os.close(fd)
+    if db_path is None:
+        db.snapshot_to(dest)
+        if slim:
+            copy = sqlite3.connect(str(dest))
+            try:
+                for table in sorted(SLIM_EXCLUDED):
+                    copy.execute(f"DELETE FROM {table}")  # noqa: S608 - fixed names
+                copy.commit()
+                copy.execute("VACUUM")
+            finally:
+                copy.close()
+        _single_file(dest)
+        return
+    src_uri = Path(db_path).as_uri() + "?mode=ro"
+    if not slim:
+        src = sqlite3.connect(src_uri, uri=True)
         try:
-            copy.execute("PRAGMA journal_mode = DELETE")
+            dst = sqlite3.connect(str(dest))
+            try:
+                src.backup(dst)
+            finally:
+                dst.close()
         finally:
-            copy.close()
-        return target.read_bytes()
+            src.close()
+    else:
+        dst = sqlite3.connect(dest.as_uri(), uri=True, isolation_level=None)
+        try:
+            dst.row_factory = sqlite3.Row
+            migrate(dst)  # schema + schema_version
+            dst.execute("ATTACH DATABASE ? AS live", (src_uri,))
+            dst.execute("BEGIN")
+            tables = [
+                str(r[0])
+                for r in dst.execute(
+                    "SELECT name FROM live.sqlite_master WHERE type = 'table'"
+                    " AND name NOT LIKE 'sqlite_%' AND name != 'schema_version'"
+                )
+                if str(r[0]) not in SLIM_EXCLUDED
+            ]
+            for table in tables:
+                dst.execute(f"INSERT INTO main.{table} SELECT * FROM live.{table}")  # noqa: S608
+            dst.execute("DELETE FROM main.sqlite_sequence")
+            dst.execute(
+                "INSERT INTO main.sqlite_sequence SELECT name, seq FROM live.sqlite_sequence"
+            )
+            dst.execute("COMMIT")
+            dst.execute("DETACH DATABASE live")
+        finally:
+            dst.close()
+    _single_file(dest)
+
+
+def _single_file(dest: Path) -> None:
+    """Make the copy self-contained (no WAL sidecars needed to open it) and private."""
+    copy = sqlite3.connect(str(dest))
+    try:
+        copy.execute("PRAGMA journal_mode = DELETE")
     finally:
-        shutil.rmtree(tmp_dir, ignore_errors=True)
+        copy.close()
+    os.chmod(dest, 0o600)
+
+
+def make_temp_dir() -> Path:
+    path = Path(tempfile.mkdtemp(prefix="tgpanel-snap-"))
+    os.chmod(path, 0o700)
+    return path
+
+
+def remove_temp_dir(path: Path | None) -> None:
+    if path is not None:
+        shutil.rmtree(path, ignore_errors=True)
 
 
 def record_backup(conn: sqlite3.Connection, info: BackupInfo) -> None:
@@ -232,13 +346,15 @@ def add_missing_backups(conn: sqlite3.Connection, infos: Iterable[BackupInfo]) -
 @dataclass(frozen=True, slots=True)
 class BackupArchive:
     manifest: dict[str, object]
-    db_snapshot: bytes | None
+    has_db: bool
+    slim: bool
     file_names: tuple[str, ...]
 
 
 async def read_archive(ops: SystemOps, path: str) -> BackupArchive:
+    """Read only MANIFEST.json (the archive is streamed; nothing else is loaded)."""
     try:
-        members = await ops.read_tar_gz(path)
+        members = await ops.read_tar_members(path, {MANIFEST_NAME})
     except SystemOpsError as exc:
         raise BackupError(f"не удалось прочитать архив: {exc}") from None
     raw = members.get(MANIFEST_NAME)
@@ -250,12 +366,14 @@ async def read_archive(ops: SystemOps, path: str) -> BackupArchive:
         raise BackupError("MANIFEST.json повреждён") from None
     if not isinstance(manifest, dict) or manifest.get("format") != 1:
         raise BackupError("неподдерживаемый формат резервной копии")
-    names = tuple(sorted(n for n in members if n not in (MANIFEST_NAME, DB_MEMBER)))
-    return BackupArchive(manifest, members.get(DB_MEMBER), names)
+    files = manifest.get("files")
+    names = tuple(sorted(files)) if isinstance(files, dict) else ()
+    return BackupArchive(manifest, bool(manifest.get("has_db")), bool(manifest.get("slim")), names)
 
 
-# Tables restored from a snapshot. History tables (audit_log, apply_runs, backups) keep their
-# current content; schema_version is never touched.
+# Tables restored from a FULL snapshot. History tables (audit_log, apply_runs, backups) keep
+# their current content; schema_version is never touched. A SLIM snapshot has no statistics:
+# traffic_* and counter_state of surviving users stay as they are.
 _RESTORE_INSERT_ORDER = (
     "pools",
     "users",
@@ -269,63 +387,112 @@ _RESTORE_INSERT_ORDER = (
     "broadcasts",
     "broadcast_items",
 )
+_STATS_TABLES = frozenset({"traffic_minute", "traffic_hour", "traffic_day", "counter_state"})
 _SEQUENCE_TABLES = ("users", "access_requests", "broadcasts", "broadcast_items")
 
 
-def restore_db_snapshot(conn: sqlite3.Connection, snapshot: bytes) -> None:
-    """Replace the restorable tables of ``conn`` with the snapshot content.
+def restore_db_snapshot(conn: sqlite3.Connection, snapshot_path: str, *, slim: bool) -> None:
+    """Replace the restorable tables of ``conn`` with the snapshot file's content.
 
     Must run inside the caller's transaction (so a later failure rolls everything back).
     The snapshot is validated (integrity, schema version) before any row is touched.
     """
-    tmp_dir = tempfile.mkdtemp(prefix="tgpanel-restore-")
     try:
-        os.chmod(tmp_dir, 0o700)
-        snap_path = Path(tmp_dir) / "snapshot.db"
-        snap_path.write_bytes(snapshot)
-        os.chmod(snap_path, 0o600)
-        try:
-            src = sqlite3.connect(str(snap_path))
-        except sqlite3.Error:
-            raise BackupError("снимок БД в архиве повреждён") from None
-        src.row_factory = sqlite3.Row
-        try:
-            _copy_tables(src, conn)
-        except sqlite3.Error:
-            raise BackupError("снимок БД в архиве повреждён или несовместим") from None
-        finally:
-            src.close()
+        src = sqlite3.connect(snapshot_path)
+    except sqlite3.Error:
+        raise BackupError("снимок БД в архиве повреждён") from None
+    src.row_factory = sqlite3.Row
+    try:
+        _copy_tables(src, conn, slim=slim)
+    except sqlite3.Error:
+        raise BackupError("снимок БД в архиве повреждён или несовместим") from None
     finally:
-        shutil.rmtree(tmp_dir, ignore_errors=True)
+        src.close()
 
 
 def _columns(conn: sqlite3.Connection, table: str) -> list[str]:
     return [str(r[1]) for r in conn.execute(f"PRAGMA table_info({table})")]
 
 
-def _copy_tables(src: sqlite3.Connection, dst: sqlite3.Connection) -> None:
+def _rows(
+    src: sqlite3.Connection, dst: sqlite3.Connection, table: str
+) -> tuple[list[str], list[tuple[object, ...]]]:
+    src_cols = set(_columns(src, table))
+    cols = [c for c in _columns(dst, table) if c in src_cols]
+    if not cols:
+        return [], []
+    col_sql = ", ".join(cols)
+    rows = [tuple(r[c] for c in cols) for r in src.execute(f"SELECT {col_sql} FROM {table}")]  # noqa: S608
+    return cols, rows
+
+
+def _insert(
+    dst: sqlite3.Connection, table: str, cols: list[str], rows: list[tuple[object, ...]]
+) -> None:
+    if not cols:
+        return
+    marks = ", ".join("?" * len(cols))
+    dst.executemany(
+        f"INSERT INTO {table} ({', '.join(cols)}) VALUES ({marks})",  # noqa: S608
+        rows,
+    )
+
+
+def _upsert_by_id(
+    dst: sqlite3.Connection, table: str, cols: list[str], rows: list[tuple[object, ...]]
+) -> None:
+    if not cols:
+        return
+    marks = ", ".join("?" * len(cols))
+    updates = ", ".join(f"{c} = excluded.{c}" for c in cols if c != "id")
+    dst.executemany(
+        f"INSERT INTO {table} ({', '.join(cols)}) VALUES ({marks})"  # noqa: S608
+        f" ON CONFLICT(id) DO UPDATE SET {updates}",
+        rows,
+    )
+
+
+def _copy_tables(src: sqlite3.Connection, dst: sqlite3.Connection, *, slim: bool) -> None:
     check = src.execute("PRAGMA integrity_check").fetchone()
     if check is None or str(check[0]) != "ok":
         raise BackupError("снимок БД не прошёл проверку целостности")
-    snap_version = current_version_readonly(src)
-    if snap_version != current_version(dst):
+    if current_version_readonly(src) != current_version(dst):
         raise BackupError("версия схемы снимка БД отличается от текущей")
     dst.execute("PRAGMA defer_foreign_keys = ON")
-    for table in reversed(_RESTORE_INSERT_ORDER):
+    plain = [
+        t for t in _RESTORE_INSERT_ORDER if t not in ("pools", "users") and t not in _STATS_TABLES
+    ]
+    for table in reversed(plain):
         dst.execute(f"DELETE FROM {table}")  # noqa: S608 - fixed table names
-    for table in _RESTORE_INSERT_ORDER:
-        dst_cols = _columns(dst, table)
-        src_cols = set(_columns(src, table))
-        cols = [c for c in dst_cols if c in src_cols]
-        if not cols:
-            continue
-        col_sql = ", ".join(cols)
-        marks = ", ".join("?" * len(cols))
-        rows = [tuple(r[c] for c in cols) for r in src.execute(f"SELECT {col_sql} FROM {table}")]  # noqa: S608
-        dst.executemany(
-            f"INSERT INTO {table} ({col_sql}) VALUES ({marks})",  # noqa: S608
-            rows,
-        )
+    if not slim:
+        for table in reversed(_RESTORE_INSERT_ORDER):
+            if table in _STATS_TABLES or table in ("pools", "users"):
+                dst.execute(f"DELETE FROM {table}")  # noqa: S608
+        for table in _RESTORE_INSERT_ORDER:
+            if table in ("pools", "users") or table in _STATS_TABLES:
+                _insert(dst, table, *_rows(src, dst, table))
+    else:
+        # Keep the statistics of surviving users: never delete-all `users` (that cascades).
+        pool_cols, pool_rows = _rows(src, dst, "pools")
+        user_cols, user_rows = _rows(src, dst, "users")
+        keep_users = {int(r[user_cols.index("id")]) for r in user_rows}  # type: ignore[call-overload]
+        keep_pools = {int(r[pool_cols.index("id")]) for r in pool_rows}  # type: ignore[call-overload]
+        for (uid,) in dst.execute("SELECT id FROM users").fetchall():
+            if int(uid) not in keep_users:
+                dst.execute("DELETE FROM users WHERE id = ?", (uid,))
+        for (pid,) in dst.execute("SELECT id FROM pools").fetchall():
+            if (
+                int(pid) not in keep_pools
+                and not dst.execute("SELECT 1 FROM users WHERE pool_id = ?", (pid,)).fetchone()
+            ):
+                dst.execute("DELETE FROM pools WHERE id = ?", (pid,))
+        _upsert_by_id(dst, "pools", pool_cols, pool_rows)
+        _upsert_by_id(dst, "users", user_cols, user_rows)
+        for (pid,) in dst.execute("SELECT id FROM pools").fetchall():
+            if int(pid) not in keep_pools:
+                dst.execute("DELETE FROM pools WHERE id = ?", (pid,))
+    for table in plain:
+        _insert(dst, table, *_rows(src, dst, table))
     for table in _SEQUENCE_TABLES:
         top = dst.execute(f"SELECT COALESCE(MAX(id), 0) FROM {table}").fetchone()[0]  # noqa: S608
         cur = dst.execute("SELECT seq FROM sqlite_sequence WHERE name = ?", (table,)).fetchone()

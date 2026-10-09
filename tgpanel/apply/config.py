@@ -10,7 +10,8 @@ CONFIG_NAME = "config.json"
 
 @dataclass(frozen=True, slots=True)
 class ApplyPaths:
-    lock: str = "/run/tgpanel/apply.lock"
+    state_dir: str = "/var/lib/tgpanel"
+    lock: str = "/var/lib/tgpanel/apply.lock"
     backups_dir: str = "/var/backups/tgpanel"
     tproxy_dir: str = "/etc/tproxy-server"
     mtproxy_env: str = "/etc/mtproxy/mtproxy.env"
@@ -19,6 +20,18 @@ class ApplyPaths:
     caddyfile: str = "/etc/caddy/Caddyfile"
     systemd_dir: str = "/etc/systemd/system"
     legacy_unit: str = "mtproxy.service"
+
+    @property
+    def journal(self) -> str:
+        return f"{self.state_dir}/apply.journal"
+
+    @property
+    def legacy_dropin_dir(self) -> str:
+        return f"{self.systemd_dir}/{self.legacy_unit}.d"
+
+    @property
+    def legacy_off_dropin(self) -> str:
+        return f"{self.legacy_dropin_dir}/tgpanel-off.conf"
 
     @property
     def profiles(self) -> str:
@@ -55,6 +68,7 @@ class ApplyPaths:
 @dataclass(frozen=True, slots=True)
 class ApplyTiming:
     lock_timeout_s: float = 120.0
+    db_write_timeout_s: float = 30.0
     port_timeout_s: float = 15.0
     http_timeout_s: float = 5.0
     healthz_attempts: int = 40

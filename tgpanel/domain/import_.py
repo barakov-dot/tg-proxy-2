@@ -69,6 +69,58 @@ class ImportPlan:
         return bool(self.errors)
 
 
+_LOOKAROUND = re.compile(r"\(\?(?:=|!|<=|<!|P=|\()")
+_BACKREF = re.compile(r"\\(?:[1-9]|g<|k<)")
+MAX_MATCH_INPUT = 64  # relay profile names are at most 64 characters: bounds any backtracking
+
+
+def check_id_regex_safety(pattern: str) -> str | None:
+    """Conservative ReDoS guard: reason string if the pattern is rejected, else None.
+
+    Rejected: look-arounds, conditionals, back-references, and a quantified group that itself
+    contains a quantifier (``(a+)+``, ``(\\d*)*``, ``(a|b+){2,}``). Matching is additionally run on
+    at most ``MAX_MATCH_INPUT`` characters, so even accepted patterns have a hard budget.
+    """
+    if _LOOKAROUND.search(pattern):
+        return "id regex must not use look-arounds or conditionals"
+    if _BACKREF.search(pattern):
+        return "id regex must not use back-references"
+    stack: list[bool] = []  # per open group: does it contain a repeating quantifier?
+    i, n = 0, len(pattern)
+    in_class = False
+    while i < n:
+        ch = pattern[i]
+        if ch == "\\":
+            i += 2
+            continue
+        if in_class:
+            in_class = ch != "]"
+            i += 1
+            continue
+        if ch == "[":
+            in_class = True
+        elif ch == "(":
+            stack.append(False)
+        elif ch == ")":
+            inner = stack.pop() if stack else False
+            if inner:
+                if stack:
+                    stack[-1] = True
+                if i + 1 < n and _is_repeat(pattern, i + 1):
+                    return "id regex has nested quantifiers"
+        elif _is_repeat(pattern, i) and stack:
+            stack[-1] = True
+        i += 1
+    return None
+
+
+def _is_repeat(pattern: str, i: int) -> bool:
+    ch = pattern[i]
+    if ch in "*+":
+        return True
+    return ch == "{" and re.match(r"\{\d*,?\d*\}", pattern[i:]) is not None
+
+
 def mask_secret(secret: str) -> str:
     return secret[:4] + "..." if len(secret) > 4 else "..."
 
@@ -127,12 +179,15 @@ def plan_import(
     if len(id_regex) > MAX_REGEX_LENGTH:
         regex_error = f"id regex is longer than {MAX_REGEX_LENGTH} characters"
     else:
+        unsafe = check_id_regex_safety(id_regex)
+        if unsafe is not None:
+            regex_error = unsafe
         try:
-            pattern = re.compile(id_regex)
+            pattern = None if unsafe else re.compile(id_regex)
         except re.error as exc:
             regex_error = f"id regex is invalid: {exc}"
         else:
-            if pattern.groups < 1:
+            if pattern is not None and pattern.groups < 1:
                 regex_error = "id regex must contain a capture group for the telegram id"
                 pattern = None
     existing_tg_set = set(existing_tg_ids)
@@ -171,7 +226,7 @@ def plan_import(
         if csv is not None and csv.tg_id is not None:
             tg_id = csv.tg_id
         else:
-            m = pattern.search(prof.name) if pattern is not None else None
+            m = pattern.search(prof.name[:MAX_MATCH_INPUT]) if pattern is not None else None
             g = m.group(1) if m else None
             if g is not None and g.isascii() and g.isdigit():
                 tg_id = int(g)

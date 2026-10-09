@@ -21,11 +21,13 @@ import asyncio
 import contextlib
 import json
 import logging
+import posixpath
 import re
 import sqlite3
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 
 from tgpanel.apply import backup as backup_mod
@@ -33,11 +35,13 @@ from tgpanel.apply.backup import BackupError, BackupInfo
 from tgpanel.apply.config import ApplyConfig
 from tgpanel.apply.errors import (
     ApplyError,
+    DbWriteTimeout,
     ExternalChangeDetected,
     OperationRejected,
     SettingsError,
 )
 from tgpanel.apply.settings_spec import (
+    KEY_ADOPTED,
     KEY_ALL_NAMES,
     KEY_MTPROXY_FACTS,
     KEY_OUR_NAMES,
@@ -58,7 +62,13 @@ from tgpanel.domain.invariants import capacity_warnings, validate_desired_state
 from tgpanel.domain.models import DesiredState, PoolRecord, UserStatus
 from tgpanel.render.bundle import RenderedFiles, render_all
 from tgpanel.render.errors import RenderError
-from tgpanel.render.profiles import SENTINEL_NAME, active_users, parse_profiles, profiles_hash
+from tgpanel.render.profiles import (
+    SENTINEL_NAME,
+    active_users,
+    foreign_loopback_ips,
+    parse_profiles,
+    profiles_hash,
+)
 from tgpanel.system.ops import FileStat, SystemOps, SystemOpsError
 from tgpanel.system.validation import scrub
 
@@ -66,6 +76,10 @@ log = logging.getLogger(__name__)
 
 _USER_PROFILE_RE = re.compile(r"u[1-9][0-9]*")
 _POOL_ENV_RE = re.compile(r"^([0-9]+)\.env$")
+_TEMP_NAME_RE = re.compile(r"^\.tgpanel-.*(\.tmp)?$")
+LEGACY_OFF_DROPIN = "[Unit]\nConditionPathExists=/nonexistent-tgpanel-disabled\n"
+
+BATCH_FAILED_NOTE = "Групповое применение не удалось, повтор по отдельности тоже: "
 
 STAGE_RU = {
     "lock": "блокировка применения",
@@ -108,6 +122,16 @@ class OperationOutcome[T]:
     warnings: tuple[str, ...] = ()
 
 
+@dataclass(slots=True)
+class RecoveryReport:
+    """What ``startup_recovery`` did."""
+
+    cleaned_temp_files: int = 0
+    run_ids: list[int] = field(default_factory=list)
+    restored_files: list[str] = field(default_factory=list)
+    messages: list[str] = field(default_factory=list)
+
+
 @dataclass(frozen=True, slots=True)
 class DriftReport:
     description: str
@@ -141,6 +165,8 @@ class _Submission:
     expect_hash: str | None
     full_nft_reload: bool
     future: asyncio.Future[OperationOutcome[Any]]
+    bypass_adoption: bool = False  # restore: the DB is about to be replaced on purpose
+    prune_orphans: bool = False  # restore / explicit prune: stop pools unknown to the DB
 
 
 @dataclass(frozen=True, slots=True)
@@ -166,6 +192,7 @@ class _Journal:
     stopped: list[int] = field(default_factory=list)
     nft_added: list[tuple[str, list[str]]] = field(default_factory=list)
     nft_deleted: list[tuple[str, list[str]]] = field(default_factory=list)
+    nft_loaded: bool = False  # the whole table was (re)loaded from the file
     relay_touched: bool = False
 
 
@@ -184,6 +211,7 @@ class _Plan:
     nft_changes: list[tuple[str, list[str], list[str]]]  # (set, to_add, to_delete)
     relay_restart: bool
     warnings: list[str]
+    nft_table_existed: bool = True
 
     @property
     def noop(self) -> bool:
@@ -200,23 +228,35 @@ class _Plan:
 class _OperationTxn:
     """The operation transaction.
 
-    File databases get a dedicated second connection: other writers (collector) are not dragged
-    into the transaction, and readers on the main connection never see uncommitted rows. An
-    in-memory database cannot be opened twice, so the shared connection is used there.
+    File databases get a dedicated second connection (synchronous=FULL): other writers are
+    kept out by the pipeline's write lock, and readers on the main connection never see
+    uncommitted rows. An in-memory database cannot be opened twice, so the shared connection
+    is used there.
     """
 
     def __init__(self, db: Database) -> None:
         self._db = db
         self._conn: sqlite3.Connection | None = None
+        self._path: str | None = None
+        self._path_known = False
+
+    @property
+    def path(self) -> str | None:
+        """Path of the database file (None for an in-memory database)."""
+        if not self._path_known:
+            self._path = backup_mod.db_file_of(self._db)
+            self._path_known = True
+        return self._path
 
     @property
     def conn(self) -> sqlite3.Connection:
         if self._conn is None:
-            files = self._db.call(
-                lambda c: [str(r[2]) for r in c.execute("PRAGMA database_list") if r[1] == "main"]
-            )
-            path = files[0] if files else ""
-            self._conn = connect(path) if path else self._db.conn
+            path = self.path
+            if path:
+                self._conn = connect(path)
+                self._conn.execute("PRAGMA synchronous = FULL")  # durable commit of operations
+            else:
+                self._conn = self._db.conn
         return self._conn
 
     @property
@@ -270,8 +310,8 @@ class ApplyPipeline:
         self._txn = _OperationTxn(db)
         self._pending: list[_Submission] = []
         self._driver: asyncio.Task[None] | None = None
-        self._txn_idle = asyncio.Event()
-        self._txn_idle.set()
+        self._db_lock = asyncio.Lock()  # held from BEGIN to COMMIT/ROLLBACK and by db_write
+        self._txn_active = False
         self._applying = False
         self.current_reason: str | None = None
 
@@ -297,6 +337,8 @@ class ApplyPipeline:
         force_external: bool = False,
         expect_profiles_hash: str | None = None,
         full_nft_reload: bool = False,
+        bypass_adoption: bool = False,
+        prune_orphans: bool = False,
     ) -> OperationOutcome[T]:
         """Perform ``mutation`` inside the operation transaction and apply the result.
 
@@ -313,6 +355,8 @@ class ApplyPipeline:
                 expect_profiles_hash,
                 full_nft_reload,
                 future,
+                bypass_adoption,
+                prune_orphans,
             )
         )
         if self._driver is None or self._driver.done():
@@ -337,33 +381,92 @@ class ApplyPipeline:
             full_nft_reload=full_nft_reload,
         )
 
-    async def db_write[R](self, fn: Callable[..., R], /, *args: Any, **kwargs: Any) -> R:
-        """Run a DB write for non-operation writers (collector, DB-only edits).
+    async def db_write[R](
+        self, fn: Callable[..., R], /, *args: Any, wait_s: float | None = None, **kwargs: Any
+    ) -> R:
+        """THE way to write to the database outside operations (collector, bot, web).
 
-        Waits until no operation transaction is open, so the write is never blocked by (or
-        swallowed into) an in-flight apply.
+        Takes the same asyncio lock that an operation holds from BEGIN to COMMIT/ROLLBACK, so
+        a writer never meets "database is locked", never waits for SQLite's busy timeout and is
+        never swallowed into an operation transaction. Waits at most ``wait_s`` seconds
+        (default ``ApplyTiming.db_write_timeout_s``), then raises ``DbWriteTimeout`` with a
+        clear Russian message. Reads may use ``db.run`` directly.
         """
-        await self._txn_idle.wait()
-        return await self.db.run(fn, *args, **kwargs)
+        limit = self.config.timing.db_write_timeout_s if wait_s is None else wait_s
+        try:
+            await asyncio.wait_for(self._db_lock.acquire(), limit)
+        except TimeoutError:
+            raise DbWriteTimeout(
+                "База данных занята применением изменений; повторите через минуту"
+            ) from None
+        try:
+            return await self.db.run(fn, *args, **kwargs)
+        finally:
+            self._db_lock.release()
+
+    async def _txn_begin(self) -> None:
+        await self._db_lock.acquire()
+        try:
+            await self._txn.begin()
+        except BaseException:
+            self._db_lock.release()
+            raise
+        self._txn_active = True
+
+    async def _txn_commit(self) -> None:
+        """COMMIT and release the write lock. On a COMMIT error the transaction stays open."""
+        try:
+            await self._txn.commit()
+        except sqlite3.Error as exc:
+            raise ApplyError("commit", type(exc).__name__) from None
+        self._txn_active = False
+        self._db_lock.release()
+
+    async def _txn_abort(self) -> None:
+        """ROLLBACK (if open) and release the write lock; safe to call repeatedly."""
+        if not self._txn_active:
+            return
+        try:
+            await self._txn.rollback()
+        finally:
+            self._txn_active = False
+            self._db_lock.release()
 
     async def detect_drift(self) -> DriftReport | None:
         """Compare profiles.json with the hash we last wrote (read-only; used by doctor)."""
         report, _ = await self._drift()
         return report
 
-    async def create_backup(self, reason: str = "manual", actor: str = "system") -> BackupInfo:
-        """Manual backup (CLI/panel), serialised with applies via the global lock."""
+    async def create_backup(
+        self, reason: str = "manual", actor: str = "system", *, full: bool = True
+    ) -> BackupInfo:
+        """Manual / scheduled backup (FULL snapshot incl. statistics), serialised by the lock.
+
+        Pre-apply backups taken by the pipeline itself are slim (no traffic/history tables).
+        """
         try:
             lock = await self.ops.acquire_lock(
                 self.config.paths.lock, self.config.timing.lock_timeout_s
             )
         except SystemOpsError as exc:
             raise BackupError(f"не удалось получить блокировку: {_clean(str(exc))}") from None
+        tmp = backup_mod.make_temp_dir()
         try:
             now = self._clock()
-            snapshot = await asyncio.to_thread(backup_mod.db_snapshot_bytes, self.db)
+            snap = tmp / "snapshot.db"
+            try:
+                await asyncio.to_thread(
+                    backup_mod.snapshot_database, self.db, self._txn.path, snap, slim=not full
+                )
+            except (OSError, sqlite3.Error) as exc:
+                raise BackupError(f"не удалось снять снимок БД: {type(exc).__name__}") from None
             info = await backup_mod.create_backup(
-                self.ops, self.config.paths, reason=reason, now=now, db_snapshot=snapshot
+                self.ops,
+                self.config.paths,
+                reason=reason,
+                now=now,
+                db_file=str(snap),
+                slim=not full,
             )
 
             def record(conn: sqlite3.Connection) -> None:
@@ -375,6 +478,7 @@ class ApplyPipeline:
             await self._prune()
             return info
         finally:
+            backup_mod.remove_temp_dir(tmp)
             with contextlib.suppress(Exception):
                 await lock.release()
 
@@ -383,45 +487,88 @@ class ApplyPipeline:
         found = await backup_mod.scan_disk_backups(self.ops, self.config.paths)
         return await self.db_write(backup_mod.add_missing_backups, found)
 
-    async def restore_backup(self, path: str, actor: str = "system") -> OperationOutcome[None]:
+    async def _resolve_backup(self, source: int | str, allow_external_path: bool) -> str | None:
+        """Path of a restorable archive: only registered copies inside the backups directory
+        (by id or by path), unless the caller explicitly allows an external file (CLI)."""
+        records = await self.db.run(repo.list_backups)
+        base = self.config.paths.backups_dir.rstrip("/") + "/"
+        if isinstance(source, int):
+            for rec in records:
+                if rec.id == source and rec.path.startswith(base):
+                    return rec.path
+            return None
+        normal = posixpath.normpath(source)
+        if any(r.path == normal for r in records) and normal.startswith(base):
+            return normal
+        return normal if allow_external_path else None
+
+    async def restore_backup(
+        self, source: int | str, actor: str = "system", *, allow_external_path: bool = False
+    ) -> OperationOutcome[None]:
         """Restore the DB snapshot of an archive and reconcile the system through the pipeline.
 
-        Proxy files are derived from the DB, so restoring the snapshot and re-rendering gives
-        the archived state. A fresh pre-restore backup is taken by the pipeline itself; on
-        failure everything (files, services, DB) returns to the pre-restore state.
+        ``source`` is a registered backup id or path; an arbitrary file path is accepted only
+        with ``allow_external_path=True`` (explicit CLI use). Proxy files are derived from the
+        DB, so restoring the snapshot and re-rendering gives the archived state. A slim
+        snapshot (pre-apply backup) keeps the current statistics. A fresh pre-restore backup is
+        taken by the pipeline itself; on failure everything returns to the pre-restore state.
         """
+        path = await self._resolve_backup(source, allow_external_path)
+        if path is None:
+            return OperationOutcome(
+                ok=False,
+                status="rejected",
+                error="Восстановить можно только зарегистрированную копию из каталога бэкапов",
+            )
         try:
             archive = await backup_mod.read_archive(self.ops, path)
         except BackupError as exc:
             return OperationOutcome(ok=False, status="rejected", error=str(exc))
-        if archive.db_snapshot is None:
+        if not archive.has_db:
             return OperationOutcome(
                 ok=False,
                 status="rejected",
                 error="В архиве нет снимка базы данных: восстановление невозможно",
             )
-        snapshot = archive.db_snapshot
-        current_hash = await self._current_profiles_hash()
-        current_names = await self._current_profile_names()
+        tmp = backup_mod.make_temp_dir()
+        try:
+            snapshot = tmp / "restore.db"
+            try:
+                found = await self.ops.extract_tar_member(path, backup_mod.DB_MEMBER, str(snapshot))
+            except SystemOpsError as exc:
+                return OperationOutcome(
+                    ok=False, status="rejected", error=f"Не удалось прочитать архив: {exc}"
+                )
+            if not found:
+                return OperationOutcome(
+                    ok=False, status="rejected", error="В архиве нет снимка базы данных"
+                )
+            current_hash = await self._current_profiles_hash()
+            current_names = await self._current_profile_names()
+            slim = archive.slim
 
-        def mutation(conn: sqlite3.Connection) -> None:
-            backup_mod.restore_db_snapshot(conn, snapshot)
-            # the file on disk is what we wrote: its managed names stay "ours" after the restore
-            repo.set_setting(conn, KEY_ALL_NAMES, json.dumps(current_names[0]))
-            repo.set_setting(conn, KEY_OUR_NAMES, json.dumps(current_names[1]))
-            if current_hash is None:
-                repo.delete_setting(conn, KEY_PROFILES_HASH)
-            else:
-                repo.set_setting(conn, KEY_PROFILES_HASH, current_hash)
-            repo.add_audit(conn, self._clock(), actor, "backup.restore", "", "restore")
+            def mutation(conn: sqlite3.Connection) -> None:
+                backup_mod.restore_db_snapshot(conn, str(snapshot), slim=slim)
+                # the file on disk is what we wrote: its managed names stay "ours" after this
+                repo.set_setting(conn, KEY_ALL_NAMES, json.dumps(current_names[0]))
+                repo.set_setting(conn, KEY_OUR_NAMES, json.dumps(current_names[1]))
+                if current_hash is None:
+                    repo.delete_setting(conn, KEY_PROFILES_HASH)
+                else:
+                    repo.set_setting(conn, KEY_PROFILES_HASH, current_hash)
+                repo.add_audit(conn, self._clock(), actor, "backup.restore", "", "restore")
 
-        return await self.run_operation(
-            mutation,
-            reason="restore",
-            actor=actor,
-            force_external=True,
-            expect_profiles_hash=current_hash,
-        )
+            return await self.run_operation(
+                mutation,
+                reason="restore",
+                actor=actor,
+                force_external=True,
+                expect_profiles_hash=current_hash,
+                bypass_adoption=True,
+                prune_orphans=True,
+            )
+        finally:
+            backup_mod.remove_temp_dir(tmp)
 
     async def recover_interrupted(self) -> list[int]:
         """Mark apply runs left 'running' by a crashed process as failed. Returns their ids."""
@@ -439,17 +586,282 @@ class ApplyPipeline:
 
         return await self.db_write(fix)
 
+    # ------------------------------------------------------------ crash recovery (startup)
+
+    async def startup_recovery(self) -> RecoveryReport:
+        """Run once at service start, before accepting operations.
+
+        Under the apply lock: removes our leftover temp files, and for an apply run left
+        'running' by a crash restores the proxy files from that run's pre-apply backup when they
+        differ from it (files only, never the DB: SQLite rolls its own transaction back),
+        reloads systemd, restarts the touched pools/relay, waits for /healthz, then marks the
+        run failed with an explanation and writes an audit event.
+        """
+        report = RecoveryReport()
+        paths = self.config.paths
+        try:
+            lock = await self.ops.acquire_lock(paths.lock, self.config.timing.lock_timeout_s)
+        except SystemOpsError as exc:
+            report.messages.append(f"блокировка недоступна: {_clean(str(exc))}")
+            return report
+        try:
+            report.cleaned_temp_files = await self._cleanup_temp_files()
+            journal = await self._read_journal()
+            running = await self.db.run(
+                lambda c: [
+                    int(r["id"])
+                    for r in c.execute("SELECT id FROM apply_runs WHERE status = 'running'")
+                ]
+            )
+            note = "прервано перезапуском процесса"
+            if journal is not None and (journal.get("run_id") in running):
+                try:
+                    restored, detail = await self._recover_files(str(journal.get("backup", "")))
+                    report.restored_files = restored
+                    note = f"прервано перезапуском процесса; {detail}"
+                    await self._journal_clear()
+                except Exception as exc:
+                    note = "прервано перезапуском процесса; восстановление не удалось: " + _clean(
+                        str(exc)
+                    )
+                    report.messages.append(note)
+            elif journal is not None:
+                await self._journal_clear()  # stale: that run had finished
+            if running:
+                report.run_ids = running
+
+                def mark(conn: sqlite3.Connection) -> None:
+                    with transaction(conn):
+                        for run_id in running:
+                            repo.finish_apply_run(
+                                conn, run_id, self._clock(), "failed", error=_clean(note)
+                            )
+                            repo.add_audit(
+                                conn,
+                                self._clock(),
+                                "system",
+                                "apply.recovered",
+                                f"apply:{run_id}",
+                                _clean(note),
+                            )
+
+                await self.db_write(mark)
+            report.messages.append(note) if running else None
+            return report
+        finally:
+            with contextlib.suppress(Exception):
+                await lock.release()
+
+    async def _cleanup_temp_files(self) -> int:
+        """Remove our own leftovers (``.tgpanel-*`` temp/check files) in the dirs we write to."""
+        paths = self.config.paths
+        removed = 0
+        for directory in (
+            paths.tproxy_dir,
+            paths.tgpanel_dir,
+            paths.pools_dir,
+            paths.systemd_dir,
+            paths.state_dir,
+        ):
+            try:
+                names = await self.ops.list_dir(directory)
+            except SystemOpsError:
+                continue
+            for name in names:
+                if _TEMP_NAME_RE.match(name):
+                    with contextlib.suppress(SystemOpsError):
+                        await self.ops.remove(f"{directory}/{name}")
+                        removed += 1
+        return removed
+
+    async def _read_journal(self) -> dict[str, Any] | None:
+        path = self.config.paths.journal
+        try:
+            if not await self.ops.exists(path):
+                return None
+            raw = json.loads(await self.ops.read_file(path))
+        except (SystemOpsError, ValueError):
+            return None
+        return raw if isinstance(raw, dict) else None
+
+    async def _journal_write(self, run_id: int, backup_path: str) -> None:
+        doc = json.dumps({"run_id": run_id, "backup": backup_path, "phase": "writing"}).encode()
+        try:
+            await self.ops.write_atomic(
+                self.config.paths.journal, doc, mode=0o600, owner="root", group="root"
+            )
+        except SystemOpsError as exc:
+            raise ApplyError(
+                "backup", f"не удалось записать журнал применения: {_clean(str(exc))}"
+            ) from None
+
+    async def _journal_clear(self) -> None:
+        with contextlib.suppress(SystemOpsError):
+            await self.ops.remove(self.config.paths.journal)
+
+    def _managed_member(self, name: str) -> bool:
+        paths = self.config.paths
+        path = "/" + name
+        return path in (paths.profiles, paths.config, paths.pool_unit, paths.nft_file) or bool(
+            re.fullmatch(re.escape(paths.pools_dir) + r"/[0-9]+\.env", path)
+        )
+
+    async def _recover_files(self, backup_path: str) -> tuple[list[str], str]:
+        """Restore managed files that differ from the pre-apply archive. Returns (paths, note)."""
+        cfg, paths, ops = self.config, self.config.paths, self.ops
+        if not backup_path:
+            return [], "журнал без резервной копии"
+        manifest_raw = (await ops.read_tar_members(backup_path, {backup_mod.MANIFEST_NAME})).get(
+            backup_mod.MANIFEST_NAME
+        )
+        if manifest_raw is None:
+            raise BackupError("в копии нет MANIFEST.json")
+        files = json.loads(manifest_raw).get("files", {})
+        wanted = [n for n in files if self._managed_member(n)]
+        members = await ops.read_tar_members(backup_path, set(wanted))
+        restored: list[str] = []
+        unit_changed = relay_changed = False
+        pools_changed: set[int] = set()
+        for name in wanted:
+            path = "/" + name
+            current: bytes | None
+            try:
+                current = await ops.read_file(path) if await ops.exists(path) else None
+            except SystemOpsError:
+                current = None
+            if current == members.get(name):
+                continue
+            meta = files[name]
+            await ops.write_atomic(
+                path,
+                members[name],
+                mode=int(meta["mode"]),
+                owner=str(meta["owner"]),
+                group=str(meta["group"]),
+            )
+            restored.append(path)
+            if path == paths.pool_unit:
+                unit_changed = True
+            elif path in (paths.profiles, paths.config):
+                relay_changed = True
+            elif path.startswith(paths.pools_dir + "/"):
+                pools_changed.add(int(path.rsplit("/", 1)[1].split(".")[0]))
+        # pool env files created by the interrupted run did not exist in the backup: remove them
+        try:
+            on_disk = await ops.list_dir(paths.pools_dir)
+        except SystemOpsError:
+            on_disk = []
+        archived_envs = {n for n in files if n.startswith(paths.pools_dir.lstrip("/") + "/")}
+        for fname in on_disk:
+            m = _POOL_ENV_RE.match(fname)
+            if m is None or f"{paths.pools_dir.lstrip('/')}/{fname}" in archived_envs:
+                continue
+            pool_id = int(m.group(1))
+            with contextlib.suppress(SystemOpsError):
+                await ops.systemctl("disable-now", cfg.pool_unit_name(pool_id))
+            await ops.remove(f"{paths.pools_dir}/{fname}")
+            restored.append(f"{paths.pools_dir}/{fname}")
+        if not restored:
+            return [], "файлы совпадают с копией, восстановление не потребовалось"
+        if unit_changed:
+            await ops.systemctl("daemon-reload", "")
+        for pool_id in sorted(pools_changed):
+            unit = cfg.pool_unit_name(pool_id)
+            await ops.systemctl("restart" if await ops.is_active(unit) else "enable-now", unit)
+        if relay_changed or pools_changed:
+            await ops.systemctl("restart", cfg.relay_unit)
+            if not await self._healthz():
+                raise ApplyError("health", "relay не ответил на /healthz после восстановления")
+        return restored, f"восстановлено файлов из копии: {len(restored)}"
+
+    # ------------------------------------------------------------ adoption / orphans
+
+    async def adopt(self, actor: str = "system") -> str:
+        """``tgpanel apply --adopt``: record the current profiles.json as the baseline.
+
+        Nothing is rendered or restarted. Entries named ``u<id>`` that the DB does not know
+        become unmanaged pass-through entries and every orphan pool is left alone.
+        """
+        lock = await self.ops.acquire_lock(
+            self.config.paths.lock, self.config.timing.lock_timeout_s
+        )
+        try:
+            names = await self._current_profile_names()
+            digest = await self._current_profiles_hash()
+
+            def write(conn: sqlite3.Connection) -> None:
+                with transaction(conn):
+                    if digest is not None:
+                        repo.set_setting(conn, KEY_PROFILES_HASH, digest)
+                    repo.set_setting(conn, KEY_ALL_NAMES, json.dumps(names[0]))
+                    repo.set_setting(conn, KEY_OUR_NAMES, json.dumps([]))
+                    repo.set_setting(conn, KEY_ADOPTED, "1")
+                    repo.add_audit(conn, self._clock(), actor, "apply.adopt", "", "")
+
+            await self.db_write(write)
+            return "Текущее состояние profiles.json принято как базовое; пулы не тронуты"
+        finally:
+            with contextlib.suppress(Exception):
+                await lock.release()
+
+    async def prune_orphans(self, actor: str = "system") -> OperationOutcome[None]:
+        """Explicit cleanup of pools whose id is unknown to the DB (stop + remove env)."""
+        return await self.run_operation(
+            lambda conn: None, reason="prune-orphans", actor=actor, prune_orphans=True
+        )
+
+    async def _adoption_gap(self) -> str | None:
+        """Russian refusal text when the DB is empty/new over a live install, else None."""
+        paths, ops = self.config.paths, self.ops
+        try:
+            names = await ops.list_dir(paths.pools_dir)
+        except SystemOpsError:
+            names = []
+        env_ids = [n for n in names if _POOL_ENV_RE.match(n)]
+        try:
+            entries = parse_profiles(await ops.read_file(paths.profiles))
+        except (SystemOpsError, RenderError):
+            entries = []
+        artefacts = [
+            e
+            for e in entries
+            if _USER_PROFILE_RE.fullmatch(e.name) or e.backend.startswith("127.64.")
+        ]
+        if not env_ids and not artefacts:
+            return None
+
+        def facts(conn: sqlite3.Connection) -> tuple[str | None, int, int]:
+            if repo.get_setting(conn, KEY_ADOPTED):
+                return "adopted", 1, 1
+            users = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+            pools = conn.execute("SELECT COUNT(*) FROM pools").fetchone()[0]
+            return repo.get_setting(conn, KEY_PROFILES_HASH), int(users), int(pools)
+
+        stored, users, pools = await self.db.run(facts)
+        if stored is None or (users == 0 and pools == 0 and env_ids):
+            return (
+                f"На сервере уже есть пулы панели ({len(env_ids)}) и профили панели "
+                f"({len(artefacts)}), а база данных о них не знает (пустая или новая). "
+                "Применение остановлено, чтобы не остановить работающие пулы. "
+                "Восстановите базу из резервной копии (tgpanel restore <файл>) или "
+                "выполните tgpanel apply --adopt."
+            )
+        return None
+
     async def set_legacy_mtproxy(
         self, enabled: bool, actor: str = "system", *, force: bool = False
     ) -> str:
         """``tgpanel legacy-mtproxy on|off``: unmask+start / mask-now the legacy unit.
 
-        Returns a short status text. Raises OperationRejected when refused.
+        If ``mask`` is refused (the unit is a regular file in /etc/systemd/system) the fallback
+        is stop + disable + a drop-in with an always-false ``ConditionPathExists``; ``on``
+        removes that drop-in again. Raises OperationRejected when refused.
         """
         cfg = self.config
         unit = cfg.paths.legacy_unit
+        ops = self.ops
         try:
-            lock = await self.ops.acquire_lock(cfg.paths.lock, cfg.timing.lock_timeout_s)
+            lock = await ops.acquire_lock(cfg.paths.lock, cfg.timing.lock_timeout_s)
         except SystemOpsError as exc:
             raise OperationRejected(f"Не удалось получить блокировку: {_clean(str(exc))}") from None
         try:
@@ -464,15 +876,32 @@ class ApplyPipeline:
                         )
                 # Remember the facts before the unit disappears (a masked unit is empty).
                 with contextlib.suppress(RenderError, SystemOpsError):
-                    facts = await read_live_facts(self.ops, cfg.paths)
-                    encoded = facts_to_json(facts)
-                    await self.db_write(self._save_facts, encoded)
-                await self.ops.systemctl("mask-now", unit)
-                text = "Старый процесс MTProxy остановлен и замаскирован"
+                    facts = await read_live_facts(ops, cfg.paths)
+                    await self.db_write(self._save_facts, facts_to_json(facts))
+                try:
+                    await ops.systemctl("mask-now", unit)
+                    text = "Старый процесс MTProxy остановлен и замаскирован"
+                except SystemOpsError:
+                    await ops.systemctl("stop", unit)
+                    await ops.systemctl("disable", unit)
+                    await ops.ensure_dir(cfg.paths.legacy_dropin_dir, 0o755, "root", "root")
+                    await ops.write_atomic(
+                        cfg.paths.legacy_off_dropin,
+                        LEGACY_OFF_DROPIN.encode(),
+                        mode=0o644,
+                        owner="root",
+                        group="root",
+                    )
+                    await ops.systemctl("daemon-reload", "")
+                    text = "Старый процесс MTProxy остановлен и отключён (drop-in tgpanel-off.conf)"
                 action = "legacy.off"
             else:
-                await self.ops.systemctl("unmask", unit)
-                await self.ops.systemctl("start", unit)
+                if await ops.exists(cfg.paths.legacy_off_dropin):
+                    await ops.remove(cfg.paths.legacy_off_dropin)
+                    await ops.systemctl("daemon-reload", "")
+                with contextlib.suppress(SystemOpsError):
+                    await ops.systemctl("unmask", unit)
+                await ops.systemctl("start", unit)
                 text = "Старый процесс MTProxy включён"
                 action = "legacy.on"
             await self.db_write(self._audit_simple, actor, action)
@@ -559,7 +988,13 @@ class ApplyPipeline:
                 self._resolve(sub, OperationOutcome(ok=False, status="failed", error=text))
             return
         try:
-            await self._locked_batch(subs)
+            retry = await self._locked_batch(subs)
+            # Poison-operation guard: a failed batch is retried once, one operation per apply,
+            # so a single bad request cannot fail unrelated ones.
+            for sub in retry:
+                if not sub.future.done():
+                    self.current_reason = sub.reason[:200]
+                    await self._locked_batch([sub], retry_note=BATCH_FAILED_NOTE)
         finally:
             with contextlib.suppress(Exception):
                 await lock.release()
@@ -619,15 +1054,20 @@ class ApplyPipeline:
 
     # ------------------------------------------------------------------ the batch
 
-    async def _locked_batch(self, subs: list[_Submission]) -> None:
+    async def _locked_batch(
+        self, subs: list[_Submission], *, retry_note: str | None = None
+    ) -> list[_Submission]:
+        """Process one batch under the flock. Returns submissions to retry individually."""
         started = self._clock()
-        reason = self.current_reason or "apply"
+        reason = "; ".join(dict.fromkeys(s.reason for s in subs))[:200] or "apply"
         run_id: int = await self.db.run(repo.start_apply_run, started, reason)
         journal = _Journal()
         plan: _Plan | None = None
         backup: BackupInfo | None = None
         outcomes: dict[int, OperationOutcome[Any]] = {}  # index in subs -> outcome
-        txn_open = False
+        values: dict[int, Any] = {}
+        survivors: list[int] = []
+        snap_dir: Path | None = None
 
         async def finish(
             status: str,
@@ -639,12 +1079,16 @@ class ApplyPipeline:
             await self._finalize(run_id, started, status, error, backup, keep_row, audit, subs)
 
         try:
-            # ---- drift / expectations -------------------------------------------------
+            # ---- adoption / drift / expectations --------------------------------------
+            gap = await self._adoption_gap() if any(not s.bypass_adoption for s in subs) else None
             report, current_hash = await self._drift()
             runnable: list[int] = []
             for i, sub in enumerate(subs):
-                if report is not None and not sub.force_external:
-                    exc = report.exception()
+                if gap is not None and not sub.bypass_adoption:
+                    outcomes[i] = OperationOutcome(
+                        ok=False, status="needs_adoption", error=gap, apply_run_id=run_id
+                    )
+                elif report is not None and not sub.force_external:
                     outcomes[i] = OperationOutcome(
                         ok=False,
                         status="external_change",
@@ -653,7 +1097,7 @@ class ApplyPipeline:
                             f"{report.description}. Операция не выполнена."
                         ),
                         apply_run_id=run_id,
-                        external=exc,
+                        external=report.exception(),
                     )
                 elif sub.expect_hash is not None and sub.expect_hash != current_hash:
                     outcomes[i] = OperationOutcome(
@@ -663,6 +1107,10 @@ class ApplyPipeline:
                     )
                 else:
                     runnable.append(i)
+            if gap is not None and not runnable:
+                await finish("failed", _clean(gap), audit=("apply.needs_adoption", _clean(gap)))
+                self._publish(subs, outcomes)
+                return []
             if report is not None and not runnable:
                 await finish(
                     "failed",
@@ -670,19 +1118,25 @@ class ApplyPipeline:
                     audit=("apply.external_change", _clean(report.description)),
                 )
                 self._publish(subs, outcomes)
-                return
+                return []
             if not runnable:
                 await finish("rejected", None, keep_row=False)
                 self._publish(subs, outcomes)
-                return
+                return []
 
-            # ---- transaction + mutations --------------------------------------------
-            await self._txn.begin()
-            txn_open = True
-            self._txn_idle.clear()
+            # ---- DB snapshot BEFORE the write transaction (separate read connection) ---
+            snap_dir = backup_mod.make_temp_dir()
+            snap_file = snap_dir / "snapshot.db"
+            try:
+                await asyncio.to_thread(
+                    backup_mod.snapshot_database, self.db, self._txn.path, snap_file, slim=True
+                )
+            except (OSError, sqlite3.Error) as exc:
+                raise ApplyError("backup", f"снимок БД: {type(exc).__name__}") from None
+
+            # ---- transaction + mutations ------------------------------------------------
+            await self._txn_begin()
             conn = self._txn.conn
-            values: dict[int, Any] = {}
-            survivors: list[int] = []
             for i in runnable:
                 try:
                     values[i] = self._run_mutation(conn, subs[i], i)
@@ -705,66 +1159,82 @@ class ApplyPipeline:
                         error=f"Внутренняя ошибка операции ({type(exc).__name__})",
                     )
             if not survivors:
-                await self._txn.rollback()
-                txn_open = False
-                self._txn_idle.set()
+                await self._txn_abort()
                 await finish("rejected", None, keep_row=False)
                 self._publish(subs, outcomes)
-                return
+                return []
 
             # ---- plan, backup, validate, execute --------------------------------------
             force_nft = any(subs[i].full_nft_reload for i in survivors)
-            plan = await self._build_plan(conn, force_nft)
+            prune = any(subs[i].prune_orphans for i in survivors)
+            plan = await self._build_plan(conn, force_nft, prune)
             if plan.noop:
                 self._store_hash(conn, plan)
-                await self._txn.commit()
-                txn_open = False
-                self._txn_idle.set()
-                await self._cleanup_stale(plan)
+                await self._txn_commit()
+                notes: list[str] = []
+                await self._cleanup_stale(plan, notes)
                 await finish("noop", None, keep_row=False)
                 for i in survivors:
                     outcomes[i] = OperationOutcome(
                         ok=True,
                         status="noop",
                         value=values[i],
-                        warnings=tuple(plan.warnings),
+                        warnings=tuple([*plan.warnings, *notes]),
                     )
                 self._publish(subs, outcomes)
-                return
+                return []
 
-            backup = await self._backup(plan, reason)
+            backup = await self._backup(plan, reason, snap_file)
+            await self._journal_write(run_id, backup.path)
             await self._validate(plan)
             await self._execute(plan, journal)
             self._store_hash(conn, plan)
-            try:
-                await self._txn.commit()
-            except sqlite3.Error as exc:
-                raise ApplyError("commit", f"{type(exc).__name__}") from None
-            txn_open = False
-            self._txn_idle.set()
+            await self._txn_commit()
         except BaseException as exc:
-            await self._fail(
-                exc, subs, outcomes, run_id, plan, journal, txn_open, finish, backup is not None
+            retry = await self._fail(
+                exc, subs, outcomes, run_id, plan, journal, finish, survivors, retry_note
             )
             if not isinstance(exc, Exception):
                 raise
-            return
+            return retry
+        finally:
+            await self._txn_abort()
+            backup_mod.remove_temp_dir(snap_dir)
 
-        # ---- success ------------------------------------------------------------------
+        # ---- success: everything below happens AFTER the commit and must never turn the
+        # ---- operation into a failure (it is durable); problems become warnings. --------
         if plan is None:  # pragma: no cover - unreachable, keeps mypy honest
             raise RuntimeError("plan missing after a successful apply")
-        await self._cleanup_stale(plan)
+        warnings = list(plan.warnings)
+        if retry_note is not None:
+            warnings.append("Групповое применение не удалось; операция выполнена отдельно")
+        await self._after_commit(plan, finish, warnings)
         for i in survivors:
             outcomes[i] = OperationOutcome(
                 ok=True,
                 status="applied",
                 value=values[i],
                 apply_run_id=run_id,
-                warnings=tuple(plan.warnings),
+                warnings=tuple(warnings),
             )
-        await finish("success", None)
-        await self._prune()
         self._publish(subs, outcomes)
+        return []
+
+    async def _after_commit(
+        self, plan: _Plan, finish: Callable[..., Awaitable[None]], warnings: list[str]
+    ) -> None:
+        steps: list[tuple[str, Callable[[], Awaitable[None]]]] = [
+            ("очистка устаревших файлов", lambda: self._cleanup_stale(plan, warnings)),
+            ("запись результата применения", lambda: finish("success", None)),
+            ("удаление журнала применения", self._journal_clear),
+            ("очистка старых бэкапов", self._prune),
+        ]
+        for label, step in steps:
+            try:
+                await step()
+            except Exception as exc:
+                log.warning("post-commit step failed: %s (%s)", label, type(exc).__name__)
+                warnings.append(f"После применения не удалось: {label}")
 
     def _publish(self, subs: list[_Submission], outcomes: dict[int, OperationOutcome[Any]]) -> None:
         for i, sub in enumerate(subs):
@@ -806,10 +1276,10 @@ class ApplyPipeline:
         run_id: int,
         plan: _Plan | None,
         journal: _Journal,
-        txn_open: bool,
         finish: Callable[..., Awaitable[None]],
-        had_backup: bool,
-    ) -> None:
+        survivors: list[int],
+        retry_note: str | None,
+    ) -> list[_Submission]:
         if isinstance(exc, ApplyError):
             stage, detail = exc.stage, _clean(exc.detail)
         elif isinstance(exc, SystemOpsError):
@@ -819,28 +1289,36 @@ class ApplyPipeline:
         elif isinstance(exc, asyncio.CancelledError):
             stage, detail = "internal", "применение прервано"
         else:
-            log.warning("apply failed: %s", type(exc).__name__)
+            log.warning("apply failed: %s", type(exc).__name__, exc_info=True)
             stage, detail = "internal", type(exc).__name__
         rollback_errors = await asyncio.shield(self._rollback(plan, journal))
-        if txn_open:
-            await self._txn.rollback()
-        self._txn_idle.set()
+        await self._txn_abort()
         text = (
             f"Не удалось применить изменения ({STAGE_RU.get(stage, stage)}): {detail}. "
             "Операция не выполнена, изменения отменены."
         )
+        if retry_note:
+            text = retry_note + text
         if rollback_errors:
             text += " ВНИМАНИЕ: откат выполнен не полностью, проверьте состояние сервисов."
         tech = f"[{stage}] {detail}"
         if rollback_errors:
             tech += " | rollback: " + "; ".join(rollback_errors)
-        await finish(
-            "failed",
-            _clean(tech),
-            audit=("apply.failed", _clean(tech)),
+        await finish("failed", _clean(tech), audit=("apply.failed", _clean(tech)))
+        if not rollback_errors:
+            await self._journal_clear()  # a dirty rollback keeps it for startup_recovery
+        retryable = (
+            isinstance(exc, Exception)
+            and retry_note is None
+            and len(survivors) > 1
+            and not rollback_errors
         )
+        retry: list[_Submission] = []
         for i in range(len(subs)):
             if i in outcomes:  # rejected / external_change / own failure: keep as is
+                continue
+            if retryable and i in survivors:
+                retry.append(subs[i])
                 continue
             outcomes[i] = OperationOutcome(
                 ok=False,
@@ -850,8 +1328,10 @@ class ApplyPipeline:
                 rolled_back=True,
                 rollback_errors=tuple(rollback_errors),
             )
-        self._publish(subs, outcomes)
-        if self.on_failure is not None:
+        for i, sub in enumerate(subs):
+            if i in outcomes:
+                self._resolve(sub, outcomes[i])
+        if self.on_failure is not None and not retryable:
             with contextlib.suppress(Exception):
                 await self.on_failure(
                     ApplyFailure(
@@ -863,7 +1343,7 @@ class ApplyPipeline:
                         tuple(rollback_errors),
                     )
                 )
-        _ = had_backup
+        return retry
 
     async def _finalize(
         self,
@@ -933,7 +1413,9 @@ class ApplyPipeline:
             raise ApplyError("render", f"не удалось прочитать файл: {_clean(str(exc))}") from None
         return _Snap(data, stat)
 
-    async def _build_plan(self, conn: sqlite3.Connection, force_nft: bool) -> _Plan:
+    async def _build_plan(
+        self, conn: sqlite3.Connection, force_nft: bool, prune_orphans: bool = False
+    ) -> _Plan:
         cfg, paths, ops = self.config, self.config.paths, self.ops
         now = self._clock()
         try:
@@ -990,12 +1472,15 @@ class ApplyPipeline:
                     to_start.append((pools_by_id[pool_id], active))
             to_stop: list[int] = []
             stale: list[str] = []
+            # Only pools that EXIST in the DB and are empty are stopped here.
             for pool_id in rendered.pools_to_stop:
-                if await ops.is_active(cfg.pool_unit_name(pool_id)):
+                unit = cfg.pool_unit_name(pool_id)
+                if await ops.is_active(unit) or await self._unit_enabled(unit):
                     to_stop.append(pool_id)
                 env_path = paths.pool_env(pool_id)
                 if await ops.exists(env_path):
                     stale.append(env_path)
+            # Pools unknown to the DB are never touched, except on explicit prune / restore.
             try:
                 names = await ops.list_dir(paths.pools_dir)
             except SystemOpsError:
@@ -1005,24 +1490,30 @@ class ApplyPipeline:
                 if m is None or int(m.group(1)) in pools_by_id:
                     continue
                 orphan = int(m.group(1))
-                if await ops.is_active(cfg.pool_unit_name(orphan)):
+                if not prune_orphans:
+                    warnings.append(f"Пул {orphan} неизвестен базе данных и оставлен без изменений")
+                    continue
+                unit = cfg.pool_unit_name(orphan)
+                if await ops.is_active(unit) or await self._unit_enabled(unit):
                     to_stop.append(orphan)
                 stale.append(f"{paths.pools_dir}/{name}")
 
-            desired_ips = sorted({u.loopback_ip for u in active_users(state)})
-            nft_full = force_nft
+            keep_ips = {u.loopback_ip for u in active_users(state)}
+            keep_ips |= set(foreign_loopback_ips(state))  # accounting of adopted profiles stays
+            desired_ips = sorted(keep_ips)
             nft_changes: list[tuple[str, list[str], list[str]]] = []
-            if not nft_full:
-                try:
-                    for set_name in ("up", "down"):
-                        current = set(await ops.nft_list_set("tgpanel", set_name))
-                        want = set(desired_ips)
-                        nft_changes.append(
-                            (set_name, sorted(want - current), sorted(current - want))
-                        )
-                except SystemOpsError:
-                    nft_full = True  # table is missing: load the whole file
-                    nft_changes = []
+            table_existed = True
+            try:
+                for set_name in ("up", "down"):
+                    current = set(await ops.nft_list_set("tgpanel", set_name))
+                    want = set(desired_ips)
+                    nft_changes.append((set_name, sorted(want - current), sorted(current - want)))
+            except SystemOpsError:
+                table_existed = False  # the table is missing: the whole file must be loaded
+                nft_changes = []
+            nft_full = force_nft or not table_existed
+            if nft_full:
+                nft_changes = []
             relay_restart = bool({paths.profiles, paths.config} & changed) or not (
                 await ops.is_active(cfg.relay_unit)
             )
@@ -1043,29 +1534,39 @@ class ApplyPipeline:
             nft_changes=nft_changes,
             relay_restart=relay_restart,
             warnings=warnings,
+            nft_table_existed=table_existed,
         )
+
+    async def _unit_enabled(self, unit: str) -> bool:
+        try:
+            return (await self.ops.unit_property(unit, "UnitFileState")) == "enabled"
+        except SystemOpsError:
+            return False
 
     @staticmethod
     def _differs(snap: _Snap, target: _Target) -> bool:
         if snap.data != target.data or snap.stat is None:
             return True
-        return snap.stat.mode != target.mode
+        st = snap.stat
+        return (st.mode, st.owner, st.group) != (target.mode, target.owner, target.group)
 
-    async def _backup(self, plan: _Plan, reason: str) -> BackupInfo:
+    async def _backup(self, plan: _Plan, reason: str, snapshot: Path) -> BackupInfo:
+        """Pre-apply backup: slim DB snapshot (taken before BEGIN), streamed into the archive;
+        file contents come from the pre-images already read under the lock (not re-read)."""
+        known = {
+            path: (snap.data, snap.stat)
+            for path, snap in plan.snaps.items()
+            if snap.data is not None and snap.stat is not None
+        }
         try:
-            # An in-memory DB shares one connection with the open transaction: the sqlite
-            # backup API would wait for it forever, so no DB snapshot is taken in that mode.
-            snapshot = (
-                None
-                if self._txn.shared
-                else await asyncio.to_thread(backup_mod.db_snapshot_bytes, self.db)
-            )
             return await backup_mod.create_backup(
                 self.ops,
                 self.config.paths,
                 reason=reason,
                 now=self._clock(),
-                db_snapshot=snapshot,
+                db_file=str(snapshot),
+                slim=True,
+                known=known,
             )
         except (BackupError, OSError, sqlite3.Error) as exc:
             raise ApplyError("backup", _clean(str(exc) or type(exc).__name__)) from None
@@ -1114,6 +1615,20 @@ class ApplyPipeline:
         except SystemOpsError as exc:
             raise ApplyError("write", _clean(str(exc))) from None
 
+    async def _assert_unchanged(self, plan: _Plan, path: str) -> None:
+        """TOCTOU guard: the file must still equal the pre-image captured under the lock."""
+        snap = plan.snaps[path]
+        try:
+            current = await self.ops.read_file(path) if await self.ops.exists(path) else None
+        except SystemOpsError as exc:
+            raise ApplyError("write", _clean(str(exc))) from None
+        if current != snap.data:
+            raise ApplyError(
+                "write",
+                f"{posixpath.basename(path)} изменён вне панели во время применения; "
+                "повторите операцию",
+            )
+
     async def _systemctl(self, stage: str, action: str, unit: str) -> None:
         try:
             await self.ops.systemctl(action, unit)
@@ -1122,6 +1637,16 @@ class ApplyPipeline:
 
     async def _execute(self, plan: _Plan, journal: _Journal) -> None:
         cfg, paths, ops, timing = self.config, self.config.paths, self.ops, self.config.timing
+
+        # 0. the firewall first: if the table is missing (or a reload is requested) the whole
+        #    file is loaded BEFORE any pool is started, so pool ports are never exposed
+        if plan.nft_full:
+            await self._write(plan, paths.nft_file, journal)
+            journal.nft_loaded = True  # recorded first: a half-done load must be undone too
+            try:
+                await ops.nft_load_file(paths.nft_file)
+            except SystemOpsError as exc:
+                raise ApplyError("nft", _clean(str(exc))) from None
 
         # A. pool unit and env files
         if paths.pool_unit in plan.changed:
@@ -1145,13 +1670,11 @@ class ApplyPipeline:
             if not opened:
                 raise ApplyError("pool", f"порт {pool.port} пула {pool.id} не открылся")
 
-        # C. nft: element differences only; the whole file only if the table is missing
-        if paths.nft_file in plan.changed or plan.nft_full:
+        # C. nft: element differences only (the whole file was handled in step 0)
+        if not plan.nft_full and paths.nft_file in plan.changed:
             await self._write(plan, paths.nft_file, journal)
         try:
-            if plan.nft_full:
-                await ops.nft_load_file(paths.nft_file)
-            else:
+            if not plan.nft_full:
                 for set_name, add, delete in plan.nft_changes:
                     if add:
                         await ops.nft_add_elements("tgpanel", set_name, add)
@@ -1162,10 +1685,13 @@ class ApplyPipeline:
         except SystemOpsError as exc:
             raise ApplyError("nft", _clean(str(exc))) from None
 
-        # D. relay files (after pools), then the relay
+        # D. relay files (after pools), then the relay. Right before each write the file is
+        #    re-read: an external change since the pre-image was taken aborts the apply.
         if paths.config in plan.changed:
+            await self._assert_unchanged(plan, paths.config)
             await self._write(plan, paths.config, journal)
         if paths.profiles in plan.changed:
+            await self._assert_unchanged(plan, paths.profiles)
             await self._write(plan, paths.profiles, journal)
         if plan.relay_restart:
             journal.relay_touched = True
@@ -1208,14 +1734,50 @@ class ApplyPipeline:
                 await self._sleep(t.readyz_interval_s)
         raise ApplyError("health", "relay не готов (/readyz): backend недоступен")
 
-    async def _cleanup_stale(self, plan: _Plan) -> None:
+    async def _cleanup_stale(self, plan: _Plan, warnings: list[str]) -> None:
         for path in plan.stale_envs:
             try:
                 await self.ops.remove(path)
             except SystemOpsError:
                 log.warning("could not remove stale pool env file")
+                warnings.append("Не удалось удалить файл остановленного пула")
 
     # ------------------------------------------------------------------ rollback
+
+    async def _restore_one(
+        self,
+        plan: _Plan,
+        path: str,
+        step: Callable[[str, Awaitable[Any]], Awaitable[Any]],
+        errors: list[str],
+    ) -> None:
+        """Restore a file WE wrote to its pre-image, unless somebody else changed it since."""
+        ops = self.ops
+        snap, target = plan.snaps[path], plan.targets[path]
+        try:
+            current = await ops.read_file(path) if await ops.exists(path) else None
+        except SystemOpsError:
+            current = target.data  # unreadable: attempt the restore
+        if current == snap.data:
+            return  # nothing to undo
+        if current is not None and current != target.data:
+            errors.append(
+                f"{posixpath.basename(path)} изменён вне панели, откат его не перезаписал"
+            )
+            return
+        if snap.data is None or snap.stat is None:
+            await step(f"remove {path}", ops.remove(path))
+        else:
+            await step(
+                f"restore {path}",
+                ops.write_atomic(
+                    path,
+                    snap.data,
+                    mode=snap.stat.mode,
+                    owner=snap.stat.owner,
+                    group=snap.stat.group,
+                ),
+            )
 
     async def _rollback(self, plan: _Plan | None, journal: _Journal) -> list[str]:
         errors: list[str] = []
@@ -1230,22 +1792,15 @@ class ApplyPipeline:
 
         if plan is not None:
             for path in reversed(journal.written):
-                snap = plan.snaps[path]
-                if snap.data is None or snap.stat is None:
-                    await step(f"remove {path}", ops.remove(path))
-                else:
-                    await step(
-                        f"restore {path}",
-                        ops.write_atomic(
-                            path,
-                            snap.data,
-                            mode=snap.stat.mode,
-                            owner=snap.stat.owner,
-                            group=snap.stat.group,
-                        ),
-                    )
+                await self._restore_one(plan, path, step, errors)
             if journal.unit_written:
                 await step("daemon-reload", ops.systemctl("daemon-reload", ""))
+            if journal.nft_loaded:
+                nft_snap = plan.snaps[self.config.paths.nft_file]
+                if plan.nft_table_existed and nft_snap.data is not None:
+                    await step("nft reload", ops.nft_load_file(self.config.paths.nft_file))
+                else:
+                    await step("nft delete table", ops.nft_delete_table("tgpanel"))
         for set_name, ips in reversed(journal.nft_added):
             await step(f"nft delete {set_name}", ops.nft_delete_elements("tgpanel", set_name, ips))
         for set_name, ips in reversed(journal.nft_deleted):

@@ -8,7 +8,7 @@ are plain audited DB writes.
 from __future__ import annotations
 
 import sqlite3
-from collections.abc import Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from typing import Any
 
 from tgpanel.apply.errors import OperationRejected, SettingsError
@@ -21,9 +21,16 @@ from tgpanel.services.api import Actor, OperationResult
 
 
 class SettingsServiceImpl:
-    def __init__(self, pipeline: ApplyPipeline, db: Database) -> None:
+    def __init__(
+        self,
+        pipeline: ApplyPipeline,
+        db: Database,
+        *,
+        on_change: Callable[[], Awaitable[None]] | None = None,
+    ) -> None:
         self._pipeline = pipeline
         self._db = db
+        self._on_change = on_change  # e.g. refresh the cached proxy host name of UserService
 
     @staticmethod
     def specs() -> Mapping[str, SettingSpec]:
@@ -74,7 +81,14 @@ class SettingsServiceImpl:
             for key, value in canonical.items():
                 if current.get(key) != value:
                     repo.set_setting(conn, key, value)
-                    repo.add_audit(conn, now, actor, "settings.set", key, value)
+                    repo.add_audit(
+                        conn,
+                        now,
+                        actor,
+                        "settings.set",
+                        key,
+                        "***" if SPECS[key].sensitive else value,
+                    )
             return []
 
         if affects_proxy:
@@ -83,6 +97,7 @@ class SettingsServiceImpl:
                 return OperationResult(
                     ok=False, error=outcome.error, apply_run_id=outcome.apply_run_id
                 )
+            await self._changed()
             return OperationResult(ok=True, apply_run_id=outcome.apply_run_id)
 
         def plain(conn: sqlite3.Connection) -> None:
@@ -93,4 +108,9 @@ class SettingsServiceImpl:
             await self._pipeline.db_write(plain)
         except OperationRejected as exc:
             return OperationResult(ok=False, error=str(exc))
+        await self._changed()
         return OperationResult(ok=True)
+
+    async def _changed(self) -> None:
+        if self._on_change is not None:
+            await self._on_change()
