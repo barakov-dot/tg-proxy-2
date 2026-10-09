@@ -14,3 +14,7 @@ build/
 .env
 *.env
 .DS_Store
+
+# synthetic test fixtures and goldens are tracked even when named *.env
+!tests/fixtures/**
+!tests/render/golden/*.env

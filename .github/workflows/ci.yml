@@ -37,7 +37,8 @@ jobs:
         with:
           python-version: ${{ matrix.python }}
       - name: install with hashes, binary wheels only (dry run)
-        run: pip install --require-hashes --only-binary=:all: --dry-run -r requirements.lock
+        run: |
+          pip install --require-hashes --only-binary=:all: --dry-run -r requirements.lock
       - name: lock is up to date with pyproject.toml
         run: |
           pip install uv==0.11.16

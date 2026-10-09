@@ -333,14 +333,12 @@ async def test_s7_real_lock_does_not_leak_descriptors_on_cancel_or_timeout(tmp_p
 async def test_s7_real_ensure_dir(tmp_path: Path) -> None:
     ops = RealSystemOps()
     target = tmp_path / "a" / "b"
-    me = os.getlogin() if hasattr(os, "getlogin") else "root"
     import grp
     import pwd
 
     uid = os.geteuid()
     owner = pwd.getpwuid(uid).pw_name
     group = grp.getgrgid(os.getegid()).gr_name
-    _ = me
     await ops.ensure_dir(str(target), 0o700, owner, group)
     assert target.is_dir() and oct(target.stat().st_mode & 0o777) == "0o700"
 
