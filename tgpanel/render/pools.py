@@ -5,7 +5,7 @@ from __future__ import annotations
 import re
 import shlex
 from collections.abc import Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from tgpanel.domain.models import DesiredState, PoolRecord
 from tgpanel.domain.pools import MAX_SECRETS_PER_PROCESS
@@ -30,6 +30,9 @@ class MtproxyFacts:
     working_directory: str | None = None
     # ExecStart references $MTPROXY_NAT_ARGS but no value was found: callers should warn.
     nat_args_unresolved: bool = False
+    # The effective ExecStart is a wrapper; facts come from an earlier direct ExecStart. Callers
+    # should warn: the wrapper may add arguments (e.g. NAT) that we cannot see.
+    exec_overridden: bool = False
 
 
 # ---------------------------------------------------------------- env files
@@ -144,6 +147,7 @@ def _parse_environment_directive(value: str) -> dict[str, str]:
 @dataclass
 class _UnitView:
     exec_start: str | None = None
+    exec_history: list[str] = field(default_factory=list)
     user: str | None = None
     working_directory: str | None = None
 
@@ -163,6 +167,8 @@ def _scan_unit(text: str, view: _UnitView, environment: dict[str, str]) -> None:
         key, value = key.strip(), value.strip()
         if key == "ExecStart":
             view.exec_start = value or None
+            if value:
+                view.exec_history.append(value)
         elif key == "User":
             view.user = value or None
         elif key == "WorkingDirectory":
@@ -207,13 +213,24 @@ def extract_mtproxy_facts(
 
     if not view.exec_start:
         raise RenderError("mtproxy.service: no ExecStart= found")
-    command = view.exec_start.lstrip("-@+!:")
-    try:
-        tokens = shlex.split(command)
-    except ValueError as exc:
-        raise RenderError(f"mtproxy.service: cannot parse ExecStart: {exc}") from exc
-
-    binary = next((t for t in tokens if t.rsplit("/", 1)[-1] == "mtproto-proxy"), None)
+    overridden = False
+    tokens: list[str] = []
+    binary: str | None = None
+    # The effective ExecStart may be a wrapper installed by a previous tool (drop-in override).
+    # Then fall back to the most recent ExecStart in the unit history that runs the binary directly.
+    candidates = [view.exec_start, *reversed(view.exec_history)]
+    for index, candidate in enumerate(candidates):
+        try:
+            parsed = shlex.split(candidate.lstrip("-@+!:"))
+        except ValueError as exc:
+            if index == 0:
+                raise RenderError(f"mtproxy.service: cannot parse ExecStart: {exc}") from exc
+            continue
+        found = next((t for t in parsed if t.rsplit("/", 1)[-1] == "mtproto-proxy"), None)
+        if found is not None:
+            tokens, binary, overridden = parsed, found, index > 0
+            view.exec_start = candidate
+            break
     if binary is None:
         raise RenderError("mtproxy.service: ExecStart does not run mtproto-proxy directly")
 
@@ -248,7 +265,9 @@ def extract_mtproxy_facts(
     nat_args = nat.strip() if nat is not None else " ".join(inline_nat)
     unresolved = nat is None and not inline_nat and "MTPROXY_NAT_ARGS" in view.exec_start
     workdir = view.working_directory
-    return MtproxyFacts(binary, user, aes_pwd, multi, nat_args, workdir, unresolved)
+    return MtproxyFacts(
+        binary, user, aes_pwd, multi, nat_args, workdir, unresolved, exec_overridden=overridden
+    )
 
 
 # ------------------------------------------------------------------- unit

@@ -189,6 +189,11 @@ async def resolve_facts(
         repo.set_setting(conn, KEY_MTPROXY_FACTS, encoded)
     if facts.nat_args_unresolved:
         warnings.append("NAT-аргументы MTProxy не найдены, хотя юнит на них ссылается")
+    if facts.exec_overridden:
+        warnings.append(
+            "mtproxy.service запускается через обёртку другого инструмента; параметры MTProxy "
+            "взяты из его прежней прямой команды (NAT-аргументы обёртки не учитываются)"
+        )
     return facts, warnings
 
 

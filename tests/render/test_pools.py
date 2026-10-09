@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import replace
+from pathlib import Path
 
 import pytest
 
@@ -200,3 +201,21 @@ def test_nat_args_unresolved_flag() -> None:
     assert not resolved.nat_args_unresolved
     no_ref = "[Service]\nExecStart=/x/mtproto-proxy -u m --aes-pwd /a/s /a/proxy-multi.conf\n"
     assert not extract_mtproxy_facts(no_ref, [], "").nat_args_unresolved
+
+
+def test_extract_facts_when_dropin_replaces_execstart_with_wrapper() -> None:
+    base = Path("tests/fixtures/upstream/owner2")
+    unit = (base / "mtproxy.service").read_text()
+    dropin = (base / "mtproxy.service.d" / "tgproxy-panel.conf").read_text()
+    facts = extract_mtproxy_facts(unit, [dropin], "MTPROXY_SECRET=" + "a" * 32 + "\n")
+    assert facts.binary == "/opt/MTProxy/objs/bin/mtproto-proxy"
+    assert facts.user == "mtproxy"
+    assert facts.aes_pwd == "/etc/mtproxy/proxy-secret"
+    assert facts.proxy_multi_conf == "/etc/mtproxy/proxy-multi.conf"
+    assert facts.exec_overridden is True
+
+
+def test_extract_facts_direct_execstart_is_not_flagged_overridden() -> None:
+    base = Path("tests/fixtures/upstream/owner2")
+    facts = extract_mtproxy_facts((base / "mtproxy.service").read_text(), [], "")
+    assert facts.exec_overridden is False
