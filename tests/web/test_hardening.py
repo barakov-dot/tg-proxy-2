@@ -4,12 +4,13 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import logging
 import re
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar
 
 import httpx
 import pytest
@@ -17,7 +18,7 @@ import pytest
 from tests.web.conftest import PASSWORD, ROOT, SECRET_KEY, Web
 from tgpanel.apply.backup import BackupError
 from tgpanel.db import repo
-from tgpanel.services.backups import BackupService
+from tgpanel.services.backups import BackupService, DownloadBusy
 from tgpanel.services.dashboard import DashboardService
 from tgpanel.services.traffic import TrafficService
 from tgpanel.web.app import create_app
@@ -93,15 +94,32 @@ async def test_xff_robust_to_garbage_and_untrusted_peers(w: Web) -> None:
         assert await attempt(c, **{"X-Forwarded-For": "1.1.1.1, ::ffff:9.9.9.9"}) == 401
 
 
-async def test_global_failure_limit_blocks_every_address(w: Web) -> None:
+async def test_global_failures_delay_but_never_lock_out(w: Web) -> None:
     async with client_from(w, "127.0.0.1") as c:
-        for i in range(30):
+        for i in range(40):
             assert await attempt(c, **{"X-Forwarded-For": f"198.51.{i}.1"}) == 401
-        assert await attempt(c, PASSWORD, **{"X-Forwarded-For": "203.0.113.200"}) == 429
+        # the administrator from a new address still gets in, only after an artificial delay
+        assert await attempt(c, PASSWORD, **{"X-Forwarded-For": "203.0.113.200"}) == 303
+    assert w.delays.values and 0 < max(w.delays.values) <= 2.0
+    assert w.delays.values == sorted(w.delays.values)  # grows with the number of failures
     assert "web.login_flood" in audit_actions(w)
 
 
+async def test_valid_session_is_never_throttled(aw: Web) -> None:
+    for _ in range(40):
+        aw.web.global_limiter.record_failure()
+    r = await aw.client.get(aw.u("/users"))
+    assert r.status_code == 200
+    again = await aw.client.post(
+        aw.u("/login"), data={"username": "x", "password": "y", "login_token": "z"}
+    )
+    assert again.status_code == 303 and again.headers["location"] == ROOT + "/"
+    assert aw.delays.values == []
+
+
 async def test_failed_logins_are_audited_in_aggregate(w: Web) -> None:
+    frozen = w.clock.now
+    w.web.clock = lambda: frozen
     async with client_from(w, "203.0.113.77") as c:
         for _ in range(25):
             await attempt(c)
@@ -164,7 +182,6 @@ async def test_numbers_on_every_route_never_500(aw: Web, bad: str) -> None:
         f"/audit?page={bad}",
         f"/users/{bad}",
         f"/users/{bad}/traffic.json",
-        f"/backups/{bad}/download",
         f"/broadcast/{bad}",
     ]
     for url in get_urls:
@@ -183,6 +200,7 @@ async def test_numbers_on_every_route_never_500(aw: Web, bad: str) -> None:
         ("/settings", {"secrets_per_process": bad}),
         (f"/users/{bad}/action", {"action": "disable"}),
         (f"/users/{bad}/reveal", {}),
+        (f"/backups/{bad}/download", {"password": PASSWORD}),
         (f"/requests/{bad}/approve", {"term": "default"}),
         (f"/backups/{bad}/restore", {"confirm": "восстановить"}),
         ("/import/confirm", {"n": bad, "ack_old_bot": "1"}),
@@ -322,7 +340,7 @@ def test_routes_and_adapters_do_not_touch_system_ops() -> None:
             assert "db_write(" not in code, path.name
 
 
-async def test_backup_service_audits_and_caps_download(aw: Web) -> None:
+async def test_backup_service_audits_streams_and_caps_download(aw: Web) -> None:
     await aw.create_users("alice")
     await aw.web.backups.create("web:admin")
     rec = next(b for b in await aw.web.backups.list() if b.reason == "manual")
@@ -332,9 +350,98 @@ async def test_backup_service_audits_and_caps_download(aw: Web) -> None:
     assert data == aw.fake.files[rec.path].data
     assert "backup.download" in audit_actions(aw)
     assert await aw.web.backups.open_download(9999, "web:admin") is None
-    small = BackupService(aw.ctx.pipeline, max_download=10)
+    opener = aw.web.backups._opener
+    small = BackupService(aw.ctx.pipeline, max_download=10, opener=opener)
     with pytest.raises(BackupError):
         await small.open_download(rec.id, "web:admin")
+    # the slot is free again after the failed attempt
+    assert await small.open_download(9999, "web:admin") is None
+
+
+async def test_download_reads_in_blocks_not_whole_file(aw: Web) -> None:
+    await aw.create_users("alice")
+    await aw.web.backups.create("web:admin")
+    rec = next(b for b in await aw.web.backups.list() if b.reason == "manual")
+
+    class Spy(io.BytesIO):
+        sizes: ClassVar[list[int]] = []
+
+        def read(self, n: int | None = -1) -> bytes:
+            Spy.sizes.append(-1 if n is None else n)
+            return super().read(n)
+
+    big = Spy(aw.fake.files[rec.path].data * 50)
+    svc = BackupService(aw.ctx.pipeline, opener=lambda path: big)
+    dl = await svc.open_download(rec.id, "web:admin")
+    assert dl is not None
+    blocks = [c async for c in dl.chunks]
+    assert (
+        len(blocks) >= 1
+        and all(n > 0 for n in Spy.sizes)
+        and max(len(b) for b in blocks) <= 1 << 20
+    )
+
+
+async def test_only_one_concurrent_download(aw: Web) -> None:
+    await aw.create_users("alice")
+    await aw.web.backups.create("web:admin")
+    rec = next(b for b in await aw.web.backups.list() if b.reason == "manual")
+    first = await aw.web.backups.open_download(rec.id, "web:admin")
+    assert first is not None
+    with pytest.raises(DownloadBusy):
+        await aw.web.backups.open_download(rec.id, "web:admin")
+    r = await aw.post(f"/backups/{rec.id}/download", {"password": PASSWORD})
+    assert r.status_code == 409
+    first.release()
+    ok = await aw.post(f"/backups/{rec.id}/download", {"password": PASSWORD})
+    assert ok.status_code == 200
+    # finished stream frees the slot again
+    assert (await aw.post(f"/backups/{rec.id}/download", {"password": PASSWORD})).status_code == 200
+
+
+async def test_stale_download_slot_expires(aw: Web) -> None:
+    now = [0.0]
+    svc = BackupService(aw.ctx.pipeline, opener=aw.web.backups._opener, monotonic=lambda: now[0])
+    await aw.create_users("alice")
+    await aw.web.backups.create("web:admin")
+    rec = next(b for b in await aw.web.backups.list() if b.reason == "manual")
+    assert await svc.open_download(rec.id, "a") is not None
+    with pytest.raises(DownloadBusy):
+        await svc.open_download(rec.id, "a")
+    now[0] = 1801.0
+    assert await svc.open_download(rec.id, "a") is not None
+
+
+async def test_download_and_restore_need_the_panel_password(aw: Web) -> None:
+    await aw.create_users("alice")
+    await aw.post("/backups/create")
+    rec = next(b for b in aw.ctx.db.call(repo.list_backups) if b.reason == "manual")
+    for data in ({}, {"password": "wrong"}):
+        r = await aw.post(f"/backups/{rec.id}/download", data)
+        assert r.status_code == 303  # no archive, back to the list with an error
+        assert b"gzip" not in r.content
+    assert "backup.download" not in audit_actions(aw)
+    r = await aw.post(
+        f"/backups/{rec.id}/restore", {"confirm": "восстановить", "password": "wrong"}
+    )
+    page = await aw.client.get(r.headers["location"])
+    assert "Текущий пароль неверен" in page.text or "Пароль" in page.text
+    assert "backup.restore" not in audit_actions(aw)
+    assert (await aw.client.get(aw.u(f"/backups/{rec.id}/download"))).status_code == 405
+    ok = await aw.post(f"/backups/{rec.id}/download", {"password": PASSWORD})
+    assert ok.status_code == 200 and ok.content == aw.fake.files[rec.path].data
+
+
+async def test_reauth_failures_are_rate_limited(aw: Web) -> None:
+    await aw.create_users("alice")
+    await aw.post("/backups/create")
+    rec = next(b for b in aw.ctx.db.call(repo.list_backups) if b.reason == "manual")
+    for _ in range(5):
+        await aw.post(f"/backups/{rec.id}/download", {"password": "wrong"})
+    r = await aw.post(f"/backups/{rec.id}/download", {"password": PASSWORD})
+    page = await aw.client.get(r.headers["location"])
+    assert r.status_code == 303 and "Слишком много попыток" in page.text
+    assert "backup.download" not in audit_actions(aw)
 
 
 async def test_dashboard_service_caches_cert_lookup_and_fills_limit(aw: Web) -> None:
@@ -365,10 +472,12 @@ async def test_dashboard_service_caches_cert_lookup_and_fills_limit(aw: Web) -> 
 
 
 async def test_download_is_audited_and_streamed(aw: Web) -> None:
+    aw.web.backups = aw.web.backups
     await aw.create_users("alice")
     await aw.post("/backups/create")
     rec = next(b for b in aw.ctx.db.call(repo.list_backups) if b.reason == "manual")
-    async with aw.client.stream("GET", aw.u(f"/backups/{rec.id}/download")) as r:
+    form = {"password": PASSWORD, "csrf_token": await aw.csrf()}
+    async with aw.client.stream("POST", aw.u(f"/backups/{rec.id}/download"), data=form) as r:
         assert r.status_code == 200 and r.headers["content-length"]
         body = b"".join([c async for c in r.aiter_bytes()])
     assert body == aw.fake.files[rec.path].data
@@ -481,3 +590,65 @@ async def test_templates_and_token_services(aw: Web) -> None:
     await aw.web.admin.set_bot_token(token, "web:admin")
     assert aw.env_writes[-1] == ("TGPANEL_BOT_TOKEN", token)
     assert await aw.web.admin.bot_token_set_at()
+
+
+# --------------------------------------------------------------------------- S12 and nits
+
+
+async def test_bot_token_message_says_what_happened(aw: Web) -> None:
+    token = "123456789:" + "C" * 35
+    r = await aw.post("/settings/bot-token", {"token": token})
+    page = await aw.client.get(r.headers["location"])
+    assert "бот перезапущен" in page.text and aw.bot.calls == 1
+    aw.bot.result = False
+    r = await aw.post("/settings/bot-token", {"token": "987654321:" + "D" * 35})
+    page = await aw.client.get(r.headers["location"])
+    assert "перезапустите службу" in page.text and aw.bot.calls == 2
+    assert aw.ctx.db.call(repo.get_setting, "bot_token") is None
+
+
+async def test_logout_ends_all_sessions_only_when_ticked(aw: Web) -> None:
+    assert "завершить все сессии" in (await aw.client.get(aw.u("/"))).text
+    version = aw.ctx.db.call(repo.get_setting, "panel_session_version")
+    r = await aw.post("/logout")
+    assert r.status_code == 303
+    assert aw.ctx.db.call(repo.get_setting, "panel_session_version") == version
+    assert (await aw.login()).status_code == 303
+    await aw.post("/logout", {"all_sessions": "1"})
+    assert aw.ctx.db.call(repo.get_setting, "panel_session_version") != version
+
+
+async def test_argon2_rehash_after_login(w: Web) -> None:
+    from argon2 import PasswordHasher
+
+    from tgpanel.services.admin import AdminService
+
+    stronger = PasswordHasher(time_cost=2, memory_cost=8, parallelism=1)
+    w.web.admin = AdminService(w.ctx.pipeline, hasher=stronger)
+    old = w.ctx.db.call(repo.get_setting, "panel_password_hash")
+    assert (await w.login()).status_code == 303
+    new = w.ctx.db.call(repo.get_setting, "panel_password_hash")
+    assert new != old and not stronger.check_needs_rehash(str(new))
+    assert stronger.verify(str(new), PASSWORD)
+    w.client.cookies.clear()
+    assert (await w.login()).status_code == 303  # still works with the new hash
+    assert "web.password_rehash" in audit_actions(w)
+
+
+async def test_wrong_current_password_attempts_are_limited(aw: Web) -> None:
+    new = "another long passphrase 42"
+    for _ in range(5):
+        await aw.post("/settings/password", {"current": "bad", "new": new, "again": new})
+    r = await aw.post("/settings/password", {"current": PASSWORD, "new": new, "again": new})
+    page = await aw.client.get(r.headers["location"])
+    assert "Слишком много попыток" in page.text
+    assert aw.ctx.db.call(repo.get_setting, "panel_session_version") == "1"
+
+
+def test_first_run_credentials_never_referenced_by_the_web_layer() -> None:
+    for path in [*WEB_DIR.rglob("*.py"), *WEB_DIR.rglob("*.html"), *WEB_DIR.rglob("*.js")]:
+        text = path.read_text()
+        assert "first-run" not in text and "first_run" not in text, path.name
+    for path in (WEB_DIR.parent / "services").glob("*.py"):
+        if path.name in ("admin.py", "backups.py", "bulk.py", "dashboard.py"):
+            assert "first-run-credentials" not in path.read_text(), path.name

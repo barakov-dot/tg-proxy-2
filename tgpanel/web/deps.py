@@ -6,6 +6,7 @@ The orchestrator wires the real services behind ``TrafficPort`` / ``RequestsPort
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, field
@@ -17,9 +18,9 @@ from argon2 import PasswordHasher
 from tgpanel.apply.pipeline import ApplyPipeline
 from tgpanel.domain.expiry import Term
 from tgpanel.domain.queries import Period
-from tgpanel.services.admin import AdminService, WriteEnv
+from tgpanel.services.admin import AdminService, RestartBot, WriteEnv
 from tgpanel.services.api import OperationResult
-from tgpanel.services.backups import BackupService
+from tgpanel.services.backups import BackupOpener, BackupService
 from tgpanel.services.bulk import BulkService
 from tgpanel.services.container import AppContext
 from tgpanel.services.dashboard import DashboardView, PoolView
@@ -130,6 +131,9 @@ class WebContext:
     limiter: LoginLimiter = field(default_factory=LoginLimiter)
     clock: Callable[[], datetime] | None = None  # defaults to the pipeline clock
     global_limiter: GlobalFailureLimiter = field(default_factory=GlobalFailureLimiter)
+    sleep: Callable[[float], Awaitable[None]] = asyncio.sleep  # login delay (tests inject)
+    restart_bot: RestartBot | None = None  # restarts only the bot task; True if it will do
+    backup_opener: BackupOpener | None = None
     write_env: WriteEnv | None = None  # writes TGPANEL_BOT_TOKEN to the env file (0600, atomic)
     extra_hosts: frozenset[str] = frozenset()  # allowed Host values besides the panel hostname
     admin: AdminService = field(init=False)
@@ -139,9 +143,12 @@ class WebContext:
 
     def __post_init__(self) -> None:
         self.admin = AdminService(
-            self.app.pipeline, write_env=self.write_env, hasher=self.password_hasher
+            self.app.pipeline,
+            write_env=self.write_env,
+            hasher=self.password_hasher,
+            restart_bot=self.restart_bot,
         )
-        self.backups = BackupService(self.app.pipeline)
+        self.backups = BackupService(self.app.pipeline, opener=self.backup_opener)
         self.bulk = BulkService(self.app.pipeline)
 
     @property

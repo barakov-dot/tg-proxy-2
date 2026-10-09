@@ -29,8 +29,7 @@ from tgpanel.domain.models import UserRecord
 from tgpanel.services.api import NewUser, UserService
 
 KEY_BLACKLIST = "bot_blacklist"
-KEY_OPEN_LIMIT = "open_mode_max_per_hour"
-DEFAULT_OPEN_LIMIT = 20
+DEFAULT_OPEN_LIMIT = 6
 RATE_WINDOW = timedelta(hours=1)
 RATE_MAX_REQUESTS = 3
 MAX_NAME = 100
@@ -99,6 +98,7 @@ class RequestService:
         *,
         rate_max: int = RATE_MAX_REQUESTS,
         rate_window: timedelta = RATE_WINDOW,
+        sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
     ) -> None:
         self._pipeline = pipeline
         self._db = db
@@ -108,6 +108,10 @@ class RequestService:
         self._locks: dict[int, tuple[asyncio.Lock, int]] = {}
         self._open_inflight = 0
         self._quota_lock = asyncio.Lock()
+        self._sleep = sleep
+        # open mode: requests wait here for the batch window and are issued by ONE apply
+        self._batch: list[tuple[int, asyncio.Future[RequestOutcome]]] = []
+        self._batch_task: asyncio.Task[None] | None = None
 
     # ------------------------------------------------------------------ reads
 
@@ -171,8 +175,10 @@ class RequestService:
 
     async def _open_quota_left(self) -> bool:
         """Global limit of profiles issued without approval per hour."""
-        raw = await self._db.run(repo.get_setting, KEY_OPEN_LIMIT, "")
-        limit = int(raw) if raw and _ASCII_ID.fullmatch(raw.strip()) else DEFAULT_OPEN_LIMIT
+        try:
+            limit = (await self._db.run(read_settings)).open_mode_max_per_hour
+        except Exception:
+            limit = DEFAULT_OPEN_LIMIT
         since = to_db(self._pipeline.now() - timedelta(hours=1))
 
         def count(conn: sqlite3.Connection) -> int:
@@ -256,7 +262,7 @@ class RequestService:
             # open mode: an earlier issuance failed; pressing the button again retries it
             if on_preparing is not None:
                 await on_preparing()
-            return await self._approve(pending.id, None, "system")
+            return await self._approve_open(pending.id)
         if await self._rate_limited(tg_id):
             return RequestOutcome(RequestKind.RATE_LIMITED)
 
@@ -288,8 +294,8 @@ class RequestService:
                 RequestKind.CREATED, request=await self._db.run(repo.get_access_request, rid)
             )
         if on_preparing is not None:
-            await on_preparing()
-        return await self._approve(rid, None, "system")
+            await on_preparing()  # "готовим…" goes out at once; the link follows the batch apply
+        return await self._approve_open(rid)
 
     async def _rate_limited(self, tg_id: int) -> bool:
         since = to_db(self._pipeline.now() - self._rate_window)
@@ -302,6 +308,99 @@ class RequestService:
             return int(row[0])
 
         return await self._db.run(count) >= self._rate_max
+
+    # ------------------------------------------------------------------ open-mode batching
+
+    async def _batch_window(self) -> int:
+        try:
+            return (await self._db.run(read_settings)).open_mode_batch_window_s
+        except Exception:
+            return 0
+
+    async def _approve_open(self, request_id: int) -> RequestOutcome:
+        """Open-mode issuance: requests arriving within the batch window share ONE apply."""
+        window = await self._batch_window()
+        if window <= 0:
+            return await self._approve(request_id, None, "system")
+        future: asyncio.Future[RequestOutcome] = asyncio.get_running_loop().create_future()
+        self._batch.append((request_id, future))
+        if self._batch_task is None or self._batch_task.done():
+            self._batch_task = asyncio.create_task(self._flush_after(window))
+        return await future
+
+    async def _flush_after(self, window: int) -> None:
+        await self._sleep(window)
+        while self._batch:
+            items, self._batch = self._batch, []
+            try:
+                outcomes = await self._issue_batch([rid for rid, _ in items])
+            except Exception:
+                outcomes = [
+                    RequestOutcome(RequestKind.FAILED, error="Не удалось создать доступ")
+                    for _ in items
+                ]
+            for (_, future), outcome in zip(items, outcomes, strict=True):
+                if not future.done():
+                    future.set_result(outcome)
+
+    async def _issue_batch(self, request_ids: list[int]) -> list[RequestOutcome]:
+        """Create all pending requests of the batch with one ``UserService.create`` (one apply)."""
+        async with contextlib.AsyncExitStack() as stack:
+            for rid in sorted(set(request_ids)):  # fixed order: no lock-order deadlocks
+                await stack.enter_async_context(self._locked(rid))
+            outcomes: dict[int, RequestOutcome] = {}
+            todo: list[tuple[int, repo.AccessRequest, NewUser]] = []
+            used: set[str] = set()
+            for index, rid in enumerate(request_ids):
+                req = await self._db.run(repo.get_access_request, rid)
+                if req is None:
+                    outcomes[index] = RequestOutcome(RequestKind.NOT_FOUND)
+                elif req.status != "pending":
+                    outcomes[index] = RequestOutcome(RequestKind.ALREADY_DECIDED, request=req)
+                else:
+                    existing = await self._db.run(repo.get_user_by_tg_id, req.tg_id)
+                    if existing is not None:
+                        await self._finalize(req, existing.id, "system", "approved")
+                        outcomes[index] = RequestOutcome(
+                            RequestKind.ISSUED,
+                            request=req,
+                            user=existing,
+                            link=self._safe_link(existing),
+                        )
+                        continue
+                    name = await self._free_name(
+                        display_name(req.full_name, req.tg_username, req.tg_id), req
+                    )
+                    suffix = f" ({req.tg_id})"
+                    if name in used:
+                        name = name[: MAX_NAME - len(suffix)] + suffix
+                    used.add(name)
+                    todo.append(
+                        (
+                            index,
+                            req,
+                            NewUser(name=name, tg_id=req.tg_id, comment="заявка из бота"),
+                        )
+                    )
+            if todo:
+                result = await self._users.create([nu for _, _, nu in todo], "system")
+                if not result.ok or len(result.user_ids) != len(todo):
+                    for index, req, _ in todo:
+                        outcomes[index] = RequestOutcome(
+                            RequestKind.FAILED,
+                            request=req,
+                            error=result.error or "Не удалось создать доступ",
+                        )
+                else:
+                    for (index, req, _), uid in zip(todo, result.user_ids, strict=True):
+                        await self._finalize(req, uid, "system", "approved")
+                        outcomes[index] = RequestOutcome(
+                            RequestKind.ISSUED,
+                            request=req,
+                            user=await self._users.get(uid),
+                            link=result.links.get(uid),
+                        )
+            return [outcomes[i] for i in range(len(request_ids))]
 
     # ------------------------------------------------------------------ decisions
 

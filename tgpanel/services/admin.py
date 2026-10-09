@@ -37,6 +37,7 @@ _TOKEN_RE = re.compile(r"[0-9]{6,12}:[A-Za-z0-9_-]{30,60}")
 _SECRET_LIKE = re.compile(r"(?i)(?:dd)?[0-9a-f]{32}")
 
 WriteEnv = Callable[[str, str], Awaitable[None] | None]
+RestartBot = Callable[[], Awaitable[bool]]  # True: the running bot task is restarting
 
 
 class AdminService:
@@ -46,10 +47,12 @@ class AdminService:
         *,
         write_env: WriteEnv | None = None,
         hasher: PasswordHasher | None = None,
+        restart_bot: RestartBot | None = None,
     ) -> None:
         self._pipeline = pipeline
         self._db = pipeline.db
         self._write_env = write_env
+        self._restart_bot = restart_bot
         self._hasher = hasher or PasswordHasher()
 
     async def audit(self, actor: str, action: str, target: str = "", details: str = "") -> None:
@@ -71,6 +74,21 @@ class AdminService:
 
     async def hash(self, password: str) -> str:
         return str(await asyncio.to_thread(self._hasher.hash, password))
+
+    async def rehash_if_needed(self, stored_hash: str, password: str) -> bool:
+        """After a successful login: store a fresh hash if the argon2 parameters changed."""
+        if not self._hasher.check_needs_rehash(stored_hash):
+            return False
+        new_hash = await self.hash(password)
+
+        def write(conn: sqlite3.Connection) -> bool:
+            if repo.get_setting(conn, KEY_HASH, "") != stored_hash:
+                return False  # changed meanwhile (password change): keep the newer value
+            repo.set_setting(conn, KEY_HASH, new_hash)
+            repo.add_audit(conn, self._pipeline.now(), "system", "web.password_rehash")
+            return True
+
+        return bool(await self._pipeline.db_write(write))
 
     async def change_password(self, current: str, new: str, again: str, actor: str) -> int:
         """Change the panel password; returns the new session version (others are logged out)."""
@@ -129,8 +147,12 @@ class AdminService:
     async def bot_token_set_at(self) -> str | None:
         return await self._db.run(repo.get_setting, KEY_TOKEN_SET_AT, None)
 
-    async def set_bot_token(self, token: str, actor: str) -> None:
-        """Write the token to the env file via the injected ``write_env`` (never to the DB)."""
+    async def set_bot_token(self, token: str, actor: str) -> bool:
+        """Write the token to the env file via the injected ``write_env`` (never to the DB).
+
+        Then asks the supervisor to restart ONLY the bot task (it re-reads the env file). Returns
+        True if that restart was started, False if the service itself must be restarted.
+        """
         if not _TOKEN_RE.fullmatch(token):
             raise OperationRejected("Токен имеет неверный формат")
         if self._write_env is None:
@@ -149,6 +171,12 @@ class AdminService:
             repo.add_audit(conn, now, actor, "settings.set", "bot_token", "***")
 
         await self._pipeline.db_write(write)
+        if self._restart_bot is None:
+            return False
+        try:
+            return bool(await self._restart_bot())
+        except Exception:
+            return False
 
     # ------------------------------------------------------------------ templates
 

@@ -55,6 +55,7 @@ class RestartProbe:
 async def test_concurrent_web_and_bot_operations_are_serialised_and_coalesced(e2e: E2E) -> None:
     assert (await e2e.login()).status_code == 303
     e2e.set_setting("issuance_mode", "open")
+    e2e.set_setting("open_mode_batch_window_s", "0")
     probe = RestartProbe(e2e, delay=0.02)
     runs_before = len(e2e.successful_runs())
     results = await asyncio.gather(

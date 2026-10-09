@@ -45,6 +45,7 @@ from tgpanel.apply.settings_spec import (
     KEY_ALL_NAMES,
     KEY_MTPROXY_FACTS,
     KEY_OUR_NAMES,
+    KEY_PANEL_SESSION_VERSION,
     KEY_PROFILES_HASH,
     read_settings,
 )
@@ -69,7 +70,7 @@ from tgpanel.render.profiles import (
     parse_profiles,
     profiles_hash,
 )
-from tgpanel.system.ops import FileStat, SystemOps, SystemOpsError
+from tgpanel.system.ops import FileStat, NftTableMissing, SystemOps, SystemOpsError
 from tgpanel.system.validation import scrub
 
 log = logging.getLogger(__name__)
@@ -77,6 +78,8 @@ log = logging.getLogger(__name__)
 _USER_PROFILE_RE = re.compile(r"u[1-9][0-9]*")
 _POOL_ENV_RE = re.compile(r"^([0-9]+)\.env$")
 _TEMP_NAME_RE = re.compile(r"^\.tgpanel-.*(\.tmp)?$")
+PROFILES_MODE = 0o400
+CHECK_COPY_MODE = 0o600
 LEGACY_OFF_DROPIN = "[Unit]\nConditionPathExists=/nonexistent-tgpanel-disabled\n"
 
 BATCH_FAILED_NOTE = "Групповое применение не удалось, повтор по отдельности тоже: "
@@ -580,6 +583,10 @@ class ApplyPipeline:
                     repo.delete_setting(conn, KEY_PROFILES_HASH)
                 else:
                     repo.set_setting(conn, KEY_PROFILES_HASH, current_hash)
+                # every panel session issued before the restore stops being valid
+                version = repo.get_setting(conn, KEY_PANEL_SESSION_VERSION, "0") or "0"
+                bumped = int(version) + 1 if version.isdigit() else 1
+                repo.set_setting(conn, KEY_PANEL_SESSION_VERSION, str(bumped))
                 repo.add_audit(conn, self._clock(), actor, "backup.restore", "", "restore")
 
             return await self.run_operation(
@@ -1471,8 +1478,17 @@ class ApplyPipeline:
         snaps: dict[str, _Snap] = {paths.config: config_snap}
         snaps[paths.profiles] = profiles_snap
         targets: dict[str, _Target] = {}
-        pm, po, pg = keep_or(snaps[paths.profiles], (0o400, "root", cfg.tproxy_group))
-        targets[paths.profiles] = _Target(paths.profiles, rendered.profiles_json, pm, po, pg)
+        # profiles.json is ALWAYS 0400 (tproxy-server refuses files readable or writable by
+        # group/others, even for -check); owner/group of an existing file are kept.
+        pm, po, pg = keep_or(snaps[paths.profiles], (PROFILES_MODE, "root", cfg.tproxy_group))
+        if snaps[paths.profiles].stat is not None and pm & 0o077:
+            warnings.append(
+                f"profiles.json имел права {pm:04o}: исправлены на {PROFILES_MODE:04o} "
+                "(tproxy-server отклоняет файлы, доступные группе или всем)"
+            )
+        targets[paths.profiles] = _Target(
+            paths.profiles, rendered.profiles_json, PROFILES_MODE, po, pg
+        )
         cm, co, cg = keep_or(config_snap, (0o640, "root", cfg.tproxy_group))
         targets[paths.config] = _Target(paths.config, rendered.config_json, cm, co, cg)
         targets[paths.pool_unit] = _Target(
@@ -1542,9 +1558,10 @@ class ApplyPipeline:
                             for ip in want & current
                             if ip in old_owners and old_owners[ip] != new_owners.get(ip)
                         )
-            except SystemOpsError:
+            except NftTableMissing:
                 table_existed = False  # the table is missing: the whole file must be loaded
                 nft_changes = []
+                nft_recreate = []
             nft_full = force_nft or not table_existed
             if nft_full:
                 nft_changes = []
@@ -1608,9 +1625,15 @@ class ApplyPipeline:
             raise ApplyError("backup", _clean(str(exc) or type(exc).__name__)) from None
 
     async def _validate(self, plan: _Plan) -> None:
+        """Check the new files on temp copies next to the targets, before anything is touched."""
+        paths = self.config.paths
+        if paths.profiles in plan.changed or paths.config in plan.changed:
+            await self._check_relay_files(plan)
+        if paths.nft_file in plan.changed or plan.nft_full:
+            await self._check_nft_file(plan)
+
+    async def _check_relay_files(self, plan: _Plan) -> None:
         paths, ops = self.config.paths, self.ops
-        if paths.profiles not in plan.changed and paths.config not in plan.changed:
-            return
         cfg_t, prof_t = plan.targets[paths.config], plan.targets[paths.profiles]
         try:
             await ops.write_atomic(
@@ -1620,10 +1643,11 @@ class ApplyPipeline:
                 owner=cfg_t.owner,
                 group=cfg_t.group,
             )
+            # the copy is ALWAYS 0600: tproxy-server -check refuses group/other access
             await ops.write_atomic(
                 paths.check_profiles,
                 prof_t.data,
-                mode=prof_t.mode,
+                mode=CHECK_COPY_MODE,
                 owner=prof_t.owner,
                 group=prof_t.group,
             )
@@ -1635,11 +1659,29 @@ class ApplyPipeline:
                 with contextlib.suppress(Exception):
                     await ops.remove(tmp)
         if not result.ok:
+            message = _clean(result.output)
+            hint = ""
+            if re.search(r"pending|budget|reserve", message, re.IGNORECASE):
+                hint = " Подсказка: уменьшите лимит сессий (max_sessions_global)."
             raise ApplyError(
-                "validate",
-                "relay отклонил конфигурацию (возможно, не хватает памяти или превышен лимит): "
-                + _clean(result.output),
+                "validate", f"relay (tproxy-server -check) отклонил конфигурацию: {message}.{hint}"
             )
+
+    async def _check_nft_file(self, plan: _Plan) -> None:
+        paths, ops = self.config.paths, self.ops
+        target = plan.targets[paths.nft_file]
+        try:
+            await ops.write_atomic(
+                paths.check_nft, target.data, mode=0o600, owner="root", group="root"
+            )
+            result = await ops.nft_check_file(paths.check_nft)
+        except SystemOpsError as exc:
+            raise ApplyError("validate", _clean(str(exc))) from None
+        finally:
+            with contextlib.suppress(Exception):
+                await ops.remove(paths.check_nft)
+        if not result.ok:
+            raise ApplyError("validate", f"nft отклонил файл правил: {_clean(result.output)}")
 
     # ------------------------------------------------------------------ execution
 
@@ -1825,10 +1867,12 @@ class ApplyPipeline:
         errors: list[str] = []
         cfg, ops, timing = self.config, self.ops, self.config.timing
 
-        async def step(label: str, coro: Awaitable[Any]) -> Any:
+        async def step(label: str, coro: Awaitable[Any], *, tolerate_missing: bool = False) -> Any:
             try:
                 return await coro
             except Exception as exc:
+                if tolerate_missing and "No such file or directory" in str(exc):
+                    return None  # already gone: exactly what the rollback wants
                 errors.append(f"{label}: {_clean(str(exc) or type(exc).__name__)}")
                 return None
 
@@ -1844,7 +1888,11 @@ class ApplyPipeline:
                 else:
                     await step("nft delete table", ops.nft_delete_table("tgpanel"))
         for set_name, ips in reversed(journal.nft_added):
-            await step(f"nft delete {set_name}", ops.nft_delete_elements("tgpanel", set_name, ips))
+            await step(
+                f"nft delete {set_name}",
+                ops.nft_delete_elements("tgpanel", set_name, ips),
+                tolerate_missing=True,
+            )
         for set_name, ips in reversed(journal.nft_deleted):
             await step(f"nft add {set_name}", ops.nft_add_elements("tgpanel", set_name, ips))
         for pool_id, was_active in journal.pools.items():

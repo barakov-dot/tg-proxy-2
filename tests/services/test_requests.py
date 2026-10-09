@@ -90,6 +90,7 @@ async def test_reject_and_unknown(svc: Svc, rs: RequestService) -> None:
 
 async def test_open_mode_issues_immediately(svc: Svc, rs: RequestService) -> None:
     set_setting(svc, "issuance_mode", "open")
+    set_setting(svc, "open_mode_batch_window_s", "0")
     order: list[str] = []
 
     async def preparing() -> None:
@@ -104,6 +105,7 @@ async def test_failed_apply_no_link_request_stays_pending_and_retry(
     svc: Svc, rs: RequestService
 ) -> None:
     set_setting(svc, "issuance_mode", "open")
+    set_setting(svc, "open_mode_batch_window_s", "0")
     pipeline = svc.ctx.pipeline
     real = pipeline._execute
 
@@ -182,6 +184,7 @@ async def test_open_mode_global_hourly_limit_falls_back_to_approval(
     svc: Svc, rs: RequestService
 ) -> None:
     set_setting(svc, "issuance_mode", "open")
+    set_setting(svc, "open_mode_batch_window_s", "0")
     set_setting(svc, "open_mode_max_per_hour", "2")
     kinds = [(await rs.submit(tg, None, f"n{tg}")).kind for tg in (10, 11, 12)]
     assert kinds == [RequestKind.ISSUED, RequestKind.ISSUED, RequestKind.CREATED]
@@ -192,6 +195,7 @@ async def test_open_mode_global_hourly_limit_falls_back_to_approval(
 
 async def test_open_mode_limit_counts_concurrent_requests(svc: Svc, rs: RequestService) -> None:
     set_setting(svc, "issuance_mode", "open")
+    set_setting(svc, "open_mode_batch_window_s", "0")
     set_setting(svc, "open_mode_max_per_hour", "3")
     outs = await asyncio.gather(*(rs.submit(100 + i, None, f"c{i}") for i in range(8)))
     assert sum(o.kind is RequestKind.ISSUED for o in outs) == 3
@@ -200,6 +204,7 @@ async def test_open_mode_limit_counts_concurrent_requests(svc: Svc, rs: RequestS
 
 async def test_concurrent_open_requests_share_applies(svc: Svc, rs: RequestService) -> None:
     set_setting(svc, "issuance_mode", "open")
+    set_setting(svc, "open_mode_batch_window_s", "0")
     set_setting(svc, "open_mode_max_per_hour", "50")
     before = len(svc.runs())
     outs = await asyncio.gather(*(rs.submit(200 + i, None, f"c{i}") for i in range(6)))

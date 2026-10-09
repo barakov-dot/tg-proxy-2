@@ -127,3 +127,28 @@ async def test_database_async_runner() -> None:
     pools = await db.run(repo.list_pools)
     assert [p.port for p in pools] == [2400]
     db.close()
+
+
+def test_newer_database_is_refused(tmp_path):  # type: ignore[no-untyped-def]
+    import pytest
+
+    from tgpanel.db.connection import SchemaTooNewError
+
+    path = tmp_path / "new.db"
+    conn = open_database(path)
+    conn.execute("INSERT INTO schema_version (version) VALUES (99)")
+    conn.close()
+    with pytest.raises(SchemaTooNewError, match="более новой версией"):
+        open_database(path)
+
+
+def test_migration_is_not_repeated_by_a_second_process(tmp_path):  # type: ignore[no-untyped-def]
+    """Two connections racing: the second sees the version inside BEGIN IMMEDIATE and skips."""
+    from tgpanel.db.connection import connect
+
+    path = tmp_path / "race.db"
+    first, second = connect(path), connect(path)
+    assert migrate(first) == MIGRATIONS[-1][0]
+    assert migrate(second) == MIGRATIONS[-1][0]
+    rows = first.execute("SELECT COUNT(*) FROM schema_version").fetchone()[0]
+    assert rows == len(MIGRATIONS)

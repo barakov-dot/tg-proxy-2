@@ -14,6 +14,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from tgpanel.apply.config import ApplyPaths
+from tgpanel.apply.settings_spec import is_credential_key
 from tgpanel.db import repo
 from tgpanel.db.connection import Database, current_version, migrate
 from tgpanel.db.repo import BackupRecord
@@ -459,11 +460,21 @@ def _copy_tables(src: sqlite3.Connection, dst: sqlite3.Connection, *, slim: bool
     if current_version_readonly(src) != current_version(dst):
         raise BackupError("версия схемы снимка БД отличается от текущей")
     dst.execute("PRAGMA defer_foreign_keys = ON")
+    # Credentials are never resurrected from a backup: the `admins` table is left untouched
+    # and the panel login/password/session version and bot-token settings keep their CURRENT
+    # values (an old backup may hold a password or an admin that was removed on purpose).
     plain = [
-        t for t in _RESTORE_INSERT_ORDER if t not in ("pools", "users") and t not in _STATS_TABLES
+        t
+        for t in _RESTORE_INSERT_ORDER
+        if t not in ("pools", "users", "admins") and t not in _STATS_TABLES
     ]
     for table in reversed(plain):
-        dst.execute(f"DELETE FROM {table}")  # noqa: S608 - fixed table names
+        if table == "settings":
+            for (key,) in dst.execute("SELECT key FROM settings").fetchall():
+                if not is_credential_key(str(key)):
+                    dst.execute("DELETE FROM settings WHERE key = ?", (key,))
+        else:
+            dst.execute(f"DELETE FROM {table}")  # noqa: S608 - fixed table names
     if not slim:
         for table in reversed(_RESTORE_INSERT_ORDER):
             if table in _STATS_TABLES or table in ("pools", "users"):
@@ -492,7 +503,11 @@ def _copy_tables(src: sqlite3.Connection, dst: sqlite3.Connection, *, slim: bool
             if int(pid) not in keep_pools:
                 dst.execute("DELETE FROM pools WHERE id = ?", (pid,))
     for table in plain:
-        _insert(dst, table, *_rows(src, dst, table))
+        cols, rows = _rows(src, dst, table)
+        if table == "settings" and cols:
+            key_at = cols.index("key")
+            rows = [r for r in rows if not is_credential_key(str(r[key_at]))]
+        _insert(dst, table, cols, rows)
     for table in _SEQUENCE_TABLES:
         top = dst.execute(f"SELECT COALESCE(MAX(id), 0) FROM {table}").fetchone()[0]  # noqa: S608
         cur = dst.execute("SELECT seq FROM sqlite_sequence WHERE name = ?", (table,)).fetchone()

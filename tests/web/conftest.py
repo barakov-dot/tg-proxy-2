@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import io
 import logging
 import re
 from collections.abc import AsyncIterator, Callable, Sequence
@@ -42,6 +43,24 @@ LOGIN = "admin"
 PASSWORD = "correct horse battery staple"
 SECRET_KEY = "k" * 40
 CSRF_RE = re.compile(r'name="csrf-token" content="([^"]*)"')
+
+
+class Recorder:
+    def __init__(self) -> None:
+        self.values: list[float] = []
+
+    async def append_async(self, seconds: float) -> None:
+        self.values.append(seconds)
+
+
+class FakeBotRestart:
+    def __init__(self) -> None:
+        self.calls = 0
+        self.result = True
+
+    async def restart(self) -> bool:
+        self.calls += 1
+        return self.result
 
 
 class FakeTraffic:
@@ -124,6 +143,8 @@ class Web:
     requests: FakeRequests
     broadcast: FakeBroadcast
     env_writes: list[tuple[str, str]] = field(default_factory=list)
+    delays: Recorder = field(default_factory=lambda: Recorder())
+    bot: FakeBotRestart = field(default_factory=lambda: FakeBotRestart())
 
     def u(self, path: str) -> str:
         return ROOT + path
@@ -194,6 +215,8 @@ async def build(tmp_path: Path, variant: str) -> AsyncIterator[Web]:
     await ctx.users.load_hostname()
     traffic, requests, broadcast = FakeTraffic(), FakeRequests(), FakeBroadcast()
     env_writes: list[tuple[str, str]] = []
+    delays = Recorder()
+    bot_restarts = FakeBotRestart()
     web = WebContext(
         app=ctx,
         traffic=traffic,
@@ -204,12 +227,27 @@ async def build(tmp_path: Path, variant: str) -> AsyncIterator[Web]:
         limiter=LoginLimiter(lambda: float(clock.now.timestamp())),
         trusted_proxies=frozenset({"127.0.0.1"}),
         extra_hosts=frozenset({"testserver"}),
+        backup_opener=lambda path: io.BytesIO(fake.files[path].data),
+        sleep=delays.append_async,
+        restart_bot=bot_restarts.restart,
         write_env=lambda key, value: env_writes.append((key, value)),
     )
     app = create_app(web, ROOT)
     transport = httpx.ASGITransport(app=app, client=("203.0.113.9", 4000))
     async with httpx.AsyncClient(transport=transport, base_url="https://testserver") as client:
-        yield Web(client, ctx, web, fake, clock, traffic, requests, broadcast, env_writes)
+        yield Web(
+            client,
+            ctx,
+            web,
+            fake,
+            clock,
+            traffic,
+            requests,
+            broadcast,
+            env_writes,
+            delays,
+            bot_restarts,
+        )
     ctx.close()
 
 

@@ -1,2 +1,3 @@
 # sha256 of /usr/local/bin/tproxy-server builds verified with tgpanel (one per line,
 # "<sha256>  # comment"). An empty list only produces a warning during installation.
+8b39c32e5c6f2a1e7a970f1d60340903b5b001a556cc15df36644ad2ba683116  # owner server, Debian 13, 2026-10-09

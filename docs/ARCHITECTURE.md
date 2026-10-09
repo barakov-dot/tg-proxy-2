@@ -45,7 +45,9 @@ into the next batch (one apply for many operations). For one batch, under the cr
 1. open the DB transaction, run the mutations (the lock is held until commit/rollback);
 2. render the desired state (`profiles.json`, `limits` in `config.json`, pool env files, nft table);
 3. backup of the current files, journal written (crash recovery data);
-4. validate (`tproxy-server -check`, nft/Caddy syntax) before touching anything;
+4. validate before touching anything: `tproxy-server -check` on 0600 temp copies of the new
+   `profiles.json`/`config.json`, and `nft -c -f` on a temp copy of the nft file (Caddy syntax is
+   checked by the installer, not by apply);
 5. atomic writes, pool (MTProxy) units, relay restart, `/healthz` and `/readyz`;
 6. commit; on any error: restore files and units from the backup, restart, roll the DB transaction
    back, record the failed run (`apply_runs`), call the `on_failure` hook (admin notification, banner).

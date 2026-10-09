@@ -580,6 +580,30 @@ async def check_relay_version(env: DoctorEnv, report: DoctorReport) -> None:
         report.add("Версия relay", Status.WARN, f"не из списка проверенных; sha256 {digest}")
 
 
+async def check_foreign_listeners(env: DoctorEnv, report: DoctorReport) -> None:
+    """Pool and stats ports belong to MTProxy; anything else there is a conflict or a leak."""
+    try:
+        listening = await env.tools.listening()
+    except SystemOpsError:
+        return
+    foreign = sorted(
+        {
+            (port, name or "?")
+            for port, name in listening
+            if (2400 <= port <= 2463 or 8900 <= port <= 8963) and name != "mtproto-proxy"
+        }
+    )
+    if foreign:
+        report.add(
+            "Порты пулов 2400-2463 и 8900-8963",
+            Status.WARN,
+            "заняты посторонними процессами: "
+            + ", ".join(f"{port} ({name})" for port, name in foreign),
+        )
+    else:
+        report.add("Порты пулов 2400-2463 и 8900-8963", Status.OK, "посторонних процессов нет")
+
+
 async def check_database(env: DoctorEnv, report: DoctorReport) -> None:
     if env.ctx is None:
         report.add("База данных", Status.FAIL, "не открывается")
@@ -699,6 +723,7 @@ async def run_doctor(env: DoctorEnv) -> DoctorReport:
     await check_services(env, report)
     await check_relay(env, report)
     await check_pools(env, report)
+    await check_foreign_listeners(env, report)
     await check_nft(env, report)
     await check_caddy(env, report, install_env)
     await check_dns(env, report, install_env)

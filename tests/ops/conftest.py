@@ -97,6 +97,7 @@ class Ops:
             "tgpanel-mtproxy-refresh.path",
         ):
             fake.set_active(unit)
+        self.tools.post_update_hook = lambda: fake.set_active("tgpanel")
         self.tools.refs["main"] = "b" * 40
         self.tools.refs["v2"] = "c" * 40
 

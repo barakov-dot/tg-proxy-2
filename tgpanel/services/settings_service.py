@@ -16,6 +16,7 @@ from tgpanel.apply.pipeline import ApplyPipeline
 from tgpanel.apply.settings_spec import SPECS, AppSettings, SettingSpec, normalize, read_settings
 from tgpanel.db import repo
 from tgpanel.db.connection import Database, transaction
+from tgpanel.domain.invariants import required_pending_bytes
 from tgpanel.domain.pools import occupancy
 from tgpanel.services.api import Actor, OperationResult
 
@@ -48,6 +49,21 @@ class SettingsServiceImpl:
     async def all(self) -> dict[str, Any]:
         cfg = await self.snapshot()
         return {key: getattr(cfg, key) for key in SPECS}
+
+    @staticmethod
+    def _check_relay_budget(conn: sqlite3.Connection, canonical: Mapping[str, str]) -> None:
+        """Reject combinations the relay would refuse: the memory its control reserve needs
+        for ``max_sessions_global`` must fit the configured ceiling."""
+        merged = read_settings(conn)
+        sessions = int(canonical.get("max_sessions_global", merged.max_sessions_global))
+        ceiling_mib = int(canonical.get("max_pending_ceiling_mib", merged.max_pending_ceiling_mib))
+        need = required_pending_bytes(sessions)
+        if need > ceiling_mib * 1024 * 1024:
+            raise OperationRejected(
+                f"Для {sessions} сессий relay нужно около {need // (1024 * 1024)} МиБ буферов "
+                f"(max_pending_global), это больше потолка {ceiling_mib} МиБ. "
+                "Уменьшите max_sessions_global или поднимите потолок."
+            )
 
     @staticmethod
     def validate(values: Mapping[str, object]) -> dict[str, str]:
@@ -86,6 +102,7 @@ class SettingsServiceImpl:
             )
             if hour_days < minute_days:
                 raise OperationRejected("Почасовая статистика должна храниться не меньше минутной")
+            self._check_relay_budget(conn, canonical)
             for key, value in canonical.items():
                 if current.get(key) != value:
                     repo.set_setting(conn, key, value)

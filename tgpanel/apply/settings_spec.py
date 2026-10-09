@@ -21,6 +21,18 @@ KEY_PROFILES_HASH = "apply.profiles_hash"
 KEY_MTPROXY_FACTS = "mtproxy_facts"
 KEY_OUR_NAMES = "apply.our_names"
 KEY_ADOPTED = "apply.adopted"
+KEY_PANEL_LOGIN = "panel_login"
+KEY_PANEL_PASSWORD_HASH = "panel_password_hash"  # noqa: S105 - setting name
+KEY_PANEL_SESSION_VERSION = "panel_session_version"
+CREDENTIAL_KEYS = frozenset({KEY_PANEL_LOGIN, KEY_PANEL_PASSWORD_HASH, KEY_PANEL_SESSION_VERSION})
+CREDENTIAL_PREFIXES = ("bot_token",)
+
+
+def is_credential_key(key: str) -> bool:
+    """Settings that a restore must never bring back from an (older) backup."""
+    return key in CREDENTIAL_KEYS or key.startswith(CREDENTIAL_PREFIXES)
+
+
 KEY_ALL_NAMES = "apply.all_names"
 
 _HOST_RE = re.compile(r"^(?=.{1,253}$)([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$")
@@ -124,14 +136,16 @@ SPECS: dict[str, SettingSpec] = dict(
         _spec(
             "max_sessions_global",
             "1024",
-            _int_range(16, 200_000, "max_sessions_global"),
+            _int_range(16, 20_000, "max_sessions_global"),
             True,
             "Глобальный лимит сессий relay",
         ),
         _spec(
             "max_streams_global",
             "16384",
-            _int_range(64, 2_000_000, "max_streams_global"),
+            # the relay needs >= max_streams_per_session (128) and >= max_backend_dials_in_flight
+            # (256); 4096 is a safe floor
+            _int_range(4096, 1_000_000, "max_streams_global"),
             True,
             "Глобальный лимит потоков relay",
         ),
@@ -204,10 +218,24 @@ SPECS: dict[str, SettingSpec] = dict(
         ),
         _spec(
             "open_mode_max_per_hour",
-            "20",
-            _int_range(1, 10_000, "Выдач в час в открытом режиме"),
+            "6",
+            _int_range(1, 60, "Выдач в час в открытом режиме"),
             False,
             "Лимит выдач в час (открытый режим)",
+        ),
+        _spec(
+            "open_mode_batch_window_s",
+            "20",
+            _int_range(0, 300, "Окно пакетной выдачи, с"),
+            False,
+            "Окно пакетной выдачи в открытом режиме, с (0 = сразу)",
+        ),
+        _spec(
+            "max_pending_ceiling_mib",
+            "8192",
+            _int_range(512, 65_536, "Потолок max_pending_global, МиБ"),
+            False,
+            "Потолок памяти буферов relay (max_pending_global), МиБ",
         ),
         _spec(
             "reminder_days",
@@ -259,6 +287,8 @@ class AppSettings:
     activity_min_bytes: int
     activity_min_packets: int
     open_mode_max_per_hour: int
+    open_mode_batch_window_s: int
+    max_pending_ceiling_mib: int
     reminder_days: int
     backup_hour: int
 

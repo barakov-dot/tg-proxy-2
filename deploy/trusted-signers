@@ -1,0 +1,5 @@
+# Public keys (ASCII-armored PGP blocks) allowed to sign release tags. Used only with
+# `install.sh --verify-tag` / `tgpanel update --verify-tag` (opt-in). Empty for now: add the
+# maintainer's key block here, or point TGPANEL_TRUSTED_SIGNERS at a file you obtained out of band
+# (a key shipped inside the repository only protects against accidental corruption, not against
+# a compromised repository).

@@ -7,12 +7,21 @@
 #
 # Options: --panel-domain D  --admin-id N  [--bot-token T | --bot-token-file F]
 #          [--panel-login L] [--panel-password P] [--ref REF] [--yes] [--import | --no-import]
-#          [--ignore-dns] [--check-only]
+#          [--ignore-dns] [--verify-tag] [--allow-downgrade] [--check-only]
+# ВНИМАНИЕ: значения аргументов (--bot-token, --panel-password) видны другим пользователям в
+# `ps`. Безопаснее --bot-token-file и переменные окружения ниже.
 # Secrets may also come from the environment (not visible in `ps`):
 #   TGPANEL_INSTALL_BOT_TOKEN, TGPANEL_INSTALL_PANEL_PASSWORD
 # Without a terminal (/dev/tty) the installer needs --yes and --import/--no-import (decided
 # BEFORE anything is changed). --yes never skips the DNS check: only --ignore-dns does.
 # Without --ref: newest v*.*.* release tag, else the moving `main` branch (a warning is printed).
+# --ref also accepts a full commit SHA (the strongest pin). --verify-tag (or
+# TGPANEL_VERIFY_TAG=1) additionally checks a signed tag against deploy/trusted-signers
+# (override: TGPANEL_TRUSTED_SIGNERS=<file>); a version older than the installed one is refused
+# unless --allow-downgrade.
+# Two stages: stage 1 (checks, packages, fetch + checkout) runs from the downloaded script; then
+# it execs the CHECKED-OUT install.sh with --stage2 (units, bootstrap, Caddy, apply), so the
+# installation steps always come from the selected version.
 #
 # Test hooks (never needed in production):
 #   TGPANEL_ROOT_PREFIX=<dir>  every absolute path (/etc, /usr, /opt, ...) is looked up under
@@ -39,7 +48,6 @@ ENV_FILE="$ETC_DIR/tgpanel.env"
 CRED_FILE="$ETC_DIR/.first-run-credentials"
 STATE_DIR="$P/var/lib/tgpanel"
 BACKUP_DIR="$P/var/backups/tgpanel"
-SYSTEMD_DIR="$P/etc/systemd/system"
 CLI_LINK="$P/usr/local/bin/tgpanel"
 LOCK_FILE="$P/run/tgpanel-install.lock"
 PACKAGES="python3 python3-venv git sqlite3 nftables ca-certificates tzdata"
@@ -54,6 +62,10 @@ REF_GIVEN=0
 ASSUME_YES=0
 IMPORT_MODE=""
 IGNORE_DNS=0
+VERIFY_TAG=0
+ALLOW_DOWNGRADE=0
+STAGE2=0
+ORIG_ARGS=()
 CHECK_ONLY=0
 UPDATE=0
 HAVE_TTY=0
@@ -63,6 +75,7 @@ BACKUP_PATH=""
 STORED_DOMAIN=""
 STORED_TOKEN=""
 PROBE_ACTIVE=0
+POLICY_MARKER="tgpanel-installer-policy-rc.d"
 POLICY_RC_CREATED=""
 TMP_FILES=()
 
@@ -91,7 +104,7 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 
 usage() {
-  sed -n '2,19p' "${BASH_SOURCE[0]:-/dev/null}" 2>/dev/null || true
+  sed -n '2,32p' "${BASH_SOURCE[0]:-/dev/null}" 2>/dev/null || true
 }
 
 # ------------------------------------------------------------------------ helpers
@@ -217,6 +230,9 @@ parse_args() {
       --import) IMPORT_MODE=yes; shift ;;
       --no-import) IMPORT_MODE=no; shift ;;
       --ignore-dns) IGNORE_DNS=1; shift ;;
+      --verify-tag) VERIFY_TAG=1; shift ;;
+      --allow-downgrade) ALLOW_DOWNGRADE=1; shift ;;
+      --stage2) STAGE2=1; shift ;;
       --check-only) CHECK_ONLY=1; shift ;;
       -h | --help) usage; exit 0 ;;
       --*) opt="${1%%=*}"; die "неизвестный аргумент: $opt" ;;
@@ -481,6 +497,10 @@ missing_packages() {
 install_packages() {
   step "Шаг 4. Пакеты"
   local missing pkgs=()
+  # a policy-rc.d left behind by an interrupted run of ours must not block services
+  if [ -f /usr/sbin/policy-rc.d ] && grep -q "$POLICY_MARKER" /usr/sbin/policy-rc.d 2>/dev/null; then
+    rm -f /usr/sbin/policy-rc.d
+  fi
   missing="$(missing_packages)"
   if [ -n "$missing" ]; then
     read -r -a pkgs <<<"$missing"
@@ -488,7 +508,7 @@ install_packages() {
     # a freshly installed nftables must not be started: its service would `flush ruleset`
     # and wipe the upstream tables
     if [ ! -e /usr/sbin/policy-rc.d ]; then
-      printf '#!/bin/sh\nexit 101\n' >/usr/sbin/policy-rc.d
+      printf '#!/bin/sh\n# %s\nexit 101\n' "$POLICY_MARKER" >/usr/sbin/policy-rc.d
       chmod 0755 /usr/sbin/policy-rc.d
       POLICY_RC_CREATED=/usr/sbin/policy-rc.d
     fi
@@ -518,10 +538,31 @@ resolve_ref() {
   return 1
 }
 
+verify_tag_signature() { # tag
+  local keys="${TGPANEL_TRUSTED_SIGNERS:-$INSTALL_DIR/deploy/trusted-signers}" home
+  command -v gpg >/dev/null 2>&1 || die "для --verify-tag нужен gpg (apt-get install gnupg)"
+  grep -q 'BEGIN PGP PUBLIC KEY BLOCK' "$keys" 2>/dev/null ||
+    die "файл доверенных ключей пуст или отсутствует ($keys): проверить подпись тега нечем"
+  home="$(mktemp -d)"
+  TMP_FILES+=("$home/.keep")
+  touch "$home/.keep"
+  GNUPGHOME="$home" gpg --batch --import "$keys" >/dev/null 2>&1 || {
+    rm -rf "$home"
+    die "не удалось загрузить доверенные ключи"
+  }
+  if ! GNUPGHOME="$home" git -C "$INSTALL_DIR" verify-tag "$1" >/dev/null 2>&1; then
+    rm -rf "$home"
+    die "подпись тега $1 не подтверждена доверенными ключами"
+  fi
+  rm -rf "$home"
+  log "подпись тега $1 подтверждена"
+}
+
 fetch_code() {
   step "Код и зависимости"
-  local commit tag
+  local commit tag previous=""
   if [ -d "$INSTALL_DIR/.git" ]; then
+    previous="$(git -C "$INSTALL_DIR" rev-parse HEAD 2>/dev/null || true)"
     git -C "$INSTALL_DIR" fetch --tags --force --prune origin
   else
     git clone "$REPO_URL" "$INSTALL_DIR"
@@ -533,16 +574,25 @@ fetch_code() {
       log "версия: последний релиз $tag"
     else
       REF="main"
-      warn "релизных тегов нет: устанавливается движущаяся ветка main. Для фиксации версии: --ref <тег или коммит>"
+      warn "релизных тегов нет: устанавливается движущаяся ветка main. Для фиксации версии: --ref <тег или полный SHA коммита>"
     fi
   fi
   commit="$(resolve_ref)" || die "ветка, тег или коммит «$REF» не найдены в репозитории"
+  if [ -n "$previous" ] && [ "$previous" != "$commit" ] &&
+    git -C "$INSTALL_DIR" merge-base --is-ancestor "$commit" "$previous" 2>/dev/null &&
+    [ "$ALLOW_DOWNGRADE" = 0 ]; then
+    die "версия $REF старше установленной ($(printf '%s' "$previous" | cut -c1-10)): добавьте --allow-downgrade, если это нужно"
+  fi
+  if [ "$VERIFY_TAG" = 1 ] || [ "${TGPANEL_VERIFY_TAG:-}" = 1 ]; then
+    printf '%s' "$REF" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+' || die "--verify-tag работает только с тегами vX.Y.Z"
+    verify_tag_signature "$REF"
+  fi
   git -C "$INSTALL_DIR" checkout --detach --force "$commit" >/dev/null 2>&1
-  log "код: $REF ($(printf '%s' "$commit" | cut -c1-10))"
+  log "код: $REF, коммит $commit"
   check_relay_version # the list shipped with this exact version decides the warning
   if [ ! -x "$VENV_PY" ]; then python3 -m venv "$INSTALL_DIR/.venv"; fi
-  "$VENV_PY" -m pip install --require-hashes --only-binary=:all: --no-input \
-    --disable-pip-version-check -r "$INSTALL_DIR/requirements.lock" >/dev/null
+  (cd "$INSTALL_DIR" && "$VENV_PY" -P -m pip install --require-hashes --only-binary=:all: --no-input \
+    --disable-pip-version-check -r "$INSTALL_DIR/requirements.lock" >/dev/null)
   log "зависимости установлены (с проверкой хешей, только готовые пакеты)"
 }
 
@@ -587,17 +637,8 @@ show_credentials_now() {
 
 install_units() {
   step "Шаг 8. Юниты, таблица nft, база данных"
-  local f
-  for f in tgpanel.service tgpanel-firewall.service tgpanel-mtproxy-refresh.path \
-    tgpanel-mtproxy-refresh.service; do
-    install -m 0644 "$INSTALL_DIR/deploy/$f" "$SYSTEMD_DIR/$f"
-  done
-  install -m 0755 "$INSTALL_DIR/deploy/tgpanel-cli" "$CLI_LINK"
   chmod 0755 "$INSTALL_DIR/scripts/restart-pools.sh"
-  systemctl daemon-reload
-  # tgpanel.nft appears with the first apply; the firewall unit only has to be enabled for boot
-  systemctl enable tgpanel-firewall.service tgpanel.service >/dev/null 2>&1
-  systemctl enable --now tgpanel-mtproxy-refresh.path >/dev/null 2>&1
+  run_ops install-units
   TGPANEL_BOOTSTRAP_PASSWORD="$PANEL_PASSWORD" run_ops bootstrap \
     "--domain=$PANEL_DOMAIN" "--login=$PANEL_LOGIN" "--admin-id=$ADMIN_ID" >/dev/null
   printf '%s\n' "$([ "$REF_GIVEN" = 1 ] && printf '%s' "$REF" || printf auto)" >"$STATE_DIR/ref"
@@ -720,6 +761,15 @@ apply_changed_settings() {
   fi
 }
 
+# Stage 1 -> stage 2 hand-off: exec the CHECKED-OUT install.sh so that everything after the
+# checkout runs from the selected version. The install lock (fd 9) stays held across exec.
+handoff_stage2() { # mode
+  export TGPANEL_STAGE2_MODE="$1" TGPANEL_STAGE2_DOMAIN="$PANEL_DOMAIN"
+  export TGPANEL_STAGE2_ADMIN="$ADMIN_ID" TGPANEL_STAGE2_REF="$REF"
+  export TGPANEL_INSTALL_BOT_TOKEN="$BOT_TOKEN" TGPANEL_INSTALL_PANEL_PASSWORD="$PANEL_PASSWORD"
+  exec bash "$INSTALL_DIR/install.sh" --stage2 ${ORIG_ARGS[@]+"${ORIG_ARGS[@]}"}
+}
+
 update_flow() {
   [ -x "$VENV_PY" ] || die "найден $ENV_FILE, но нет $VENV_PY: переустановите (удалите $ETC_DIR только если уверены)"
   if [ -f "$CRED_FILE" ]; then
@@ -728,11 +778,15 @@ update_flow() {
   install_packages
   apply_changed_settings
   step "Обновление кода (так же, как tgpanel update)"
-  if [ "$REF_GIVEN" = 1 ]; then
-    run_ops update "--ref=$REF" || die "обновление не удалось (выполнен откат на прежнюю версию)"
-  else
-    run_ops update || die "обновление не удалось (выполнен откат на прежнюю версию)"
-  fi
+  local flags=()
+  if [ "$REF_GIVEN" = 1 ]; then flags+=("--ref=$REF"); fi
+  if [ "$ALLOW_DOWNGRADE" = 1 ]; then flags+=(--allow-downgrade); fi
+  if [ "$VERIFY_TAG" = 1 ]; then flags+=(--verify-tag); fi
+  run_ops update ${flags[@]+"${flags[@]}"} || die "обновление не удалось (выполнен откат на прежнюю версию)"
+  handoff_stage2 update
+}
+
+update_stage2() {
   install_caddy
   first_apply_and_start
   final_summary
@@ -741,6 +795,10 @@ update_flow() {
 fresh_flow() {
   install_packages
   fetch_code
+  handoff_stage2 fresh
+}
+
+fresh_stage2() {
   make_dirs_and_backup
   write_env
   install_units
@@ -760,9 +818,21 @@ acquire_install_lock() {
 
 # ------------------------------------------------------------------------------- main
 
+stage2_main() {
+  PANEL_DOMAIN="${TGPANEL_STAGE2_DOMAIN:-$PANEL_DOMAIN}"
+  ADMIN_ID="${TGPANEL_STAGE2_ADMIN:-$ADMIN_ID}"
+  REF="${TGPANEL_STAGE2_REF:-$REF}"
+  if [ "${TGPANEL_STAGE2_MODE:-}" = update ]; then UPDATE=1; update_stage2; else fresh_stage2; fi
+}
+
 main() {
+  ORIG_ARGS=("$@")
   parse_args "$@"
   detect_tty
+  if [ "$STAGE2" = 1 ]; then
+    stage2_main
+    return 0
+  fi
   check_system
   if [ -f "$ENV_FILE" ]; then UPDATE=1; fi
   check_proxy_installed # step 2 first, read-only; exits 1 on failure

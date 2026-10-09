@@ -45,6 +45,7 @@ async def test_web_approves_the_same_request_service(e2e: E2E) -> None:
 
 async def test_open_mode_issues_without_admin(e2e: E2E) -> None:
     e2e.set_setting("issuance_mode", "open")
+    e2e.set_setting("open_mode_batch_window_s", "0")
     runs = len(e2e.successful_runs())
     await e2e.tg.press(USER, "req")
     user = e2e.stack.ctx.db.call(repo.get_user_by_tg_id, USER)

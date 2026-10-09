@@ -57,6 +57,10 @@ class ApplyPaths:
         return f"{self.pools_dir}/{pool_id}.env"
 
     @property
+    def check_nft(self) -> str:
+        return f"{self.tgpanel_dir}/.tgpanel-check-tgpanel.nft"
+
+    @property
     def check_profiles(self) -> str:
         return f"{self.tproxy_dir}/.tgpanel-check-{PROFILES_NAME}"
 

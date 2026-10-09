@@ -27,6 +27,7 @@ from tgpanel.system.ops import (
     HttpResult,
     LocalFile,
     LockHandle,
+    NftTableMissing,
     SetCounter,
     SystemOpsError,
 )
@@ -305,7 +306,7 @@ class FakeSystemOps:
 
     def fail_check(
         self,
-        method: Literal["tproxy_check", "caddy_validate"],
+        method: Literal["tproxy_check", "caddy_validate", "nft_check_file"],
         output: str = "injected check failure",
         match: Matcher = None,
         times: int | None = 1,
@@ -581,7 +582,7 @@ class FakeSystemOps:
                 if max_profiles < 1:
                     return ["config: limits.max_profiles must be >= 1"]
         problems: list[str] = []
-        if prof_file.mode & 0o077 & ~0o040:
+        if prof_file.mode & 0o077:  # the real binary refuses group/other access, even read
             problems.append(f"profiles: file mode {prof_file.mode:04o} too permissive")
         try:
             doc = json.loads(prof_file.data)
@@ -642,8 +643,17 @@ class FakeSystemOps:
         validate_nft_ident(set_name, "set")
         s = self.nft_sets.get((table, set_name))
         if s is None:
-            raise SystemOpsError("nft list set failed: No such file or directory")
+            raise NftTableMissing("nft list set failed: No such file or directory")
         return s
+
+    async def nft_check_file(self, path: str) -> CheckResult:
+        validate_path(path)
+        injected = self._enter("nft_check_file", path)
+        if injected is not None:
+            return injected
+        if path not in self.files:
+            return CheckResult(False, "no such file")
+        return CheckResult(True, "ok")
 
     async def nft_list_set(self, table: str, set_name: str) -> dict[str, SetCounter]:
         self._enter("nft_list_set", table, set_name)

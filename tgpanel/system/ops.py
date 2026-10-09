@@ -56,6 +56,10 @@ class SystemOpsError(Exception):
     """Any failed system operation. Message must not contain secrets."""
 
 
+class NftTableMissing(SystemOpsError):
+    """The nft table or set does not exist (as opposed to any other nft failure)."""
+
+
 class SystemOps(Protocol):
     # --- files (all paths absolute) ---
     async def read_file(self, path: str) -> bytes: ...
@@ -119,8 +123,15 @@ class SystemOps(Protocol):
 
     # --- nftables ---
     async def nft_load_file(self, path: str) -> None: ...
+    async def nft_check_file(self, path: str) -> CheckResult:
+        """`nft -c -f <path>`: syntax/semantic check without applying (output is scrubbed)."""
+        ...
+
     async def nft_list_set(self, table: str, set_name: str) -> dict[str, SetCounter]:
-        """ip -> counter. Parsed from `nft -j list set inet <table> <set>`."""
+        """ip -> counter. Parsed from `nft -j list set inet <table> <set>`.
+
+        Raises ``NftTableMissing`` when the table/set does not exist, any other
+        ``SystemOpsError`` for other failures."""
         ...
 
     async def nft_delete_table(self, table: str) -> None:

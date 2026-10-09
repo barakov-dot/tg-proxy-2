@@ -248,3 +248,84 @@ def test_unknown_argument_does_not_echo_value(tmp_path: Path) -> None:
     assert res.returncode == 1
     assert "SUPERSECRETVALUE" not in res.stderr + res.stdout
     assert "--bogus" in res.stderr
+
+
+# --------------------------------------------------------------- stages, credentials
+
+
+def _bash(script: str, root: Path) -> subprocess.CompletedProcess[str]:
+    assert BASH is not None
+    return subprocess.run(  # noqa: S603
+        [
+            BASH,
+            "-c",
+            f'TGPANEL_SOURCE_ONLY=1 TGPANEL_ROOT_PREFIX="{root}" source "{INSTALL}"; {script}',
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=60,
+        stdin=subprocess.DEVNULL,
+        env={"PATH": os.environ["PATH"], "HOME": str(root)},
+    )
+
+
+def test_first_run_credentials_file_is_private_and_removed_after_summary(tmp_path: Path) -> None:
+    root = tmp_path / "r"
+    (root / "etc/tgpanel").mkdir(parents=True)
+    script = f"""
+PANEL_DOMAIN=panel.example.com BOT_TOKEN={TOKEN} ADMIN_ID=1 PANEL_LOGIN=boss
+write_env
+mode_env=$(ls -l "$ENV_FILE" | cut -c1-10)
+mode_cred=$(ls -l "$CRED_FILE" | cut -c1-10)
+echo "MODES $mode_env $mode_cred"
+grep -q '^password=' "$CRED_FILE" && echo CRED_HAS_PASSWORD
+bot_name() {{ printf '@bot'; }}
+run_ops() {{ printf '/backup.tar.gz'; }}
+final_summary
+[ -e "$CRED_FILE" ] && echo CRED_STILL_THERE || echo CRED_REMOVED
+"""
+    res = _bash(script, root)
+    assert res.returncode == 0, res.stderr
+    assert "MODES -rw------- -rw-------" in res.stdout
+    assert "CRED_HAS_PASSWORD" in res.stdout and "CRED_REMOVED" in res.stdout
+    assert "Пароль:" in res.stdout and "Логин:          boss" in res.stdout
+    path = [
+        ln
+        for ln in (root / "etc/tgpanel/tgpanel.env").read_text().splitlines()
+        if "PANEL_PATH" in ln
+    ]
+    assert path and path[0].split("=", 1)[1][0].isalnum()
+
+
+def test_stage1_execs_the_checked_out_installer_with_stage2(tmp_path: Path) -> None:
+    root = tmp_path / "r"
+    (root / "opt/tgpanel").mkdir(parents=True)
+    (root / "opt/tgpanel/install.sh").write_text(
+        '#!/usr/bin/env bash\necho "STAGE2 args=$* mode=$TGPANEL_STAGE2_MODE '
+        'domain=$TGPANEL_STAGE2_DOMAIN ref=$TGPANEL_STAGE2_REF"\n'
+    )
+    script = """
+ORIG_ARGS=(--panel-domain panel.example.com --yes)
+PANEL_DOMAIN=panel.example.com ADMIN_ID=5 REF=v1.2.3 BOT_TOKEN=x
+handoff_stage2 fresh
+echo NOT-REACHED
+"""
+    res = _bash(script, root)
+    assert res.returncode == 0, res.stderr
+    assert "STAGE2 args=--stage2 --panel-domain panel.example.com --yes" in res.stdout
+    assert "mode=fresh domain=panel.example.com ref=v1.2.3" in res.stdout
+    assert "NOT-REACHED" not in res.stdout
+
+
+def test_new_flags_parse(tmp_path: Path) -> None:
+    root = make_root(tmp_path)
+    res = run(root, None, "--verify-tag", "--allow-downgrade", "--ref", "a" * 40)
+    assert res.returncode == 0, res.stderr
+
+
+def test_install_sh_uses_python_P_and_binary_only() -> None:
+    text = INSTALL.read_text()
+    assert "-P -m pip install --require-hashes --only-binary=:all:" in text
+    assert 'cd "$INSTALL_DIR" && "$VENV_PY" -P' in text
+    assert "-I -m" not in text

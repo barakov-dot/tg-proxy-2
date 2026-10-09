@@ -262,7 +262,7 @@ def test_update_success(installed: Ops) -> None:
         "pip_install_locked",
     ]
     assert t.head == "b" * 40
-    assert installed.fake.restart_count("tgpanel") == 1
+    assert installed.fake.systemctl_calls("stop", "tgpanel")  # stopped during the swap
     assert installed.fake.files["/var/lib/tgpanel/ref"].data == b"main\n"
     assert any("pre-update" in p for p in installed.fake.files)
 
@@ -425,3 +425,51 @@ def test_caddy_env_honours_environment_file(installed: Ops) -> None:
     env = asyncio.run(read_caddy_env(installed.fake, FAST))
     assert env["EXTRA_VAR"] == "from-file"
     assert env["TPROXY_HOSTNAME"] == "proxy.example.com"
+
+
+def test_update_stage2_failure_rolls_back_and_keeps_snapshot(installed: Ops) -> None:
+    installed.tools.post_update_rc = 1
+    installed.tools.post_update_output = "boom"
+    code, out = installed("update", "--ref", "main")
+    assert code == 1 and "этап 2 обновления завершился с кодом 1" in out
+    assert installed.tools.head == "a" * 40
+    assert installed.fake.restart_count("tgpanel") >= 1
+    assert any(p.endswith("-pre-update.db") for p in installed.fake.files)
+
+
+def test_update_refuses_downgrade_without_flag(installed: Ops) -> None:
+    installed.tools.ancestors.add(("b" * 40, "a" * 40))
+    code, out = installed("update", "--ref", "main")
+    assert code == 1 and "--allow-downgrade" in out
+    assert installed.tools.calls_of("git_checkout") == []
+    code, out = installed("update", "--ref", "main", "--allow-downgrade")
+    assert code == 0, out
+
+
+def test_update_verify_tag_needs_keys_and_signature(installed: Ops) -> None:
+    installed.tools.refs["v1.0.0"] = "e" * 40
+    code, out = installed("update", "--ref", "v1.0.0", "--verify-tag")
+    assert code == 1 and "trusted-signers пуст" in out
+    installed.fake.put_file(
+        "/opt/tgpanel/deploy/trusted-signers",
+        "-----BEGIN PGP PUBLIC KEY BLOCK-----\nxx\n-----END PGP PUBLIC KEY BLOCK-----\n",
+    )
+    installed.tools.tag_verified = False
+    code, out = installed("update", "--ref", "v1.0.0", "--verify-tag")
+    assert code == 1 and "подпись тега" in out and installed.tools.calls_of("git_checkout") == []
+    installed.tools.tag_verified = True
+    code, out = installed("update", "--ref", "v1.0.0", "--verify-tag")
+    assert code == 0, out
+    code, out = installed("update", "--ref", "main", "--verify-tag", "--force")
+    assert code == 1 and "только с тегами" in out
+
+
+def test_update_prints_full_installed_sha(installed: Ops) -> None:
+    _, out = installed("update", "--ref", "main")
+    assert "b" * 40 in out
+
+
+def test_doctor_warns_about_foreign_listener_on_pool_ports(installed: Ops) -> None:
+    installed.tools.listeners = [(2410, "nginx"), (2401, "mtproto-proxy"), (80, "caddy")]
+    _, out = installed("doctor")
+    assert "2410 (nginx)" in out and "2401" not in out.split("заняты посторонними")[1]

@@ -11,6 +11,7 @@ from fastapi import APIRouter, Depends, Request, Response
 from tgpanel.apply.errors import OperationRejected
 from tgpanel.web.deps import WebContext
 from tgpanel.web.routes.common import (
+    auth_of,
     client_ip,
     delete_cookie,
     fraw,
@@ -95,19 +96,31 @@ async def login_form(request: Request) -> Response:
     return await _login_page(request)
 
 
+async def _valid_session(request: Request, web: WebContext) -> bool:
+    session = get_signer(request).load_session(
+        request.cookies.get(SESSION_COOKIE), int(web.now().timestamp())
+    )
+    if session is None:
+        return False
+    cfg = await web.app.db.run(read_panel_auth)
+    return bool(cfg.password_hash) and cfg.login == session.login and cfg.version == session.version
+
+
 @router.post("/login")
 async def login_submit(request: Request) -> Response:
     web = get_web(request)
     signer = get_signer(request)
+    if await _valid_session(request, web):
+        return redirect(request, "/")  # an authenticated client is never throttled
     ip = client_ip(request, web)
-    global_wait = web.global_limiter.blocked_for()
-    if global_wait > 0:
-        return await _throttled(global_wait, request)
     wait = web.limiter.allow(ip)
     if wait > 0:
         if web.limiter.newly_blocked:
             await _audit_failure(request, web, ip, blocked=True)
         return await _throttled(wait, request)
+    delay = web.global_limiter.delay()
+    if delay > 0:
+        await web.sleep(delay)  # many failures overall: slow down, never lock anybody out
     form = await load_form(request)
     now_s = int(web.now().timestamp())
     if not signer.login_token_ok(
@@ -125,6 +138,10 @@ async def login_submit(request: Request) -> Response:
         await _audit_failure(request, web, ip, blocked=False)
         return await _login_page(request, 401, T["login_failed"])
     web.limiter.success(ip)
+    try:
+        await web.admin.rehash_if_needed(cfg.password_hash, password)
+    except OperationRejected:
+        log.warning("password rehash skipped: database busy")
     session = signer.make_session(cfg.login, cfg.version, now_s)
     response = redirect(request, "/")
     set_cookie(response, request, SESSION_COOKIE, signer.dump_session(session), SESSION_TTL_S)
@@ -135,6 +152,10 @@ async def login_submit(request: Request) -> Response:
 
 @router.post("/logout", dependencies=[Depends(require_auth)])
 async def logout(request: Request) -> Response:
+    """Delete this browser's cookie; other sessions end only if "all sessions" is ticked."""
+    form = await load_form(request)
+    if fstr(form, "all_sessions") == "1":
+        await get_web(request).admin.logout_all(auth_of(request).actor)
     response = redirect(request, "/login")
     delete_cookie(response, request, SESSION_COOKIE)
     return response

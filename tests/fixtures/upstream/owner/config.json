@@ -1,22 +1,9 @@
 {
-  "ListenAddr": "127.0.0.1:8080",
-  "AdminAddr": "127.0.0.1:8081",
-  "SiteRoot": "/srv/tproxy-site",
-  "BasePath": "/",
-  "TokenKeyFile": "/etc/tproxy-server/token.key",
-  "StaticRoutes": [
-    {
-      "path": "/robots.txt",
-      "file": "robots.txt"
-    },
-    {
-      "path": "/favicon.ico",
-      "file": "favicon.ico"
-    }
-  ],
-  "LogLevel": "info",
-  "ExperimentalFlags": {
-    "EarlyData": false,
-    "Retries": 3
-  }
+  "public_hostname": "proxy.example.com",
+  "base_path": "k3x9q2m7ab",
+  "listen": "127.0.0.1:8080",
+  "admin_listen": "127.0.0.1:8081",
+  "public_dir": "/srv/tproxy-site",
+  "static_routes": "exact",
+  "profiles_file": "/run/credentials/tproxy-server.service/profiles.json"
 }

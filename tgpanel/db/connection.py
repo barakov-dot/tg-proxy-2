@@ -70,15 +70,50 @@ def current_version(conn: sqlite3.Connection) -> int:
     return int(row["v"] or 0)
 
 
+class SchemaTooNewError(RuntimeError):
+    """The database was migrated by a newer version of tgpanel than this code."""
+
+
+def _statements(script: str) -> Iterator[str]:
+    """Split a migration script into complete SQL statements (triggers included)."""
+    buf = ""
+    for piece in script.split(";"):
+        buf += piece + ";"
+        if sqlite3.complete_statement(buf):
+            if buf.strip(" \n\t;"):
+                yield buf
+            buf = ""
+    if buf.strip(" \n\t;"):
+        yield buf
+
+
 def migrate(conn: sqlite3.Connection) -> int:
-    """Apply pending migrations, each atomically. Returns the resulting version."""
+    """Apply pending migrations, each atomically. Returns the resulting version.
+
+    The schema version is read INSIDE ``BEGIN IMMEDIATE``, so two processes starting at once
+    cannot both run the same migration. A database newer than this code is refused.
+    """
+    known = max((number for number, _ in MIGRATIONS), default=0)
     version = current_version(conn)
+    if version > known:
+        raise SchemaTooNewError(
+            f"База данных создана более новой версией tgpanel (схема {version}, "
+            f"эта версия знает схему {known}). Обновите код или восстановите базу из копии."
+        )
     for number, script in MIGRATIONS:
         if number <= version:
             continue
-        stmt = f"INSERT INTO schema_version (version) VALUES ({int(number)});"  # noqa: S608
+        conn.execute("BEGIN IMMEDIATE")
         try:
-            conn.executescript(f"BEGIN IMMEDIATE;\n{script}\n{stmt}\nCOMMIT;")
+            row = conn.execute("SELECT MAX(version) AS v FROM schema_version").fetchone()
+            if number <= int(row["v"] or 0):  # another process migrated while we waited
+                conn.execute("ROLLBACK")
+                version = max(version, number)
+                continue
+            for statement in _statements(script):
+                conn.execute(statement)
+            conn.execute("INSERT INTO schema_version (version) VALUES (?)", (int(number),))
+            conn.execute("COMMIT")
         except BaseException:
             if conn.in_transaction:
                 conn.execute("ROLLBACK")

@@ -35,7 +35,7 @@ def test_render_all_deterministic_and_complete() -> None:
     assert limits["new_bootstraps_burst"] == 2048 and limits["max_bootstraps_global"] == 2048
     assert limits["max_streams_global"] == 20000
     assert limits["max_pending_global"] == 536870912
-    assert json.loads(a.config_json)["TokenKeyFile"] == "/etc/tproxy-server/token.key"
+    assert json.loads(a.config_json)["public_dir"] == "/srv/tproxy-site"
 
 
 def test_pool_without_secrets_is_stopped() -> None:

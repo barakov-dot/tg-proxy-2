@@ -12,6 +12,8 @@ import asyncio
 import os
 import re
 import shutil
+import tempfile
+from collections.abc import Callable
 from typing import Any, Protocol
 
 from tgpanel.system.ops import SystemOpsError
@@ -58,8 +60,22 @@ class ShellTools(Protocol):
         """`pip install --require-hashes -r <lock_file>` with the venv interpreter."""
         ...
 
-    async def migrate_database(self, python: str, repo: str, db_path: str) -> str:
-        """Run DB migrations with the (new) code in ``repo``; returns the schema version text."""
+    async def git_is_ancestor(self, repo: str, ancestor: str, descendant: str) -> bool:
+        """`git merge-base --is-ancestor` (True also when both are equal)."""
+        ...
+
+    async def git_verify_tag(self, repo: str, tag: str, keys_file: str) -> tuple[bool, str]:
+        """Verify a signed tag with a throwaway GnuPG home holding only ``keys_file`` keys."""
+        ...
+
+    async def run_post_update(
+        self, python: str, repo: str, db_path: str, old: str, new: str
+    ) -> tuple[int, str]:
+        """Stage 2 of an update: NEW code in a NEW process. Returns (exit code, output)."""
+        ...
+
+    async def listening(self) -> list[tuple[int, str]]:
+        """(port, process name) of every listening TCP socket."""
         ...
 
     async def journal_tail(self, unit: str, lines: int) -> str:
@@ -147,6 +163,7 @@ class RealShellTools:
         res = await run_command(
             [
                 python,
+                "-P",
                 "-m",
                 "pip",
                 "install",
@@ -159,19 +176,79 @@ class RealShellTools:
             ],
             env={"HOME": "/root"},
             timeout_s=self._pip_timeout,
+            cwd=os.path.dirname(lock_file),
         )
         if not res.ok:
             raise SystemOpsError(f"pip install failed: {res.output}")
 
-    async def migrate_database(self, python: str, repo: str, db_path: str) -> str:
+    async def git_is_ancestor(self, repo: str, ancestor: str, descendant: str) -> bool:
+        for commit in (ancestor, descendant):
+            if not re.fullmatch(r"[0-9a-f]{40}", commit):
+                raise SystemOpsError("invalid commit id")
         res = await run_command(
-            [python, "-m", "tgpanel.ops_cli", "--db", db_path, "migrate"],
-            env={"HOME": "/root", "PYTHONPATH": repo},
+            ["git", "-C", repo, "merge-base", "--is-ancestor", ancestor, descendant],
+            env=_GIT_ENV,
             timeout_s=self._timeout,
         )
+        return res.ok
+
+    async def git_verify_tag(self, repo: str, tag: str, keys_file: str) -> tuple[bool, str]:
+        _check_ref(tag)
+        home = await asyncio.to_thread(tempfile.mkdtemp, prefix="tgpanel-gpg-")
+        try:
+            imp = await run_command(
+                ["gpg", "--batch", "--homedir", home, "--import", keys_file], timeout_s=60.0
+            )
+            if not imp.ok:
+                return False, f"не удалось загрузить доверенные ключи: {imp.output}"
+            res = await run_command(
+                ["git", "-C", repo, "verify-tag", tag],
+                env={**_GIT_ENV, "GNUPGHOME": home},
+                timeout_s=60.0,
+            )
+            return res.ok, res.output
+        finally:
+            await asyncio.to_thread(shutil.rmtree, home, True)
+
+    async def run_post_update(
+        self, python: str, repo: str, db_path: str, old: str, new: str
+    ) -> tuple[int, str]:
+        for commit in (old, new):
+            if not re.fullmatch(r"[0-9a-f]{40}", commit):
+                raise SystemOpsError("invalid commit id")
+        res = await run_command(
+            [
+                python,
+                "-P",
+                "-m",
+                "tgpanel.ops_cli",
+                f"--db={db_path}",
+                "post-update",
+                f"--from={old}",
+                f"--to={new}",
+            ],
+            env={"HOME": "/root", "PYTHONPATH": repo},
+            timeout_s=self._pip_timeout,
+            cwd=repo,
+        )
+        return (-1 if res.timed_out else res.returncode), res.output
+
+    async def listening(self) -> list[tuple[int, str]]:
+        res = await run_command(["ss", "-Hltnp"], timeout_s=30.0)
         if not res.ok:
-            raise SystemOpsError(f"migration failed: {res.output}")
-        return res.output
+            return []
+        out: list[tuple[int, str]] = []
+        for line in res.stdout.decode("utf-8", "replace").splitlines():
+            fields = line.split()
+            if len(fields) < 4:
+                continue
+            try:
+                port = int(fields[3].rsplit(":", 1)[1])
+            except (IndexError, ValueError):
+                continue
+            m = re.search(r'\(\("([^"]+)"', line)
+            out.append((port, m.group(1) if m else ""))
+        return out
 
     async def journal_tail(self, unit: str, lines: int) -> str:
         if not _UNIT_RE.fullmatch(unit) or unit.startswith("-"):
@@ -214,7 +291,12 @@ class FakeShellTools:
         self.free_bytes = 50 * 1024**3
         self.removed_trees: list[str] = []
         self.fail: dict[str, int] = {}  # method -> remaining failures
-        self.migrate_output = "schema version 1"
+        self.ancestors: set[tuple[str, str]] = set()  # (ancestor, descendant) pairs
+        self.tag_verified = True
+        self.post_update_rc = 0
+        self.post_update_output = "post-update ok"
+        self.post_update_hook: Callable[[], None] | None = None
+        self.listeners: list[tuple[int, str]] = []
         # (python, lock_file) -> side effect hook, e.g. to flip service health in tests
         self.on_checkout: list[str] = []
         self.latest_tag: str | None = None
@@ -268,9 +350,25 @@ class FakeShellTools:
     async def pip_install_locked(self, python: str, lock_file: str) -> None:
         self._enter("pip_install_locked", python, lock_file)
 
-    async def migrate_database(self, python: str, repo: str, db_path: str) -> str:
-        self._enter("migrate_database", python, repo, db_path)
-        return self.migrate_output
+    async def git_is_ancestor(self, repo: str, ancestor: str, descendant: str) -> bool:
+        self._enter("git_is_ancestor", repo, ancestor, descendant)
+        return ancestor == descendant or (ancestor, descendant) in self.ancestors
+
+    async def git_verify_tag(self, repo: str, tag: str, keys_file: str) -> tuple[bool, str]:
+        self._enter("git_verify_tag", repo, tag, keys_file)
+        return self.tag_verified, "fake verification"
+
+    async def run_post_update(
+        self, python: str, repo: str, db_path: str, old: str, new: str
+    ) -> tuple[int, str]:
+        self._enter("run_post_update", python, repo, db_path, old, new)
+        if self.post_update_hook is not None:
+            self.post_update_hook()
+        return self.post_update_rc, self.post_update_output
+
+    async def listening(self) -> list[tuple[int, str]]:
+        self._enter("listening")
+        return list(self.listeners)
 
     async def journal_tail(self, unit: str, lines: int) -> str:
         self._enter("journal_tail", unit, lines)

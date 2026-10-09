@@ -37,6 +37,7 @@ from tgpanel.system.ops import (
     HttpResult,
     LocalFile,
     LockHandle,
+    NftTableMissing,
     SetCounter,
     SystemOpsError,
 )
@@ -107,6 +108,7 @@ async def run_command(
     *,
     env: Mapping[str, str] | None = None,
     timeout_s: float = 30.0,
+    cwd: str | None = None,
 ) -> CommandResult:
     """Run an argument list (no shell) with a minimal environment and a timeout."""
     if not argv or any("\x00" in a for a in argv):
@@ -118,6 +120,7 @@ async def run_command(
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             env=minimal_env(env),
+            cwd=cwd,
             start_new_session=True,  # own process group: a timeout kills grandchildren too
         )
     except OSError as exc:
@@ -590,6 +593,11 @@ class RealSystemOps:
         if not res.ok:
             raise SystemOpsError(f"nft -f failed: {res.output}")
 
+    async def nft_check_file(self, path: str) -> CheckResult:
+        validate_path(path)
+        res = await run_command([self._nft, "-c", "-f", path], timeout_s=self._timeout)
+        return CheckResult(ok=res.ok, output=res.output)
+
     async def nft_list_set(self, table: str, set_name: str) -> dict[str, SetCounter]:
         validate_nft_ident(table, "table")
         validate_nft_ident(set_name, "set")
@@ -597,6 +605,8 @@ class RealSystemOps:
             [self._nft, "-j", "list", "set", "inet", table, set_name], timeout_s=self._timeout
         )
         if not res.ok:
+            if "No such file or directory" in res.output:
+                raise NftTableMissing(f"nft list set failed: {res.output}")
             raise SystemOpsError(f"nft list set failed: {res.output}")
         return parse_nft_set_json(res.stdout)
 

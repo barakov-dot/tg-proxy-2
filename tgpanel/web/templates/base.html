@@ -23,6 +23,7 @@
   </nav>
   <form method="post" action="{{ url('/logout') }}" class="inline">
     <input type="hidden" name="csrf_token" value="{{ csrf }}">
+    <label class="chk" title="{{ t.logout_hint }}"><input type="checkbox" name="all_sessions" value="1"> {{ t.logout_all_short }}</label>
     <button type="submit" class="link">{{ t.logout }} ({{ login }})</button>
   </form>
 </header>

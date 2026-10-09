@@ -37,7 +37,7 @@ from tgpanel.apply.backup import PRE_INSTALL, BackupError, scan_disk_backups
 from tgpanel.apply.config import ApplyConfig
 from tgpanel.apply.errors import OperationRejected
 from tgpanel.db import repo
-from tgpanel.db.connection import current_version, transaction
+from tgpanel.db.connection import SchemaTooNewError, current_version, transaction
 from tgpanel.doctor import (
     PANEL_PORT,
     DoctorEnv,
@@ -68,8 +68,6 @@ CLI_WRAPPER = "/usr/local/bin/tgpanel"
 DEFAULT_DB = "/var/lib/tgpanel/tgpanel.db"
 DEFAULT_REF = "main"
 PANEL_UNIT = "tgpanel"
-FIREWALL_UNIT = "tgpanel-firewall"
-REFRESH_PATH_UNIT = "tgpanel-mtproxy-refresh.path"
 POOL_TEMPLATE = "tgpanel-mtproxy@.service"
 BOOTSTRAP_PASSWORD_ENV = "TGPANEL_BOOTSTRAP_PASSWORD"  # noqa: S105 - variable name
 SETTING_LOGIN = "panel_login"
@@ -77,22 +75,11 @@ SETTING_PASSWORD_HASH = "panel_password_hash"  # noqa: S105 - setting name
 SETTING_SESSION_VERSION = "panel_session_version"
 SETTING_BOOTSTRAPPED = "install.bootstrapped"
 
-# deploy file (relative to the repository) -> (target path, mode)
-_STATIC_UNITS: tuple[tuple[str, str, int], ...] = (
-    ("deploy/tgpanel.service", "/etc/systemd/system/tgpanel.service", 0o644),
-    (
-        "deploy/tgpanel-mtproxy-refresh.path",
-        "/etc/systemd/system/tgpanel-mtproxy-refresh.path",
-        0o644,
-    ),
-    (
-        "deploy/tgpanel-mtproxy-refresh.service",
-        "/etc/systemd/system/tgpanel-mtproxy-refresh.service",
-        0o644,
-    ),
-    ("deploy/tgpanel-cli", CLI_WRAPPER, 0o755),
-)
-_FIREWALL_UNIT_PATH = "/etc/systemd/system/tgpanel-firewall.service"
+# Units shipped in deploy/ that we own: tgpanel*.service|path|timer|socket (never the pool
+# template tgpanel-mtproxy@.service, which the apply pipeline renders). The firewall unit is
+# rendered from code, the CLI wrapper is deploy/tgpanel-cli.
+_OWNED_UNIT_RE = re.compile(r"^tgpanel[A-Za-z0-9._-]*\.(service|path|timer|socket)$")
+FIREWALL_UNIT_NAME = "tgpanel-firewall.service"
 _REF_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/@+-]{0,99}$")
 
 
@@ -238,19 +225,45 @@ async def remove_caddy_block(rt: Runtime) -> CaddyOutcome:
 
 
 async def desired_static_files(rt: Runtime) -> dict[str, tuple[bytes, int]]:
-    """Unit files and the CLI wrapper: path -> (content, mode). Raises SystemOpsError."""
+    """Unit files and the CLI wrapper of THIS tree: path -> (content, mode)."""
+    ops = rt.ops
+    sysd = rt.config.paths.systemd_dir
+    deploy = f"{rt.install_dir}/deploy"
     files: dict[str, tuple[bytes, int]] = {}
-    for rel, target, mode in _STATIC_UNITS:
-        files[target] = (await rt.ops.read_file(f"{rt.install_dir}/{rel}"), mode)
-    files[_FIREWALL_UNIT_PATH] = (render_firewall_unit(), 0o644)
+    for name in sorted(await ops.list_dir(deploy)):
+        if _OWNED_UNIT_RE.match(name) and "@" not in name and name != FIREWALL_UNIT_NAME:
+            files[f"{sysd}/{name}"] = (await ops.read_file(f"{deploy}/{name}"), 0o644)
+    if f"{sysd}/tgpanel.service" not in files:
+        raise SystemOpsError("в deploy нет tgpanel.service")
+    files[f"{sysd}/{FIREWALL_UNIT_NAME}"] = (render_firewall_unit(), 0o644)
+    files[CLI_WRAPPER] = (await ops.read_file(f"{deploy}/tgpanel-cli"), 0o755)
     return files
 
 
+async def _obsolete_units(rt: Runtime, wanted: dict[str, tuple[bytes, int]]) -> list[str]:
+    """Our unit files in /etc/systemd/system that the new tree no longer ships."""
+    sysd = rt.config.paths.systemd_dir
+    try:
+        names = await rt.ops.list_dir(sysd)
+    except SystemOpsError:
+        return []
+    return [
+        f"{sysd}/{n}"
+        for n in sorted(names)
+        if _OWNED_UNIT_RE.match(n) and "@" not in n and f"{sysd}/{n}" not in wanted
+    ]
+
+
 async def sync_static_files(rt: Runtime) -> list[str]:
-    """Write changed unit files; on any failure restore the previous ones. Returns changed paths."""
+    """Write changed unit files and remove obsolete ones of ours; restore all on failure.
+
+    Returns the changed paths. daemon-reload runs when a unit file changed.
+    """
     ops = rt.ops
     wanted = await desired_static_files(rt)
+    sysd = rt.config.paths.systemd_dir
     changed: list[tuple[str, bytes | None]] = []
+    removed: list[tuple[str, bytes]] = []
     try:
         for target, (data, mode) in wanted.items():
             try:
@@ -261,7 +274,13 @@ async def sync_static_files(rt: Runtime) -> list[str]:
                 continue
             await ops.write_atomic(target, data, mode=mode, owner="root", group="root")
             changed.append((target, current))
-        if any(t.startswith("/etc/systemd/system/") for t, _ in changed):
+        for target in await _obsolete_units(rt, wanted):
+            old = await ops.read_file(target)
+            with contextlib.suppress(SystemOpsError):
+                await ops.systemctl("disable-now", target.rsplit("/", 1)[-1])
+            await ops.remove(target)
+            removed.append((target, old))
+        if any(t.startswith(sysd + "/") for t, _ in changed) or removed:
             await ops.systemctl("daemon-reload", "")
     except SystemOpsError:
         for target, previous in reversed(changed):
@@ -271,17 +290,26 @@ async def sync_static_files(rt: Runtime) -> list[str]:
                 else:
                     mode = wanted[target][1]
                     await ops.write_atomic(target, previous, mode=mode, owner="root", group="root")
+        for target, previous in removed:
+            with contextlib.suppress(SystemOpsError):
+                await ops.write_atomic(target, previous, mode=0o644, owner="root", group="root")
         with contextlib.suppress(SystemOpsError):
             await ops.systemctl("daemon-reload", "")
         raise
-    return [t for t, _ in changed]
+    return [t for t, _ in changed] + [t for t, _ in removed]
 
 
 async def enable_static_units(rt: Runtime) -> None:
+    """Enable every shipped unit that has an [Install] section (paths/timers also start)."""
     ops = rt.ops
-    await ops.systemctl("enable", FIREWALL_UNIT)
-    await ops.systemctl("enable", PANEL_UNIT)
-    await ops.systemctl("enable-now", REFRESH_PATH_UNIT)
+    for target, (data, _mode) in (await desired_static_files(rt)).items():
+        name = target.rsplit("/", 1)[-1]
+        if not _OWNED_UNIT_RE.match(name) or b"[Install]" not in data:
+            continue
+        if name.endswith((".path", ".timer")):
+            await ops.systemctl("enable-now", name)
+        else:
+            await ops.systemctl("enable", name)
 
 
 # -------------------------------------------------------------------------- commands
@@ -394,7 +422,68 @@ async def _panel_healthy(rt: Runtime) -> bool:
         return False
 
 
+_TAG_RE = re.compile(r"^v\d+\.\d+\.\d+")
+
+
+def _db_schema_version(path: str) -> int:
+    """Schema version of a database file, read with a plain connection (0 if unreadable)."""
+    import sqlite3
+
+    try:
+        conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    except sqlite3.Error:
+        return 0
+    try:
+        row = conn.execute("SELECT MAX(version) FROM schema_version").fetchone()
+        return int(row[0] or 0)
+    except sqlite3.Error:
+        return 0
+    finally:
+        conn.close()
+
+
+async def _restore_db_snapshot(rt: Runtime, snapshot: str) -> bool:
+    """Put the pre-update database back (sqlite backup API into the live connection)."""
+    import sqlite3
+
+    tmp_dir = backup_mod.make_temp_dir()
+
+    def restore(conn: sqlite3.Connection, local: str) -> None:
+        src = sqlite3.connect(local)
+        try:
+            src.backup(conn)
+        finally:
+            src.close()
+
+    try:
+        local = tmp_dir / "restore.db"
+        await asyncio.to_thread(local.write_bytes, await rt.ops.read_file(snapshot))
+        await rt.ctx.db.run(restore, str(local))
+    except (sqlite3.Error, SystemOpsError, OSError):
+        return False
+    finally:
+        backup_mod.remove_temp_dir(tmp_dir)
+    return True
+
+
+async def _verify_requested_tag(rt: Runtime, ref: str) -> str | None:
+    """Opt-in signature check of a tag against deploy/trusted-signers; error text or None."""
+    if not _TAG_RE.match(ref):
+        return "--verify-tag работает только с тегами вида vX.Y.Z"
+    keys = f"{rt.install_dir}/deploy/trusted-signers"
+    try:
+        text = (await rt.ops.read_file(keys)).decode("utf-8", "replace")
+    except SystemOpsError:
+        text = ""
+    if "BEGIN PGP PUBLIC KEY BLOCK" not in text:
+        return "файл deploy/trusted-signers пуст: нет ключей для проверки подписи тега"
+    ok, detail = await rt.tools.git_verify_tag(rt.install_dir, ref, keys)
+    return None if ok else f"подпись тега {ref} не подтверждена: {_clean(detail)}"
+
+
 async def cmd_update(rt: Runtime, args: argparse.Namespace) -> int:
+    """Stage 1 (OLD code): resolve, back up, stop, check out + install the new code, then hand
+    over to a NEW interpreter (``post-update``). Any failure rolls everything back."""
     ops, tools = rt.ops, rt.tools
     requested = args.ref or await _read_state_ref(rt)
     if requested != AUTO_REF and (not _REF_RE.fullmatch(requested) or ".." in requested):
@@ -409,42 +498,92 @@ async def cmd_update(rt: Runtime, args: argparse.Namespace) -> int:
         rt.say(f"Не удалось получить обновление: {_clean(str(exc))}")
         return EXIT_ERROR
     if target == previous and not args.force:
-        rt.say(f"Уже установлена версия {previous[:10]} ({ref}); обновлять нечего.")
+        rt.say(f"Уже установлена версия {previous} ({ref}); обновлять нечего.")
         return EXIT_OK
-    rt.say(f"Обновление {previous[:10]} → {target[:10]} ({ref})")
+    try:
+        downgrade = target != previous and await tools.git_is_ancestor(
+            rt.install_dir, target, previous
+        )
+    except SystemOpsError:
+        downgrade = False
+    if downgrade and not args.allow_downgrade:
+        rt.say(
+            f"Версия {ref} ({target[:10]}) старше установленной ({previous[:10]}): откат версии "
+            "может сломать схему базы. Если это нужно, добавьте --allow-downgrade."
+        )
+        return EXIT_ERROR
+    if args.verify_tag or os.environ.get("TGPANEL_VERIFY_TAG") == "1":
+        problem = await _verify_requested_tag(rt, ref)
+        if problem:
+            rt.say(f"Обновление остановлено: {problem}")
+            return EXIT_ERROR
+        rt.say(f"Подпись тега {ref} подтверждена.")
+    rt.say(f"Обновление {previous[:10]} → {target} ({ref})")
+
+    # --- backups: archive + a plain database snapshot (restored if the schema moves forward)
     try:
         info = await rt.ctx.pipeline.create_backup("pre-update", ACTOR)
         rt.say(f"Резервная копия: {info.path}")
     except BackupError as exc:
         rt.say(f"Резервная копия не создана, обновление остановлено: {exc}")
         return EXIT_ERROR
+    stamp = rt.clock().strftime("%Y%m%dT%H%M%SZ")
+    snapshot = f"{rt.config.paths.backups_dir}/{stamp}-pre-update.db"
+    tmp_dir = backup_mod.make_temp_dir()
+    try:
+        local = tmp_dir / "snapshot.db"
+        await asyncio.to_thread(rt.ctx.db.snapshot_to, local)
+        await ops.write_atomic(
+            snapshot,
+            await asyncio.to_thread(local.read_bytes),
+            mode=0o600,
+            owner="root",
+            group="root",
+        )
+    except Exception as exc:
+        rt.say(f"Снимок базы данных не создан, обновление остановлено: {_clean(str(exc))}")
+        return EXIT_ERROR
+    finally:
+        backup_mod.remove_temp_dir(tmp_dir)
+    schema_before = await rt.ctx.db.run(current_version)
+
+    # --- no mutating operations while the code is swapped
+    with contextlib.suppress(SystemOpsError):
+        await ops.systemctl("stop", PANEL_UNIT)
 
     async def roll_back(reason: str) -> int:
         rt.say(f"Ошибка: {reason}. Возвращаю версию {previous[:10]}…")
         try:
             await _switch_code(rt, previous)
+            if _db_schema_version(rt.db_path) > schema_before:
+                restored = await _restore_db_snapshot(rt, snapshot)
+                rt.say(
+                    "База данных возвращена к состоянию до обновления."
+                    if restored
+                    else f"НЕ УДАЛОСЬ вернуть базу данных; снимок: {snapshot}"
+                )
+            await sync_static_files(rt)
+            await enable_static_units(rt)
             await ops.systemctl("restart", PANEL_UNIT)
             if await _panel_healthy(rt):
-                rt.say(
-                    "Предыдущая версия запущена. Схема БД могла уйти вперёд: "
-                    "резервная копия сделана перед обновлением."
-                )
+                rt.say("Предыдущая версия запущена.")
             else:
                 rt.say("Предыдущая версия возвращена, но панель не отвечает: tgpanel doctor.")
         except SystemOpsError as exc:
-            rt.say(f"Откат не удался: {_clean(str(exc))}")
+            rt.say(f"Откат не удался: {_clean(str(exc))}; снимок базы: {snapshot}")
         return EXIT_ERROR
 
     try:
         await _switch_code(rt, target)
-        await rt.tools.migrate_database(rt.venv_python, rt.install_dir, rt.db_path)
-        changed = await sync_static_files(rt)
-        await enable_static_units(rt)
-        if changed:
-            rt.say("Обновлены файлы: " + ", ".join(p.rsplit("/", 1)[-1] for p in changed))
-        await ops.systemctl("restart", PANEL_UNIT)
+        rc, output = await tools.run_post_update(
+            rt.venv_python, rt.install_dir, rt.db_path, previous, target
+        )
     except SystemOpsError as exc:
         return await roll_back(_clean(str(exc)))
+    if output.strip():
+        rt.say(output.strip())
+    if rc != 0:
+        return await roll_back(f"этап 2 обновления завершился с кодом {rc}")
     if not await _panel_healthy(rt):
         return await roll_back("панель не запустилась после обновления")
     with contextlib.suppress(SystemOpsError):
@@ -455,7 +594,54 @@ async def cmd_update(rt: Runtime, args: argparse.Namespace) -> int:
             owner="root",
             group="root",
         )
-    rt.say("Обновление выполнено, панель работает.")
+        await ops.remove(snapshot)
+    rt.say(f"Обновление выполнено, панель работает. Установлена версия {target}.")
+    return EXIT_OK
+
+
+async def cmd_post_update(rt: Runtime, args: argparse.Namespace) -> int:
+    """Stage 2 (NEW code, new process): migrations ran when the database was opened; now units,
+    the apply and the panel restart. Non-zero makes stage 1 roll back."""
+    ops = rt.ops
+    version = await rt.ctx.db.run(current_version)
+    rt.say(f"Этап 2: новый код {args.new[:10]}, схема БД {version}")
+    try:
+        changed = await sync_static_files(rt)
+        await enable_static_units(rt)
+    except SystemOpsError as exc:
+        rt.say(f"Юниты не обновлены: {_clean(str(exc))}")
+        return EXIT_ERROR
+    if changed:
+        rt.say("Обновлены файлы: " + ", ".join(p.rsplit("/", 1)[-1] for p in changed))
+    outcome = await rt.ctx.pipeline.apply_now("update", ACTOR)
+    if outcome.status in ("needs_adoption", "external_change"):
+        rt.say(f"Применение отложено (не ошибка обновления): {outcome.error}")
+    elif not outcome.ok:
+        rt.say(f"Применение после обновления не удалось: {outcome.error}")
+        return EXIT_ERROR
+    try:
+        await ops.systemctl("restart", PANEL_UNIT)
+    except SystemOpsError as exc:
+        rt.say(f"Панель не запустилась: {_clean(str(exc))}")
+        return EXIT_ERROR
+    if not await _panel_healthy(rt):
+        rt.say("Панель не открыла порт 8090 после перезапуска.")
+        return EXIT_ERROR
+    return EXIT_OK
+
+
+async def cmd_install_units(rt: Runtime, args: argparse.Namespace) -> int:
+    """Internal (install.sh stage 2): unit files + CLI wrapper + enable."""
+    try:
+        changed = await sync_static_files(rt)
+        await enable_static_units(rt)
+    except SystemOpsError as exc:
+        rt.say(f"Юниты не установлены: {_clean(str(exc))}")
+        return EXIT_ERROR
+    rt.say(
+        "Юниты установлены: "
+        + (", ".join(p.rsplit("/", 1)[-1] for p in changed) or "без изменений")
+    )
     return EXIT_OK
 
 
@@ -563,7 +749,10 @@ async def cmd_uninstall(rt: Runtime, args: argparse.Namespace) -> int:
                 problems.append(f"{tree}: {_clean(str(exc))}")
         with contextlib.suppress(SystemOpsError):
             await ops.remove(CLI_WRAPPER)
-        rt.say(f"Данные удалены. Резервные копии остались в {paths.backups_dir}.")
+        rt.say(
+            f"Данные удалены. Резервные копии остались в {paths.backups_dir}: в них есть секреты "
+            "пользователей и токен бота (архивы 0600). Удалите их вручную, если они не нужны."
+        )
     else:
         rt.say(
             f"Данные сохранены: база {DEFAULT_DB}, настройки {paths.tgpanel_dir}, резервные копии."
@@ -846,19 +1035,21 @@ async def _remove_our_components(rt: Runtime) -> list[str]:
     for pool_id in sorted(pool_ids):
         await attempt(f"пул {pool_id}", ops.systemctl("disable-now", cfg.pool_unit_name(pool_id)))
         await attempt(f"env пула {pool_id}", ops.remove(paths.pool_env(pool_id)))
-    for unit in (REFRESH_PATH_UNIT, "tgpanel-mtproxy-refresh.service", FIREWALL_UNIT, PANEL_UNIT):
+    owned: list[str] = []
+    with contextlib.suppress(SystemOpsError):
+        owned = [
+            n
+            for n in await ops.list_dir(paths.systemd_dir)
+            if _OWNED_UNIT_RE.match(n) and "@" not in n
+        ]
+    for name in owned:
         with contextlib.suppress(SystemOpsError):
-            await ops.systemctl("disable-now", unit)
+            await ops.systemctl("disable-now", name)
     await attempt("таблица nft", ops.nft_delete_table("tgpanel"))
-    for path in (
-        paths.nft_file,
-        paths.pool_unit,
-        _FIREWALL_UNIT_PATH,
-        "/etc/systemd/system/tgpanel.service",
-        "/etc/systemd/system/tgpanel-mtproxy-refresh.path",
-        "/etc/systemd/system/tgpanel-mtproxy-refresh.service",
-    ):
+    for path in (paths.nft_file, paths.pool_unit):
         await attempt(path, ops.remove(path))
+    for name in owned:
+        await attempt(name, ops.remove(f"{paths.systemd_dir}/{name}"))
     await attempt("daemon-reload", ops.systemctl("daemon-reload", ""))
     rt.say(f"Удалены пулы ({len(pool_ids)}), юниты tgpanel, таблица nft.")
     return problems
@@ -1047,8 +1238,17 @@ _HANDLERS: dict[str, _Handler] = {
     "bootstrap": cmd_bootstrap,
     "pre-install-backup": cmd_pre_install_backup,
     "migrate": cmd_migrate,
+    "post-update": cmd_post_update,
+    "install-units": cmd_install_units,
 }
-INTERNAL_COMMANDS = ("caddy-install", "bootstrap", "pre-install-backup", "migrate")
+INTERNAL_COMMANDS = (
+    "caddy-install",
+    "bootstrap",
+    "pre-install-backup",
+    "migrate",
+    "post-update",
+    "install-units",
+)
 
 
 def add_commands(sub: Any) -> None:
@@ -1057,6 +1257,14 @@ def add_commands(sub: Any) -> None:
     p = sub.add_parser("update", help="обновить tgpanel до ветки, тега или коммита")
     p.add_argument("--ref", help="ветка, тег или коммит (по умолчанию как при установке)")
     p.add_argument("--force", action="store_true", help="переустановить, даже если версия та же")
+    p.add_argument(
+        "--allow-downgrade", action="store_true", help="разрешить установку более старой версии"
+    )
+    p.add_argument(
+        "--verify-tag",
+        action="store_true",
+        help="проверить подпись тега по deploy/trusted-signers (или TGPANEL_VERIFY_TAG=1)",
+    )
     p = sub.add_parser("uninstall", help="убрать tgpanel и вернуть прокси к состоянию pre-install")
     p.add_argument("--purge", action="store_true", help="удалить также данные и настройки")
     p.add_argument("--yes", action="store_true", help="не спрашивать подтверждение")
@@ -1074,6 +1282,10 @@ def add_commands(sub: Any) -> None:
     p.add_argument("--admin-id", default="")
     sub.add_parser("pre-install-backup", help=argparse.SUPPRESS)
     sub.add_parser("migrate", help=argparse.SUPPRESS)
+    sub.add_parser("install-units", help=argparse.SUPPRESS)
+    p = sub.add_parser("post-update", help=argparse.SUPPRESS)
+    p.add_argument("--from", dest="old", default="")
+    p.add_argument("--to", dest="new", default="")
 
 
 def _runner(
@@ -1083,13 +1295,19 @@ def _runner(
     sleep: Callable[[float], Awaitable[None]],
     clock: Callable[[], datetime],
     monotonic: Callable[[], float],
+    install_dir: str,
 ) -> Callable[..., int]:
     def run(
         args: argparse.Namespace,
         out: TextIO | None = None,
         input_fn: Callable[[str], str] = input,
     ) -> int:
-        ctx = ctx_factory()
+        out_stream = out or sys.stdout
+        try:
+            ctx = ctx_factory()
+        except SchemaTooNewError as exc:
+            print(str(exc), file=out_stream)
+            return EXIT_USAGE
         db_path = getattr(args, "db", None) or os.environ.get("TGPANEL_DB") or DEFAULT_DB
         rt = Runtime(
             ctx=ctx,
@@ -1100,6 +1318,7 @@ def _runner(
             sleep=sleep,
             clock=clock,
             monotonic=monotonic,
+            install_dir=install_dir,
         )
         try:
             return asyncio.run(_run_handler(name, rt, args))
@@ -1128,13 +1347,16 @@ def register(
     sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
     clock: Callable[[], datetime] = lambda: datetime.now(UTC),
     monotonic: Callable[[], float] = time.monotonic,
+    install_dir: str = INSTALL_DIR,
 ) -> None:
     """Add the subcommands; each parser gets ``ops_run(args, out, input_fn) -> exit code``."""
     add_commands(subparsers)
     for name, parser in subparsers.choices.items():
         if name in _HANDLERS and (include_internal or name not in INTERNAL_COMMANDS):
             parser.set_defaults(
-                ops_run=_runner(name, ctx_factory, tools_factory, sleep, clock, monotonic)
+                ops_run=_runner(
+                    name, ctx_factory, tools_factory, sleep, clock, monotonic, install_dir
+                )
             )
 
 
@@ -1149,6 +1371,7 @@ def main(
     sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
     clock: Callable[[], datetime] = lambda: datetime.now(UTC),
     monotonic: Callable[[], float] = time.monotonic,
+    install_dir: str = INSTALL_DIR,
 ) -> int:
     from tgpanel.services.container import build_context
 
@@ -1174,6 +1397,7 @@ def main(
         sleep=sleep,
         clock=clock,
         monotonic=monotonic,
+        install_dir=install_dir,
     )
     args = parser.parse_args(argv)
     args.db = db_path

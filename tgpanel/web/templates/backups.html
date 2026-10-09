@@ -6,10 +6,12 @@
 <table><thead><tr><th>#</th><th>{{ t.col_time }}</th><th>{{ t.col_reason }}</th><th>{{ t.backup_size }}</th><th></th></tr></thead><tbody>
 {% for b in items %}
 <tr><td>{{ b.id }}</td><td>{{ fmt(b.created_at) }}</td><td>{{ b.reason }}</td><td>{{ human_bytes(b.size) }}</td>
-<td><a href="{{ url('/backups/' ~ b.id ~ '/download') }}">{{ t.download }}</a>
+<td><form method="post" action="{{ url('/backups/' ~ b.id ~ '/download') }}" class="inline"><input type="hidden" name="csrf_token" value="{{ csrf }}">
+<input type="password" name="password" placeholder="{{ t.password_reenter }}" autocomplete="current-password" required class="short"> <button type="submit">{{ t.download }}</button></form>
 <form method="post" action="{{ url('/backups/' ~ b.id ~ '/restore') }}" class="inline"><input type="hidden" name="csrf_token" value="{{ csrf }}">
-<input name="confirm" placeholder="{{ t.restore_word }}" autocomplete="off" class="short"> <button type="submit" class="danger">{{ t.restore }}</button></form></td></tr>
+<input type="password" name="password" placeholder="{{ t.password_reenter }}" autocomplete="current-password" required class="short"> <input name="confirm" placeholder="{{ t.restore_word }}" autocomplete="off" class="short"> <button type="submit" class="danger">{{ t.restore }}</button></form></td></tr>
 {% else %}<tr><td colspan="5">{{ t.no_data }}</td></tr>{% endfor %}
 </tbody></table>
 <p class="hint">{{ t.restore_hint }}</p>
+<p class="hint">{{ t.download_hint }}</p>
 {% endblock %}

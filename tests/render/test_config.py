@@ -24,13 +24,24 @@ def test_only_limits_change_and_unknown_keys_survive() -> None:
     for key in before:
         if key != "limits":
             assert before[key] == after[key]
-    for key in ("BasePath", "TokenKeyFile", "StaticRoutes"):
+    for key in ("public_hostname", "base_path", "profiles_file", "static_routes"):
         assert key in after
     lim = after["limits"]
     assert lim["max_profiles"] == 64 and lim["max_sessions_global"] == 1024
     assert lim["brand_new"] == 5
     assert lim["max_pending_global"] == before["limits"]["max_pending_global"]  # untouched
     assert list(lim)[: len(before["limits"])] == list(before["limits"])
+
+
+def test_unknown_top_level_and_limit_keys_survive() -> None:
+    doc = json.loads(fixture_bytes("clean", "config.json"))
+    doc["some_future_key"] = {"nested": [1, 2, 3]}
+    doc["limits"]["some_future_limit"] = 7
+    raw = (json.dumps(doc, indent=2) + "\n").encode()
+    after = json.loads(patch_config(raw, {"max_profiles": 48}))
+    assert after["some_future_key"] == {"nested": [1, 2, 3]}
+    assert after["limits"]["some_future_limit"] == 7
+    assert after["limits"]["max_profiles"] == 48
 
 
 def test_limits_created_when_absent() -> None:

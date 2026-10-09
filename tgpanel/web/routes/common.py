@@ -14,6 +14,7 @@ from fastapi.responses import RedirectResponse
 from starlette.datastructures import FormData, UploadFile
 from starlette.templating import Jinja2Templates
 
+from tgpanel.apply.errors import OperationRejected
 from tgpanel.db import repo
 from tgpanel.system.validation import scrub
 from tgpanel.web.deps import WebContext
@@ -160,6 +161,32 @@ def read_panel_auth(conn: Any) -> PanelAuthConfig:
     raw = repo.get_setting(conn, KEY_VERSION, "1") or "1"
     version = int(raw) if raw.isascii() and raw.isdigit() else 1
     return PanelAuthConfig(login, pw_hash, version)
+
+
+async def check_password(request: Request, scope: str, password: str) -> str | None:
+    """Re-authentication for dangerous actions. None = confirmed, else a Russian error text.
+
+    Failures are rate limited per client exactly like logins (separate counter per ``scope``).
+    """
+    web = get_web(request)
+    key = f"{scope}:{client_ip(request, web)}"
+    wait = web.limiter.allow(key)
+    if wait > 0:
+        return T["login_throttled"].format(seconds=int(wait) + 1)
+    cfg = await web.app.db.run(read_panel_auth)
+    ok = (
+        bool(cfg.password_hash)
+        and len(password) <= 1024
+        and await web.admin.verify(cfg.password_hash, password)
+    )
+    if ok:
+        web.limiter.success(key)
+        return None
+    try:
+        await web.admin.audit(f"web:{cfg.login}", "web.reauth_failed", scope)
+    except OperationRejected:
+        pass
+    return T["password_wrong"]
 
 
 async def load_form(request: Request) -> FormData:

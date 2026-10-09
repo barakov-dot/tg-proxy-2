@@ -52,6 +52,11 @@ def control_reserve(streams_per_session: int) -> tuple[int, int]:
     return items * (_QUEUE_ITEM_COST + _FRAME_HEADER_SIZE + 4), items
 
 
+def required_pending_bytes(sessions: int, streams_per_session: int = 128) -> int:
+    """max_pending_global the relay needs for ``sessions`` (control reserve plus data headroom)."""
+    return _DATA_HEADROOM * control_reserve(streams_per_session)[0] * sessions
+
+
 def compute_relay_limits(
     state: DesiredState,
     profile_count: int,

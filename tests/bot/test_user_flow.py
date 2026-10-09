@@ -84,6 +84,7 @@ async def test_reject_notifies_user(env: Env) -> None:
 
 async def test_open_mode_prepares_then_sends_link(env: Env) -> None:
     env.set_setting("issuance_mode", "open")
+    env.set_setting("open_mode_batch_window_s", "0")
     await env.tg.press(USER, "req")
     texts = env.session.texts(USER)
     assert "Готовим" in texts[0]
@@ -95,6 +96,7 @@ async def test_open_mode_prepares_then_sends_link(env: Env) -> None:
 
 async def test_failed_apply_no_link_and_admin_notified(env: Env) -> None:
     env.set_setting("issuance_mode", "open")
+    env.set_setting("open_mode_batch_window_s", "0")
     _break_apply(env)
     await env.tg.press(USER, "req")
     assert not env.session.photos(USER)

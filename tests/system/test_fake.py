@@ -199,7 +199,9 @@ async def test_tproxy_check_limits_modes_and_defaults() -> None:
     put_cfg(f, {"profiles": [good_profile()]}, mode=0o644)
     assert "mode" in (await check(f))[1]
     put_cfg(f, {"profiles": [good_profile()]}, mode=0o640)
-    assert (await check(f))[0]  # group read (systemd credential) is allowed
+    assert "mode" in (await check(f))[1]  # verified on the real binary: group read is refused too
+    put_cfg(f, {"profiles": [good_profile()]}, mode=0o600)
+    assert (await check(f))[0]
     put_cfg(f, {"profiles": [good_profile()]}, mode=0o660)
     assert "mode" in (await check(f))[1]
     put_cfg(f, {"profiles": [good_profile()]}, mode=0o404)

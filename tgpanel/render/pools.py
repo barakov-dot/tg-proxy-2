@@ -292,12 +292,19 @@ def render_pool_unit(facts: MtproxyFacts) -> bytes:
         "# Managed by tgpanel. Do not edit: regenerated on every apply.\n"
         "[Unit]\n"
         "Description=Telegram MTProxy pool %i (tgpanel)\n"
-        # the port guard (tgpanel-firewall) must be loaded before a pool port is opened
+        # the port guard (tgpanel-firewall) must be loaded before a pool port is opened, and a
+        # pool must never run without it: Requires= (not Wants=) plus After=
         "After=network-online.target tgpanel-firewall.service\n"
-        "Wants=network-online.target tgpanel-firewall.service\n"
+        "Wants=network-online.target\n"
+        "Requires=tgpanel-firewall.service\n"
         "\n"
         "[Service]\n"
         "Type=simple\n"
+        # Runs unprivileged from the start (ports are 2400+, no privileged bind needed); -u stays
+        # in ExecStart as in the upstream unit. [ПРОВЕРИТЬ НА СЕРВЕРЕ]: mtproto-proxy accepts -u
+        # for the user it already runs as; a failure shows in `journalctl -u tgpanel-mtproxy@N`.
+        f"User={facts.user}\n"
+        f"Group={facts.user}\n"
         f"{workdir_line}"
         "EnvironmentFile=/etc/tgpanel/mtproxy/%i.env\n"
         # $VAR (unbraced) is word-split by systemd; ${VAR} is not. The secret and NAT
@@ -306,8 +313,8 @@ def render_pool_unit(facts: MtproxyFacts) -> bytes:
         "$MTP_SECRET_ARGS $MTP_NAT_ARGS "
         f"--aes-pwd {facts.aes_pwd} {facts.proxy_multi_conf} "
         "-M ${MTP_WORKERS} -C ${MTP_MAX_CONNECTIONS}\n"
-        "Restart=always\n"
-        "RestartSec=3\n"
+        "Restart=on-failure\n"
+        "RestartSec=3s\n"
         "NoNewPrivileges=true\n"
         "ProtectSystem=strict\n"
         "ProtectHome=true\n"
@@ -318,6 +325,14 @@ def render_pool_unit(facts: MtproxyFacts) -> bytes:
         "ProtectControlGroups=true\n"
         "RestrictSUIDSGID=true\n"
         "LockPersonality=true\n"
+        "ProtectProc=invisible\n"
+        "ProcSubset=pid\n"
+        "ReadOnlyPaths=/etc/mtproxy /etc/tgpanel/mtproxy\n"
+        "RestrictAddressFamilies=AF_INET AF_INET6\n"
+        "RestrictNamespaces=true\n"
+        "RestrictRealtime=true\n"
+        "CapabilityBoundingSet=\n"
+        # MemoryDenyWriteExecute is deliberately NOT set: not verified against mtproto-proxy
         "LimitNOFILE=1048576\n"
         "\n"
         "[Install]\n"

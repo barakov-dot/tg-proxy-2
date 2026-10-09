@@ -255,6 +255,50 @@ def configure_logging(secrets_to_mask: Iterable[str] = (), stream: Any = None) -
     return scrub_filter
 
 
+# ------------------------------------------------------------------------------ bot token
+
+
+def read_env_file_token(path: str) -> str | None:
+    """``TGPANEL_BOT_TOKEN`` from the env file, if it holds a well-formed token."""
+    try:
+        text = Path(path).read_text(encoding="utf-8")
+    except OSError:
+        return None
+    found: str | None = None
+    for line in text.splitlines():
+        key, sep, value = line.partition("=")
+        if sep and key.strip() == "TGPANEL_BOT_TOKEN":
+            found = value.strip().strip("\"'")
+    if found is not None and BOT_TOKEN_RE.fullmatch(found):
+        return found
+    return None
+
+
+def resolve_bot_token(env: AppEnv) -> str | None:
+    """The env FILE wins over the process environment (the panel rewrites the file; the
+    process environment is frozen at service start). Read at every bot (re)start."""
+    return read_env_file_token(env.env_file) or (env.bot_token if env.bot_token_valid else None)
+
+
+class BotControl:
+    """Lets the panel restart ONLY the bot task (the supervisor keeps everything else running)."""
+
+    def __init__(self) -> None:
+        self.running = False
+        self._restart = asyncio.Event()
+
+    async def restart(self) -> bool:
+        """True if a running bot task will restart (and re-read the token)."""
+        if not self.running:
+            return False
+        self._restart.set()
+        return True
+
+    @property
+    def restart_event(self) -> asyncio.Event:
+        return self._restart
+
+
 # ---------------------------------------------------------------------------------- supervisor
 
 
@@ -349,6 +393,7 @@ class Stack:
     dashboard: DashboardService
     web: WebContext
     app: FastAPI
+    bot_control: BotControl = field(default_factory=BotControl)
 
     @property
     def pipeline(self) -> ApplyPipeline:
@@ -356,7 +401,7 @@ class Stack:
 
     @property
     def bot_enabled(self) -> bool:
-        return self.env.bot_token_valid
+        return resolve_bot_token(self.env) is not None
 
 
 def compose(
@@ -402,6 +447,7 @@ def compose(
     hosts = {h.lower() for h in extra_hosts}
     if env.panel_domain:
         hosts.add(env.panel_domain)
+    control = BotControl()
     web_kwargs: dict[str, Any] = {}
     if password_hasher is not None:
         web_kwargs["password_hasher"] = password_hasher
@@ -415,11 +461,12 @@ def compose(
         secret_key=env.secret_key,
         clock=clock,
         write_env=make_write_env(env.env_file),
+        restart_bot=control.restart,
         extra_hosts=frozenset(hosts),
         **web_kwargs,
     )
     app = create_app(web, "/" + env.panel_path)
-    return Stack(env, ctx, runtime, collector, traffic, dashboard, web, app)
+    return Stack(env, ctx, runtime, collector, traffic, dashboard, web, app, control)
 
 
 async def prepare(stack: Stack) -> RecoveryReport | None:
@@ -527,16 +574,51 @@ def collector_component(stack: Stack) -> Factory:
 def bot_component(stack: Stack) -> Factory:
     async def run(stop: asyncio.Event) -> None:
         rt = stack.runtime
-        try:
-            await run_bot(stack.env.bot_token, rt.deps, rt.sender, stop, session=rt.session)
-        except TelegramUnauthorizedError:
-            log.critical(
-                "Telegram отклонил токен бота: бот отключён, остальные части панели работают. "
-                "Задайте верный токен в настройках панели и перезапустите службу."
-            )
-            await stop.wait()
+        control = stack.bot_control
+        while not stop.is_set():
+            token = await asyncio.to_thread(resolve_bot_token, stack.env)
+            if token is None:
+                log.error("токен бота не задан: бот ждёт токен (задайте его в настройках панели)")
+                await _wait_any(stop, control.restart_event)
+                control.restart_event.clear()
+                continue
+            child = asyncio.Event()
+            control.restart_event.clear()
+            control.running = True
+            forward = asyncio.create_task(_forward(stop, control.restart_event, child))
+            try:
+                await run_bot(token, rt.deps, rt.sender, child, session=rt.session)
+            except TelegramUnauthorizedError:
+                log.critical(
+                    "Telegram отклонил токен бота: бот отключён, остальные части панели "
+                    "работают. Задайте верный токен в настройках панели."
+                )
+                await _wait_any(stop, control.restart_event)
+            finally:
+                control.running = False
+                forward.cancel()
+                await asyncio.gather(forward, return_exceptions=True)
+            if control.restart_event.is_set() and not stop.is_set():
+                log.info("бот перезапускается (новый токен)")
+                control.restart_event.clear()
 
     return run
+
+
+async def _wait_any(*events: asyncio.Event) -> None:
+    waiters = [asyncio.create_task(e.wait()) for e in events]
+    try:
+        await asyncio.wait(waiters, return_when=asyncio.FIRST_COMPLETED)
+    finally:
+        for w in waiters:
+            w.cancel()
+        await asyncio.gather(*waiters, return_exceptions=True)
+
+
+async def _forward(stop: asyncio.Event, restart: asyncio.Event, child: asyncio.Event) -> None:
+    """Stop the running bot when the service stops or a restart is requested."""
+    await _wait_any(stop, restart)
+    child.set()
 
 
 def scheduler_component(stack: Stack) -> Factory:

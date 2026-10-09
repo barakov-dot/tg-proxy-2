@@ -170,33 +170,42 @@ class LoginLimiter:
 
 
 class GlobalFailureLimiter:
-    """All failed logins together (many addresses): ``max_failures`` per window, then a pause."""
+    """Failed logins from all clients together: slows logins down, never locks anybody out.
+
+    An outsider can always produce failures from many addresses, so a hard global block would
+    let them lock the administrator out. Instead, once ``free_failures`` failures happened in the
+    window, every new login attempt waits an artificial delay that grows by ``step_s`` per extra
+    failure up to ``max_delay_s`` (per-client /64 limits stay in force separately).
+    """
 
     def __init__(
         self,
         clock: Callable[[], float] = time.monotonic,
         *,
-        max_failures: int = 30,
+        free_failures: int = 10,
         window_s: float = 60.0,
-        pause_s: float = 60.0,
+        step_s: float = 0.1,
+        max_delay_s: float = 2.0,
     ) -> None:
         self._clock = clock
-        self._max = max_failures
+        self._free = free_failures
         self._window = window_s
-        self._pause = pause_s
+        self._step = step_s
+        self._max = max_delay_s
         self._failures: list[float] = []
-        self._blocked_until = 0.0
 
-    def blocked_for(self) -> float:
-        return max(0.0, self._blocked_until - self._clock())
-
-    def record_failure(self) -> bool:
-        """Count a failure; True if this one tripped the global block."""
+    def _recent(self) -> list[float]:
         now = self._clock()
         self._failures = [t for t in self._failures if now - t < self._window]
-        self._failures.append(now)
-        if len(self._failures) >= self._max and self._blocked_until <= now:
-            self._blocked_until = now + self._pause
-            self._failures.clear()
-            return True
-        return False
+        return self._failures
+
+    def delay(self) -> float:
+        """Seconds a new login attempt must wait before it is processed (0 when calm)."""
+        extra = len(self._recent()) - self._free
+        return 0.0 if extra <= 0 else min(self._max, extra * self._step)
+
+    def record_failure(self) -> bool:
+        """Count a failure; True when this one made the delay start."""
+        recent = self._recent()
+        recent.append(self._clock())
+        return len(recent) == self._free + 1

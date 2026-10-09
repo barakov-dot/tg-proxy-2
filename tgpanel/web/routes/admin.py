@@ -7,6 +7,7 @@ from typing import Any
 
 from fastapi import APIRouter, Depends, Request, Response
 from fastapi.responses import StreamingResponse
+from starlette.background import BackgroundTask
 
 from tgpanel.apply.backup import BackupError
 from tgpanel.apply.errors import OperationRejected, SettingsError
@@ -16,13 +17,16 @@ from tgpanel.domain.expiry import Term
 from tgpanel.domain.models import CarrierMode, UserStatus
 from tgpanel.services.admin import MAX_TEMPLATE, MESSAGE_KEYS
 from tgpanel.services.api import UserFilter, UserListQuery
+from tgpanel.services.backups import DownloadBusy
 from tgpanel.web.deps import WebContext, safe
 from tgpanel.web.inputs import parse_uint
 from tgpanel.web.routes.common import (
     HttpError,
     PathId,
     auth_of,
+    check_password,
     clean,
+    client_ip,
     delete_cookie,
     fint,
     fraw,
@@ -336,10 +340,11 @@ async def settings_bot_token(request: Request) -> Response:
     web = get_web(request)
     form = await load_form(request)
     try:
-        await web.admin.set_bot_token(fstr(form, "token"), auth_of(request).actor)
+        restarted = await web.admin.set_bot_token(fstr(form, "token"), auth_of(request).actor)
     except OperationRejected as exc:
         return redirect(request, "/settings", ("err", clean(str(exc))))
-    return redirect(request, "/settings", ("ok", T["token_saved"]))
+    text = T["token_saved_restarted"] if restarted else T["token_saved_manual"]
+    return redirect(request, "/settings", ("ok", text))
 
 
 @router.post("/settings/templates")
@@ -359,12 +364,19 @@ async def settings_password(request: Request) -> Response:
     web = get_web(request)
     auth = auth_of(request)
     form = await load_form(request)
+    key = f"pw:{client_ip(request, web)}"
+    wait = web.limiter.allow(key)  # wrong "current password" guesses are limited like logins
+    if wait > 0:
+        return redirect(
+            request, "/settings", ("err", T["login_throttled"].format(seconds=int(wait) + 1))
+        )
     try:
         version = await web.admin.change_password(
             fraw(form, "current"), fraw(form, "new"), fraw(form, "again"), auth.actor
         )
     except OperationRejected as exc:
         return redirect(request, "/settings", ("err", clean(str(exc))))
+    web.limiter.success(key)
     signer = get_signer(request)
     session = signer.make_session(auth.session.login, version, int(web.now().timestamp()))
     response = redirect(request, "/settings", ("ok", T["password_changed"]))
@@ -403,11 +415,18 @@ async def backups_create(request: Request) -> Response:
     return redirect(request, "/backups", ("ok", T["backup_created"]))
 
 
-@router.get("/backups/{backup_id}/download")
+@router.post("/backups/{backup_id}/download")
 async def backup_download(request: Request, backup_id: PathId) -> Response:
+    """Streams the archive; it contains the env file and all secrets, so the password is asked."""
     web = get_web(request)
+    form = await load_form(request)
+    error = await check_password(request, "reauth", fraw(form, "password"))
+    if error is not None:
+        return redirect(request, "/backups", ("err", error))
     try:
         download = await web.backups.open_download(backup_id, auth_of(request).actor)
+    except DownloadBusy:
+        raise HttpError(409, T["download_busy"]) from None
     except BackupError as exc:
         raise HttpError(413, clean(str(exc))) from None
     except OperationRejected as exc:
@@ -421,6 +440,7 @@ async def backup_download(request: Request, backup_id: PathId) -> Response:
             "Content-Disposition": f'attachment; filename="{download.filename}"',
             "Content-Length": str(download.size),
         },
+        background=BackgroundTask(download.release),
     )
 
 
@@ -428,6 +448,9 @@ async def backup_download(request: Request, backup_id: PathId) -> Response:
 async def backup_restore(request: Request, backup_id: PathId) -> Response:
     web = get_web(request)
     form = await load_form(request)
+    error = await check_password(request, "reauth", fraw(form, "password"))
+    if error is not None:
+        return redirect(request, "/backups", ("err", error))
     if fstr(form, "confirm").lower() != T["restore_word"]:
         return redirect(
             request, "/backups", ("err", T["restore_confirm_bad"].format(word=T["restore_word"]))

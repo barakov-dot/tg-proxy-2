@@ -109,7 +109,7 @@ def test_pool_unit_golden(variant: str, golden: Callable[[str, bytes], None]) ->
     assert "$MTP_SECRET_ARGS $MTP_NAT_ARGS" in text
     assert "-p ${MTP_STATS_PORT} -H ${MTP_PORT}" in text
     assert "-M ${MTP_WORKERS} -C ${MTP_MAX_CONNECTIONS}" in text
-    assert "Restart=always" in text and "NoNewPrivileges=true" in text
+    assert "Restart=on-failure" in text and "NoNewPrivileges=true" in text
     assert "WantedBy=multi-user.target" in text and "After=network-online.target" in text
     assert "MTPROXY_" not in text  # legacy variables never leak into our unit
 
@@ -219,3 +219,30 @@ def test_extract_facts_direct_execstart_is_not_flagged_overridden() -> None:
     base = Path("tests/fixtures/upstream/owner2")
     facts = extract_mtproxy_facts((base / "mtproxy.service").read_text(), [], "")
     assert facts.exec_overridden is False
+
+
+def test_pool_unit_requires_the_firewall_and_is_hardened() -> None:
+    text = render_pool_unit(clean_facts()).decode()
+    lines = text.splitlines()
+    assert "Requires=tgpanel-firewall.service" in lines
+    assert any(
+        ln.startswith("After=") and "tgpanel-firewall.service" in ln.split("=", 1)[1].split()
+        for ln in lines
+    )
+    assert not any(ln.startswith("Wants=") and "tgpanel-firewall" in ln for ln in lines)
+    for needed in (
+        "User=mtproxy",
+        "Group=mtproxy",
+        "Restart=on-failure",
+        "RestartSec=3s",
+        "ProtectProc=invisible",
+        "ProcSubset=pid",
+        "ReadOnlyPaths=/etc/mtproxy /etc/tgpanel/mtproxy",
+        "RestrictAddressFamilies=AF_INET AF_INET6",
+        "RestrictNamespaces=true",
+        "RestrictRealtime=true",
+        "CapabilityBoundingSet=",
+    ):
+        assert needed in lines, needed
+    assert "MemoryDenyWriteExecute" not in text  # unverified against mtproto-proxy
+    assert " -u mtproxy " in text  # -u stays in ExecStart as upstream has it

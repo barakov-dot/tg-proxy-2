@@ -2,14 +2,17 @@
 [Unit]
 Description=Telegram MTProxy pool %i (tgpanel)
 After=network-online.target tgpanel-firewall.service
-Wants=network-online.target tgpanel-firewall.service
+Wants=network-online.target
+Requires=tgpanel-firewall.service
 
 [Service]
 Type=simple
+User=mtproxy
+Group=mtproxy
 EnvironmentFile=/etc/tgpanel/mtproxy/%i.env
 ExecStart=/opt/MTProxy/objs/bin/mtproto-proxy -u mtproxy -p ${MTP_STATS_PORT} -H ${MTP_PORT} $MTP_SECRET_ARGS $MTP_NAT_ARGS --aes-pwd /etc/mtproxy/proxy-secret /etc/mtproxy/proxy-multi.conf -M ${MTP_WORKERS} -C ${MTP_MAX_CONNECTIONS}
-Restart=always
-RestartSec=3
+Restart=on-failure
+RestartSec=3s
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
@@ -20,6 +23,13 @@ ProtectKernelModules=true
 ProtectControlGroups=true
 RestrictSUIDSGID=true
 LockPersonality=true
+ProtectProc=invisible
+ProcSubset=pid
+ReadOnlyPaths=/etc/mtproxy /etc/tgpanel/mtproxy
+RestrictAddressFamilies=AF_INET AF_INET6
+RestrictNamespaces=true
+RestrictRealtime=true
+CapabilityBoundingSet=
 LimitNOFILE=1048576
 
 [Install]

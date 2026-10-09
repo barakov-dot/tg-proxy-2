@@ -5,7 +5,7 @@ import json
 import re
 from collections.abc import Callable
 
-from tests.web.conftest import ROOT, Web
+from tests.web.conftest import PASSWORD, ROOT, Web
 from tgpanel.db import repo
 from tgpanel.domain.models import CarrierMode, UserStatus
 from tgpanel.services.dashboard import DashboardService
@@ -258,28 +258,36 @@ async def test_backups_create_download_restore(aw: Web, _log_capture: Callable[[
     manual = next(b for b in items if b.reason == "manual")
     page = (await aw.client.get(aw.u("/backups"))).text
     assert f"/backups/{manual.id}/download" in page
-    dl = await aw.client.get(aw.u(f"/backups/{manual.id}/download"))
+    dl = await aw.post(f"/backups/{manual.id}/download", {"password": PASSWORD})
     assert dl.status_code == 200 and dl.content == aw.fake.files[manual.path].data
     assert "attachment" in dl.headers["content-disposition"]
     assert dl.headers["cache-control"] == "no-store"
-    assert (await aw.client.get(aw.u("/backups/999/download"))).status_code == 404
+    assert (await aw.post("/backups/999/download", {"password": PASSWORD})).status_code == 404
     # restore needs the confirmation word
-    r = await aw.post(f"/backups/{manual.id}/restore", {"confirm": "no"})
+    r = await aw.post(f"/backups/{manual.id}/restore", {"confirm": "no", "password": PASSWORD})
     assert "введите слово" in await flash_text(aw, r)
     await aw.post("/users/bulk", {"action": "delete", "confirm": "удалить", "ids": [str(uid)]})
     assert aw.ctx.db.call(repo.all_users) == []
-    r = await aw.post(f"/backups/{manual.id}/restore", {"confirm": "восстановить"})
-    assert "восстановлено" in (await flash_text(aw, r)).lower()
+    r = await aw.post(
+        f"/backups/{manual.id}/restore", {"confirm": "восстановить", "password": PASSWORD}
+    )
+    # the restore invalidates every session (the pipeline bumps panel_session_version)
+    assert r.status_code == 303
+    assert (await aw.client.get(aw.u("/backups"))).status_code == 303
+    aw.client.cookies.clear()
+    assert (await aw.login()).status_code == 303
     assert [u.name for u in aw.ctx.db.call(repo.all_users)] == ["alice"]
     # the download is gone for anonymous clients
     aw.client.cookies.clear()
-    assert (await aw.client.get(aw.u(f"/backups/{manual.id}/download"))).status_code == 303
+    assert (
+        await aw.client.post(aw.u(f"/backups/{manual.id}/download"), data={"password": PASSWORD})
+    ).status_code == 303
 
 
 async def test_backup_download_refuses_paths_outside_backup_dir(aw: Web) -> None:
     aw.ctx.db.call(repo.add_backup, "/etc/shadow", aw.clock.now, "x", 1)
     rec = aw.ctx.db.call(repo.list_backups)[0]
-    assert (await aw.client.get(aw.u(f"/backups/{rec.id}/download"))).status_code == 404
+    assert (await aw.post(f"/backups/{rec.id}/download", {"password": PASSWORD})).status_code == 404
 
 
 async def test_audit_and_apply_history_pages(aw: Web) -> None:

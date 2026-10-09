@@ -57,3 +57,71 @@ jobs:
         run: |
           docker run --rm --platform linux/amd64 -v "$PWD:/src:ro" "${{ matrix.image }}" \
             bash /src/scripts/installer-container-check.sh
+  real-tools:
+    # Our rendered files against the REAL upstream tools (not our fakes): tproxy-server -check,
+    # caddy validate, nft -c, systemd-analyze verify.
+    runs-on: ubuntu-24.04
+    env:
+      UPSTREAM_COMMIT: c8adb8b7c6b7fc46c12ae3acb68be9070c26a8e8
+      CADDY_VERSION: "2.10.0"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          cache: false
+      - name: build upstream tproxy-server at the pinned commit
+        run: |
+          mkdir -p "$RUNNER_TEMP/bin"
+          git clone https://github.com/telegramdesktop/tproxy-server "$RUNNER_TEMP/up"
+          git -C "$RUNNER_TEMP/up" checkout "$UPSTREAM_COMMIT"
+          (cd "$RUNNER_TEMP/up" && go build -o "$RUNNER_TEMP/bin/tproxy-server" ./cmd/tproxy-server)
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+      - name: render our files (clean, owner, 300 users at 128/1024/4096 sessions)
+        run: python tests/tools/render_for_upstream.py "$RUNNER_TEMP/render"
+      - name: tproxy-server -check on every rendered scenario
+        run: |
+          for d in "$RUNNER_TEMP"/render/*/; do
+            echo "== $d"
+            tproxy-server -config "$d/config.json" -profiles-file "$d/profiles.json" -check
+          done
+      - name: install caddy (release binary, checksum verified)
+        run: |
+          base="https://github.com/caddyserver/caddy/releases/download/v${CADDY_VERSION}"
+          cd "$RUNNER_TEMP"
+          curl -fsSLO "$base/caddy_${CADDY_VERSION}_linux_amd64.tar.gz"
+          curl -fsSLO "$base/caddy_${CADDY_VERSION}_checksums.txt"
+          grep " caddy_${CADDY_VERSION}_linux_amd64.tar.gz\$" "caddy_${CADDY_VERSION}_checksums.txt" | sha256sum -c -
+          tar -xzf "caddy_${CADDY_VERSION}_linux_amd64.tar.gz" caddy
+          mv caddy "$RUNNER_TEMP/bin/caddy"
+      - name: caddy validate (upstream Caddyfile + our block)
+        env:
+          TPROXY_HOSTNAME: proxy.example.com
+          TPROXY_SITE_ROOT: /srv/tproxy-site
+          ACME_EMAIL: admin@example.com
+        run: |
+          for d in "$RUNNER_TEMP"/render/*/; do
+            caddy validate --config "$d/Caddyfile" --adapter caddyfile
+          done
+      - name: nft -c on the rendered ruleset (unprivileged namespace)
+        run: |
+          sudo apt-get install -y -qq nftables >/dev/null
+          for d in "$RUNNER_TEMP"/render/*/; do
+            sudo unshare -Urn nft -c -f "$d/tgpanel.nft"
+          done
+      - name: systemd-analyze verify (shipped units + rendered pool unit)
+        run: |
+          sudo mkdir -p /opt/tgpanel/.venv/bin /opt/tgpanel/scripts /opt/MTProxy/objs/bin /var/lib/mtproxy
+          sudo touch /opt/tgpanel/.venv/bin/python /opt/tgpanel/scripts/restart-pools.sh /opt/MTProxy/objs/bin/mtproto-proxy
+          sudo chmod +x /opt/tgpanel/.venv/bin/python /opt/tgpanel/scripts/restart-pools.sh /opt/MTProxy/objs/bin/mtproto-proxy
+          units="$RUNNER_TEMP/units"
+          mkdir -p "$units"
+          cp deploy/tgpanel.service deploy/tgpanel-firewall.service \
+            deploy/tgpanel-mtproxy-refresh.path deploy/tgpanel-mtproxy-refresh.service "$units/"
+          cp "$RUNNER_TEMP/render/clean/tgpanel-mtproxy@.service" "$units/"
+          systemd-analyze verify --man=no "$units"/tgpanel.service "$units"/tgpanel-firewall.service \
+            "$units"/tgpanel-mtproxy-refresh.path "$units"/tgpanel-mtproxy-refresh.service \
+            "$units/tgpanel-mtproxy@.service"

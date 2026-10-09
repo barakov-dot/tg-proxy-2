@@ -126,10 +126,11 @@ async def test_failed_apply_reverts_the_setting(svc: Svc) -> None:
     assert svc.fake.files[CONFIG].data == before
 
 
-async def test_budget_rejected_by_relay_check_is_not_applied(svc: Svc) -> None:
+async def test_relay_check_rejection_shows_the_relay_message(svc: Svc) -> None:
     svc.fake.fail_check("tproxy_check", "max_pending_global: budget exceeded")
-    res = await svc.ctx.settings.set("max_sessions_global", 100000, "x")
-    assert not res.ok and "памяти" in (res.error or "")
+    res = await svc.ctx.settings.set("max_sessions_global", 1500, "x")
+    assert not res.ok and "budget exceeded" in (res.error or "")  # the relay's own words
+    assert "max_sessions_global" in (res.error or "")  # plus a hint what to lower
     assert await svc.ctx.settings.get("max_sessions_global") == 1024
 
 
@@ -140,3 +141,52 @@ async def test_default_carrier_mode_change(svc: Svc) -> None:
         svc.fake.get_json("/etc/tproxy-server/profiles.json")["profiles"][0]["carrier_mode"]
         == "websocket"
     )
+
+
+@pytest.mark.parametrize(
+    ("key", "value"),
+    [
+        ("max_streams_global", 4095),
+        ("max_streams_global", 1_000_001),
+        ("max_sessions_global", 20_001),
+        ("max_sessions_global", 100_000),
+        ("open_mode_max_per_hour", 0),
+        ("open_mode_max_per_hour", 61),
+        ("open_mode_batch_window_s", 301),
+        ("open_mode_batch_window_s", -1),
+        ("max_pending_ceiling_mib", 511),
+    ],
+)
+async def test_s8_new_bounds_are_enforced(svc: Svc, key: str, value: int) -> None:
+    res = await svc.ctx.settings.set(key, value, "x")
+    assert not res.ok and "допустимо" in (res.error or "")
+
+
+async def test_s8_boundaries_and_defaults(svc: Svc) -> None:
+    cfg = await svc.ctx.settings.all()
+    assert cfg["open_mode_max_per_hour"] == 6 and cfg["open_mode_batch_window_s"] == 20
+    assert cfg["max_pending_ceiling_mib"] == 8192
+    assert (
+        await svc.ctx.settings.set_many(
+            {"max_streams_global": 4096, "max_sessions_global": 20_000}, "x"
+        )
+    ).ok
+    assert (await svc.ctx.settings.set("open_mode_max_per_hour", 60, "x")).ok
+    assert (await svc.ctx.settings.set("open_mode_batch_window_s", 300, "x")).ok
+    assert (await svc.ctx.settings.set("open_mode_batch_window_s", 0, "x")).ok
+
+
+async def test_s8_session_count_that_exceeds_the_memory_ceiling_is_rejected(svc: Svc) -> None:
+    runs = len(svc.runs())
+    res = await svc.ctx.settings.set_many(
+        {"max_sessions_global": 20_000, "max_pending_ceiling_mib": 512}, "x"
+    )
+    assert not res.ok and "МиБ" in (res.error or "") and "потолка 512" in (res.error or "")
+    assert await svc.ctx.settings.get("max_sessions_global") == 1024
+    assert len(svc.runs()) == runs and svc.fake.calls_of("systemctl") == []
+    # raising the ceiling first makes the same value acceptable
+    assert (await svc.ctx.settings.set("max_pending_ceiling_mib", 8192, "x")).ok
+    assert (await svc.ctx.settings.set("max_sessions_global", 20_000, "x")).ok
+    # lowering the ceiling below what the current sessions need is refused as well
+    low = await svc.ctx.settings.set("max_pending_ceiling_mib", 512, "x")
+    assert not low.ok and "МиБ" in (low.error or "")
