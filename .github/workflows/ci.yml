@@ -50,7 +50,7 @@ jobs:
     runs-on: ubuntu-24.04
     strategy:
       matrix:
-        image: ["ubuntu:24.04", "debian:13"]
+        image: ["public.ecr.aws/docker/library/ubuntu:24.04", "public.ecr.aws/docker/library/debian:13"]  # ECR mirror: no Docker Hub pull limit
     steps:
       - uses: actions/checkout@v4
       - name: installer refuses a server without the proxy
@@ -94,7 +94,7 @@ jobs:
           cd "$RUNNER_TEMP"
           curl -fsSLO "$base/caddy_${CADDY_VERSION}_linux_amd64.tar.gz"
           curl -fsSLO "$base/caddy_${CADDY_VERSION}_checksums.txt"
-          grep " caddy_${CADDY_VERSION}_linux_amd64.tar.gz\$" "caddy_${CADDY_VERSION}_checksums.txt" | sha256sum -c -
+          awk -v f="caddy_${CADDY_VERSION}_linux_amd64.tar.gz" '$2 == f { print $1 "  " $2; found = 1 } END { exit !found }' "caddy_${CADDY_VERSION}_checksums.txt" | sha256sum -c -
           tar -xzf "caddy_${CADDY_VERSION}_linux_amd64.tar.gz" caddy
           mv caddy "$RUNNER_TEMP/bin/caddy"
       - name: caddy validate (upstream Caddyfile + our block)
