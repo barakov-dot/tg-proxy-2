@@ -105,11 +105,11 @@ jobs:
           for d in "$RUNNER_TEMP"/render/*/; do
             caddy validate --config "$d/Caddyfile" --adapter caddyfile
           done
-      - name: nft -c on the rendered ruleset (unprivileged namespace)
+      - name: nft -c on the rendered ruleset (check-only)
         run: |
           sudo apt-get install -y -qq nftables >/dev/null
           for d in "$RUNNER_TEMP"/render/*/; do
-            sudo unshare -Urn nft -c -f "$d/tgpanel.nft"
+            sudo nft -c -f "$d/tgpanel.nft"  # check-only: parses and validates, changes nothing
           done
       - name: systemd-analyze verify (shipped units + rendered pool unit)
         run: |
