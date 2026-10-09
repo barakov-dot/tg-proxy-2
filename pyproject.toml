@@ -35,6 +35,7 @@ target-version = "py312"
 select = ["E", "F", "W", "I", "B", "UP", "S", "ASYNC", "RUF"]
 
 [tool.ruff.lint.per-file-ignores]
+"tgpanel/**" = ["RUF001", "RUF002", "RUF003"]
 "tests/**" = ["S101", "S105", "S106"]
 
 [tool.mypy]
