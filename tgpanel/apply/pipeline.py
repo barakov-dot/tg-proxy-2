@@ -1,4 +1,3 @@
-# ruff: noqa: RUF001
 """The apply pipeline (PLAN 3.6): the only code allowed to change proxy-side files.
 
 One operation = DB mutation + apply, sharing one transaction boundary:

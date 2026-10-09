@@ -1,4 +1,3 @@
-# ruff: noqa: RUF001
 """Typed registry of panel settings stored in the ``settings`` table (values are strings)."""
 
 from __future__ import annotations

@@ -1,4 +1,3 @@
-# ruff: noqa: RUF001
 """Import of the proxy's existing profiles into the panel (PLAN 3.10).
 
 ``preview`` is read-only. ``confirm`` is ONE pipeline operation: the pools are started and their

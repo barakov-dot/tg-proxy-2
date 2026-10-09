@@ -1,4 +1,3 @@
-# ruff: noqa: RUF001
 """UserService implementation (contract: services/api.py).
 
 Every mutating call is ONE pipeline operation (one apply, however many users it touches). The

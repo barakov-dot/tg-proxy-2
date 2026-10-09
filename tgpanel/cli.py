@@ -1,4 +1,3 @@
-# ruff: noqa: RUF001
 """tgpanel command line interface.
 
 Implemented here: status, apply, import, backup, restore, legacy-mtproxy. Other subcommands
