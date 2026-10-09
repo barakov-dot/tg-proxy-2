@@ -93,8 +93,7 @@ jobs:
           base="https://github.com/caddyserver/caddy/releases/download/v${CADDY_VERSION}"
           cd "$RUNNER_TEMP"
           curl -fsSLO "$base/caddy_${CADDY_VERSION}_linux_amd64.tar.gz"
-          curl -fsSLO "$base/caddy_${CADDY_VERSION}_checksums.txt"
-          awk -v f="caddy_${CADDY_VERSION}_linux_amd64.tar.gz" '$2 == f { print $1 "  " $2; found = 1 } END { exit !found }' "caddy_${CADDY_VERSION}_checksums.txt" | sha256sum -c -
+          echo "626682d623ca04356ab3c9a93a82386cfde6d8243b11f2d0eea9e97ba630c7ada62373401e96b72c6690c98ae8dd004d61fafe477f5249690d5cb251ebbfd2d9  caddy_${CADDY_VERSION}_linux_amd64.tar.gz" | sha512sum -c -
           tar -xzf "caddy_${CADDY_VERSION}_linux_amd64.tar.gz" caddy
           mv caddy "$RUNNER_TEMP/bin/caddy"
       - name: caddy validate (upstream Caddyfile + our block)
