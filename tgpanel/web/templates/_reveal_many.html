@@ -1,7 +1,8 @@
+{% from '_macros.html' import icon with context %}
 <div class="reveal">
 {% if error %}<div class="alert err">{{ error }}</div>
 {% else %}
-<textarea readonly rows="8" class="wide">{{ text }}</textarea>
-<button type="button" data-copy-text>{{ t.copy }}</button> <button type="button" data-hide>{{ t.hide }}</button>
+<textarea readonly rows="8" class="wide" aria-label="{{ t.reveal_links }}">{{ text }}</textarea>
+<p class="actions"><button type="button" data-copy-text>{{ icon('copy') }} {{ t.copy }}</button> <button type="button" data-hide>{{ icon('x') }} {{ t.hide }}</button></p>
 {% endif %}
 </div>

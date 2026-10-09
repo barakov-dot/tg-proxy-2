@@ -46,6 +46,7 @@ from tgpanel.db.connection import transaction
 from tgpanel.ops_cli import SETTING_BOOTSTRAPPED
 from tgpanel.services.container import AppContext, build_context
 from tgpanel.services.dashboard import DashboardService
+from tgpanel.services.server_metrics import ServerMetricsService
 from tgpanel.services.traffic import TrafficService
 from tgpanel.system.ops import SystemOps
 from tgpanel.web.adapters import TrafficAdapter
@@ -462,6 +463,7 @@ def compose(
         clock=clock,
         write_env=make_write_env(env.env_file),
         restart_bot=control.restart,
+        metrics=ServerMetricsService(ops),
         extra_hosts=frozenset(hosts),
         **web_kwargs,
     )

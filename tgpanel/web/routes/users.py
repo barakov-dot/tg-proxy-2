@@ -38,6 +38,7 @@ from tgpanel.web.routes.common import (
     redirect,
     render,
     require_auth,
+    series_response,
     set_cookie,
 )
 from tgpanel.web.security import COLS_COOKIE
@@ -132,9 +133,12 @@ async def users_list(request: Request) -> Response:
     extras = await _extras(web, [r.user.id for r in page.rows])
     rows = [RowView(r, extras.get(r.user.id)) for r in page.rows]
     pages = max(1, -(-page.total // query.per_page))
+    live = request.headers.get("hx-request") == "true" and not request.headers.get(
+        "hx-history-restore-request"
+    )
     response = await render(
         request,
-        "users.html",
+        "_users_region.html" if live else "users.html",  # live filter swaps only the table
         page="users",
         rows=rows,
         total=page.total,
@@ -148,6 +152,7 @@ async def users_list(request: Request) -> Response:
         filter_qs=_encode(canon),
         statuses=canon.get("status", []),
     )
+    response.headers["Vary"] = "HX-Request"
     if persist:
         set_cookie(response, request, COLS_COOKIE, ",".join(cols), 365 * 86400)
     return response
@@ -489,19 +494,7 @@ async def user_traffic(request: Request, user_id: PathId) -> Response:
     series = await safe(web.traffic.user_series(user_id, start, end, 600), "user_series")
     if series is None:
         return JSONResponse({"error": T["traffic_unavailable"]}, status_code=503)
-    points: list[list[float | int]] = []
-    for p in series.points:
-        ts, up, down = (p.ts, p.up, p.down) if hasattr(p, "ts") else (p[0], p[1], p[2])
-        ms = int(ts.timestamp() * 1000) if isinstance(ts, datetime) else int(float(ts) * 1000)
-        points.append([ms, int(up), int(down)])
-    return JSONResponse(
-        {
-            "granularity": series.granularity,
-            "points": points,
-            "total_up": int(series.total_up),
-            "total_down": int(series.total_down),
-        }
-    )
+    return series_response(series)
 
 
 __all__ = ["flist", "router"]

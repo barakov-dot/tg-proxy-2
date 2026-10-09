@@ -1,9 +1,10 @@
 {% extends 'base.html' %}
+{% from '_macros.html' import icon with context %}
 {% block title %}{{ t.error_title }}{% endblock %}
 {% block content %}
-<section class="card narrow">
-<h1>{{ code }}</h1>
-<div class="alert err" role="alert">{{ message }}</div>
-<p><a href="{{ url('/') }}">{{ t.to_home }}</a></p>
+<section class="card login-card">
+  <h1>{{ code }}</h1>
+  <div class="alert err" role="alert">{{ icon('alert') }} {{ message }}</div>
+  <a class="btn" href="{{ url('/') }}">{{ icon('dashboard') }} {{ t.to_home }}</a>
 </section>
 {% endblock %}

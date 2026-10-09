@@ -1,21 +1,24 @@
 {% extends 'base.html' %}
+{% from '_macros.html' import icon with context %}
 {% block title %}{{ t.nav_audit }}{% endblock %}
 {% block content %}
-<h1>{{ t.nav_audit }}</h1>
+<div class="page-head"><h1>{{ t.nav_audit }}</h1></div>
 <nav class="tabs"><a href="{{ url('/audit?tab=audit') }}"{% if tab == 'audit' %} class="active"{% endif %}>{{ t.tab_audit }}</a>
 <a href="{{ url('/audit?tab=apply') }}"{% if tab == 'apply' %} class="active"{% endif %}>{{ t.tab_apply }}</a></nav>
+<section class="card pad-0"><div class="table-wrap">
 {% if tab == 'audit' %}
 <table><thead><tr><th>{{ t.col_time }}</th><th>{{ t.col_actor }}</th><th>{{ t.col_action }}</th><th>{{ t.col_target }}</th><th>{{ t.col_details }}</th></tr></thead><tbody>
-{% for e in entries %}<tr><td>{{ fmt(e.ts) }}</td><td>{{ e.actor }}</td><td>{{ e.action }}</td><td>{{ e.target }}</td><td>{{ e.details }}</td></tr>{% else %}<tr><td colspan="5">{{ t.no_data }}</td></tr>{% endfor %}
+{% for e in entries %}<tr><td class="nowrap">{{ fmt(e.ts) }}</td><td>{{ e.actor }}</td><td>{{ e.action }}</td><td>{{ e.target }}</td><td>{{ e.details }}</td></tr>{% else %}<tr><td colspan="5" class="muted">{{ t.no_data }}</td></tr>{% endfor %}
 </tbody></table>
 {% else %}
 <table><thead><tr><th>#</th><th>{{ t.col_time }}</th><th>{{ t.col_finished }}</th><th>{{ t.col_reason }}</th><th>{{ t.col_status }}</th><th>{{ t.col_error }}</th></tr></thead><tbody>
-{% for r in entries %}<tr><td>{{ r.id }}</td><td>{{ fmt(r.started_at) }}</td><td>{{ fmt(r.finished_at) }}</td><td>{{ r.reason }}</td><td>{{ r.status }}</td><td>{{ r.error or '' }}</td></tr>{% else %}<tr><td colspan="6">{{ t.no_data }}</td></tr>{% endfor %}
+{% for r in entries %}<tr><td>{{ r.id }}</td><td class="nowrap">{{ fmt(r.started_at) }}</td><td class="nowrap">{{ fmt(r.finished_at) }}</td><td>{{ r.reason }}</td><td><span class="badge {{ 'good' if r.status == 'success' else ('bad' if r.status == 'failed' else '') }}">{{ r.status }}</span></td><td>{{ r.error or '' }}</td></tr>{% else %}<tr><td colspan="6" class="muted">{{ t.no_data }}</td></tr>{% endfor %}
 </tbody></table>
 {% endif %}
+</div></section>
 <nav class="pager">
-{% if pg > 1 %}<a href="{{ url('/audit?tab=' ~ tab ~ '&page=' ~ (pg - 1)) }}">‹ {{ t.prev }}</a>{% endif %}
+{% if pg > 1 %}<a class="btn" href="{{ url('/audit?tab=' ~ tab ~ '&page=' ~ (pg - 1)) }}">{{ icon('chevron-left') }} {{ t.prev }}</a>{% endif %}
 <span>{{ pg }}</span>
-{% if more %}<a href="{{ url('/audit?tab=' ~ tab ~ '&page=' ~ (pg + 1)) }}">{{ t.next }} ›</a>{% endif %}
+{% if more %}<a class="btn" href="{{ url('/audit?tab=' ~ tab ~ '&page=' ~ (pg + 1)) }}">{{ t.next }} {{ icon('chevron-right') }}</a>{% endif %}
 </nav>
 {% endblock %}

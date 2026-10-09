@@ -1,30 +1,85 @@
 {% extends 'base.html' %}
+{% from '_macros.html' import icon with context %}
 {% block title %}{{ t.nav_dashboard }}{% endblock %}
+{% block head %}
+<script src="{{ url('/static/vendor/echarts.min.js') }}" defer></script>
+<script src="{{ url('/static/chart.js') }}" defer></script>
+{% endblock %}
 {% block content %}
-<h1>{{ t.nav_dashboard }}</h1>
-{% if degraded %}<div class="alert warn">{{ t.dashboard_degraded }}</div>{% endif %}
-<div class="grid">
-  <div class="card"><h3>{{ t.dash_users }}</h3><p class="big">{{ v.users_total }}</p>
-    <p>{{ t.dash_active }}: {{ v.users_active }} · {{ t.dash_online }}: {{ v.online }}</p>
-    <p>{{ t.dash_disabled }}: {{ v.users_disabled }} · {{ t.dash_expired }}: {{ v.users_expired }}</p></div>
-  <div class="card"><h3>{{ t.dash_traffic_24h }}</h3>
-    <p>↑ {{ human_bytes(v.up_24h) }} · ↓ {{ human_bytes(v.down_24h) }}</p>
-    <h3>{{ t.dash_traffic_30d }}</h3>
-    <p>↑ {{ human_bytes(v.up_30d) }} · ↓ {{ human_bytes(v.down_30d) }}</p></div>
-  <div class="card"><h3>{{ t.dash_capacity }}</h3>
-    {% for p in v.pools %}
-    <p>{{ t.dash_pool }} {{ p.pool_id }} (:{{ p.port }}): {{ p.used }} / {{ p.capacity }} <meter min="0" max="{{ p.capacity }}" value="{{ p.used }}"></meter></p>
-    {% else %}<p>{{ t.no_data }}</p>{% endfor %}
-    <p>{{ t.dash_sessions }}: {{ v.sessions_live if v.sessions_live is not none else '—' }} / {{ v.max_sessions_global if v.max_sessions_global is not none else '—' }}</p>
-    <p>{{ t.dash_limit_hits }}: {{ v.limit_hits_total if v.limit_hits_total is not none else '—' }}</p></div>
-  <div class="card"><h3>{{ t.dash_health }}</h3>
-    <p>{{ t.dash_relay }}: {% if v.relay_ok is none %}—{% elif v.relay_ok %}<span class="good">{{ t.ok }}</span>{% else %}<span class="bad">{{ t.fail }}</span>{% endif %}</p>
-    {% for unit, active in v.services.items() %}
-    <p>{{ unit }}: {% if active %}<span class="good">{{ t.ok }}</span>{% else %}<span class="bad">{{ t.fail }}</span>{% endif %}</p>
-    {% endfor %}
-    {% if v.cert_days_left is not none %}<p>{{ t.dash_cert }}: {{ v.cert_days_left }} {{ t.days_short }}{% if v.cert_days_left < 14 %} <span class="bad">{{ t.dash_cert_warn }}</span>{% endif %}</p>{% endif %}</div>
+<div class="page-head"><h1>{{ t.nav_dashboard }}</h1></div>
+{% if degraded %}<div class="alert warn">{{ icon('alert') }} {{ t.dashboard_degraded }}</div>{% endif %}
+
+<div class="stats">
+  <div class="stat"><div class="label">{{ icon('users') }} {{ t.dash_users }}</div><div class="value">{{ v.users_total }}</div>
+    <div class="sub">{{ t.dash_active }}: {{ v.users_active }} · {{ t.dash_disabled }}: {{ v.users_disabled }} · {{ t.dash_expired }}: {{ v.users_expired }}</div></div>
+  <div class="stat"><div class="label">{{ icon('wifi') }} {{ t.dash_online|capitalize }}</div><div class="value good">{{ v.online }}</div>
+    <div class="sub"><a href="{{ url('/users?online=1') }}">{{ t.show_all_online }}</a></div></div>
+  <div class="stat"><div class="label">{{ icon('shield') }} {{ t.dash_relay }}</div>
+    <div class="value">{% if v.relay_ok is none %}—{% elif v.relay_ok %}<span class="good">{{ t.ok }}</span>{% else %}<span class="bad">{{ t.fail }}</span>{% endif %}</div>
+    <div class="sub">{% for unit, active in v.services.items() %}{{ unit }}: <span class="{{ 'good' if active else 'bad' }}">{{ t.ok if active else t.fail }}</span>{% if not loop.last %} · {% endif %}{% endfor %}</div></div>
+  <div class="stat"><div class="label">{{ icon('lock') }} {{ t.dash_cert }}</div>
+    <div class="value{% if v.cert_days_left is not none and v.cert_days_left < 14 %} bad{% endif %}">{% if v.cert_days_left is not none %}{{ v.cert_days_left }} <small>{{ t.days_short }}</small>{% else %}—{% endif %}</div>
+    <div class="sub">{% if v.cert_days_left is not none and v.cert_days_left < 14 %}{{ t.dash_cert_warn }}{% else %}&nbsp;{% endif %}</div></div>
+  {% set used = v.pools|sum(attribute='used') %}{% set cap = v.pools|sum(attribute='capacity') %}
+  <div class="stat"><div class="label">{{ icon('server') }} {{ t.dash_slots }}</div><div class="value">{{ used }} <small>/ {{ cap }}</small></div>
+    {% if cap %}<progress max="{{ cap }}" value="{{ used }}" aria-label="{{ t.dash_slots }}"></progress>{% endif %}
+    <div class="sub">{{ t.dash_free }}: {{ cap - used }}</div></div>
+  <div class="stat"><div class="label">{{ icon('activity') }} {{ t.dash_sessions }}</div>
+    <div class="value">{{ v.sessions_live|int if v.sessions_live is not none else '—' }} <small>/ {{ v.max_sessions_global if v.max_sessions_global is not none else '—' }}</small></div>
+    {% if v.sessions_live is not none and v.max_sessions_global %}<progress max="{{ v.max_sessions_global }}" value="{{ v.sessions_live }}" aria-label="{{ t.dash_sessions }}"></progress>{% endif %}
+    <div class="sub">{{ t.dash_limit_hits }}: {{ v.limit_hits_total|int if v.limit_hits_total is not none else '—' }}</div></div>
+  <div class="stat"><div class="label">{{ icon('arrow-down') }} {{ t.dash_traffic_24h }}</div>
+    <div class="value">{{ human_bytes(v.up_24h + v.down_24h) }}</div>
+    <div class="sub">↑ {{ human_bytes(v.up_24h) }} · ↓ {{ human_bytes(v.down_24h) }}</div></div>
+  <div class="stat"><div class="label">{{ icon('calendar') }} {{ t.dash_traffic_30d }}</div>
+    <div class="value">{{ human_bytes(v.up_30d + v.down_30d) }}</div>
+    <div class="sub">↑ {{ human_bytes(v.up_30d) }} · ↓ {{ human_bytes(v.down_30d) }}</div></div>
 </div>
-<h2>{{ t.dash_recent_applies }}</h2>
-<table><thead><tr><th>#</th><th>{{ t.col_time }}</th><th>{{ t.col_reason }}</th><th>{{ t.col_status }}</th></tr></thead>
-<tbody>{% for r in runs %}<tr><td>{{ r.id }}</td><td>{{ fmt(r.started_at) }}</td><td>{{ r.reason }}</td><td>{{ r.status }}</td></tr>{% else %}<tr><td colspan="4">{{ t.no_data }}</td></tr>{% endfor %}</tbody></table>
+
+{% if v.pools %}
+<div class="card">
+  <div class="card-head"><h2>{{ t.dash_capacity }}</h2></div>
+  <div class="form-grid">
+  {% for p in v.pools %}
+    <div>{{ t.dash_pool }} {{ p.pool_id }} <code>:{{ p.port }}</code> — {{ p.used }} / {{ p.capacity }}
+      <progress max="{{ p.capacity }}" value="{{ p.used }}" aria-label="{{ t.dash_pool }} {{ p.pool_id }}"></progress></div>
+  {% endfor %}
+  </div>
+</div>
+{% endif %}
+
+<h3 class="sr-only">{{ t.metrics_title }}</h3>
+<div id="metrics" class="metrics" data-poll hx-get="{{ url('/metrics/fragment') }}" hx-trigger="load, every 5s, tgp-refresh" hx-swap="innerHTML" aria-live="off">
+  <div class="metric"><div class="head">{{ icon('server') }} {{ t.metrics_title }}</div><div class="muted">{{ t.loading }}</div></div>
+</div>
+
+<div class="cols-2">
+  <section class="card">
+    <div class="card-head">
+      <h2>{{ icon('activity') }} {{ t.server_traffic }}</h2>
+      <div class="segmented" role="group" aria-label="{{ t.f_period }}">
+        <button type="button" data-preset="1d" aria-pressed="true">{{ t.preset_1d }}</button>
+        <button type="button" data-preset="7d" aria-pressed="false">{{ t.preset_7d }}</button>
+        <button type="button" data-preset="30d" aria-pressed="false">{{ t.preset_30d }}</button>
+      </div>
+    </div>
+    <div id="global-chart" class="chart" data-totals="global-totals" data-default="1d" role="img" aria-label="{{ t.server_traffic }}" data-url="{{ url('/traffic/global.json') }}" data-label-up="{{ t.up }}" data-label-down="{{ t.down }}" data-label-error="{{ t.traffic_unavailable }}"></div>
+    <p id="global-totals" class="hint" aria-live="polite"></p>
+  </section>
+  <section class="card" id="online-panel">
+    <div class="card-head"><h2>{{ icon('wifi') }} {{ t.online_now }} <span class="badge good">{{ online_total }}</span></h2></div>
+    <ul class="online-list">
+    {% for o in online %}
+      <li>
+        <span class="dot on" aria-hidden="true"></span>
+        <div class="who"><a href="{{ url('/users/' ~ o.id) }}">{{ o.name }}</a>
+          <div class="meta">{% if o.tg_username %}@{{ o.tg_username }}{% elif o.tg_id %}ID {{ o.tg_id }}{% else %}—{% endif %} · {{ t.dash_pool }} {{ o.pool_id }} · {{ fmt(o.last_seen) }}</div></div>
+        <div class="traffic">↑ {{ human_bytes(o.up) }}<br>↓ {{ human_bytes(o.down) }}</div>
+      </li>
+    {% else %}<li class="muted">{{ t.online_none }}</li>{% endfor %}
+    </ul>
+    {% if online_total > online|length %}<p><a href="{{ url('/users?online=1') }}">{{ t.show_all_online }} ({{ online_total }}) {{ icon('chevron-right') }}</a></p>{% endif %}
+    <p class="hint">{{ t.online_traffic_hint }}</p>
+  </section>
+</div>
 {% endblock %}

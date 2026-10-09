@@ -1,17 +1,22 @@
 {% extends 'base.html' %}
+{% from '_macros.html' import icon with context %}
 {% block title %}{{ t.nav_backups }}{% endblock %}
 {% block content %}
-<h1>{{ t.nav_backups }}</h1>
-<form method="post" action="{{ url('/backups/create') }}"><input type="hidden" name="csrf_token" value="{{ csrf }}"><button type="submit" class="primary">{{ t.backup_create }}</button></form>
-<table><thead><tr><th>#</th><th>{{ t.col_time }}</th><th>{{ t.col_reason }}</th><th>{{ t.backup_size }}</th><th></th></tr></thead><tbody>
+<div class="page-head"><h1>{{ t.nav_backups }}</h1><span class="spacer"></span>
+  <form method="post" action="{{ url('/backups/create') }}"><input type="hidden" name="csrf_token" value="{{ csrf }}"><button type="submit" class="primary">{{ icon('archive') }} {{ t.backup_create }}</button></form></div>
+<section class="card pad-0">
+<div class="table-wrap"><table><thead><tr><th>#</th><th>{{ t.col_time }}</th><th>{{ t.col_reason }}</th><th>{{ t.backup_size }}</th><th></th></tr></thead><tbody>
 {% for b in items %}
-<tr><td>{{ b.id }}</td><td>{{ fmt(b.created_at) }}</td><td>{{ b.reason }}</td><td>{{ human_bytes(b.size) }}</td>
-<td><form method="post" action="{{ url('/backups/' ~ b.id ~ '/download') }}" class="inline"><input type="hidden" name="csrf_token" value="{{ csrf }}">
-<input type="password" name="password" placeholder="{{ t.password_reenter }}" autocomplete="current-password" required class="short"> <button type="submit">{{ t.download }}</button></form>
+<tr><td>{{ b.id }}</td><td class="nowrap">{{ fmt(b.created_at) }}</td><td>{{ b.reason }}</td><td class="nowrap">{{ human_bytes(b.size) }}</td>
+<td><div class="actions">
+<form method="post" action="{{ url('/backups/' ~ b.id ~ '/download') }}" class="inline"><input type="hidden" name="csrf_token" value="{{ csrf }}">
+<input type="password" name="password" placeholder="{{ t.password_reenter }}" aria-label="{{ t.password_reenter }}" autocomplete="current-password" required class="short"> <button type="submit">{{ icon('download') }} {{ t.download }}</button></form>
 <form method="post" action="{{ url('/backups/' ~ b.id ~ '/restore') }}" class="inline"><input type="hidden" name="csrf_token" value="{{ csrf }}">
-<input type="password" name="password" placeholder="{{ t.password_reenter }}" autocomplete="current-password" required class="short"> <input name="confirm" placeholder="{{ t.restore_word }}" autocomplete="off" class="short"> <button type="submit" class="danger">{{ t.restore }}</button></form></td></tr>
-{% else %}<tr><td colspan="5">{{ t.no_data }}</td></tr>{% endfor %}
-</tbody></table>
+<input type="password" name="password" placeholder="{{ t.password_reenter }}" aria-label="{{ t.password_reenter }}" autocomplete="current-password" required class="short"> <input name="confirm" placeholder="{{ t.restore_word }}" aria-label="{{ t.restore_word }}" autocomplete="off" class="short"> <button type="submit" class="danger">{{ icon('refresh') }} {{ t.restore }}</button></form>
+</div></td></tr>
+{% else %}<tr><td colspan="5" class="muted">{{ t.no_data }}</td></tr>{% endfor %}
+</tbody></table></div>
+</section>
 <p class="hint">{{ t.restore_hint }}</p>
 <p class="hint">{{ t.download_hint }}</p>
 {% endblock %}

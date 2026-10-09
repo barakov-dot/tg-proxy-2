@@ -20,6 +20,12 @@ class FileStat:
 
 
 @dataclass(frozen=True, slots=True)
+class DiskUsage:
+    total: int  # bytes
+    used: int  # bytes
+
+
+@dataclass(frozen=True, slots=True)
 class CheckResult:
     ok: bool
     output: str  # never contains secrets (implementation must scrub)
@@ -65,6 +71,10 @@ class SystemOps(Protocol):
     async def read_file(self, path: str) -> bytes: ...
     async def exists(self, path: str) -> bool: ...
     async def stat(self, path: str) -> FileStat: ...
+    async def disk_usage(self, path: str) -> DiskUsage:
+        """Total and used bytes of the filesystem that holds ``path`` (``statvfs``)."""
+        ...
+
     async def list_dir(self, path: str) -> list[str]: ...
     async def write_atomic(
         self, path: str, data: bytes, *, mode: int, owner: str, group: str

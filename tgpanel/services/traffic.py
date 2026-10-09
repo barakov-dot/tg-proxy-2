@@ -250,6 +250,31 @@ class TrafficService:
         the chosen granularity never double counts. Coarser data cannot be split: when the
         window reaches into a coarser tier the point sits at that tier's bucket start.
         """
+        return await self._series(user_id, start, end, max_points, fill_gaps)
+
+    async def global_series(
+        self,
+        start: datetime,
+        end: datetime,
+        max_points: int = 1500,
+        *,
+        fill_gaps: bool = True,
+    ) -> SeriesResult:
+        """Up/down series of the WHOLE server (all users) at an automatically chosen granularity.
+
+        Same merging rules as ``user_series``: the three tiers hold disjoint data, they are
+        summed per bucket in SQL and re-bucketed to the chosen granularity.
+        """
+        return await self._series(None, start, end, max_points, fill_gaps)
+
+    async def _series(
+        self,
+        user_id: int | None,
+        start: datetime,
+        end: datetime,
+        max_points: int,
+        fill_gaps: bool,
+    ) -> SeriesResult:
         now = self._clock()
         settings, rows = await self._db.run(self._read_series, user_id, start, end, now)
         policy = retention_policy(settings)
@@ -276,14 +301,26 @@ class TrafficService:
 
     @staticmethod
     def _read_series(
-        conn: sqlite3.Connection, user_id: int, start: datetime, end: datetime, now: datetime
+        conn: sqlite3.Connection, user_id: int | None, start: datetime, end: datetime, now: datetime
     ) -> tuple[dict[str, str], list[tuple[datetime, int, int]]]:
         settings = repo.all_settings(conn)
         rows: list[tuple[datetime, int, int]] = []
         for tier in ("day", "hour", "minute"):
             lo = _FLOOR[tier](start)
-            for p in repo.get_traffic(conn, tier, user_id, lo, max(end, lo)):
-                rows.append((p.ts, p.bytes_up, p.bytes_down))
+            hi = max(end, lo)
+            if user_id is not None:
+                for p in repo.get_traffic(conn, tier, user_id, lo, hi):
+                    rows.append((p.ts, p.bytes_up, p.bytes_down))
+                continue
+            table = repo.TRAFFIC_TIERS[tier]
+            cur = conn.execute(
+                "SELECT bucket_ts, SUM(bytes_up), SUM(bytes_down)"  # noqa: S608
+                f" FROM {table} WHERE bucket_ts >= ? AND bucket_ts < ?"
+                " GROUP BY bucket_ts ORDER BY bucket_ts",
+                (times.to_epoch(lo), times.to_epoch(hi)),
+            )
+            for ts, up, down in cur:
+                rows.append((times.from_epoch(int(ts)), int(up), int(down)))
         return settings, rows
 
     # ---- totals

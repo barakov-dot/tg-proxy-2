@@ -1,3 +1,4 @@
+{% from '_macros.html' import icon with context %}
 <!doctype html>
 <html lang="ru">
 <head>
@@ -8,30 +9,48 @@
 <meta name="htmx-config" content='{"includeIndicatorStyles":false,"allowEval":false,"selfRequestsOnly":true,"responseHandling":[{"code":"204","swap":false},{"code":"[23]..","swap":true},{"code":"[45]..","swap":true,"error":true}]}'>
 <title>{% block title %}{{ t.app_name }}{% endblock %}</title>
 <link rel="stylesheet" href="{{ url('/static/app.css') }}">
+<script src="{{ url('/static/theme.js') }}"></script>
 <script src="{{ url('/static/vendor/htmx.min.js') }}" defer></script>
 <script src="{{ url('/static/app.js') }}" defer></script>
 {% block head %}{% endblock %}
 </head>
 <body>
 {% if login %}
-<header class="top">
-  <strong class="brand">{{ t.app_name }}</strong>
-  <nav>
-    {% for key, path in [('dashboard','/'),('users','/users'),('create','/users/new'),('import','/import'),('requests','/requests'),('broadcast','/broadcast'),('settings','/settings'),('backups','/backups'),('audit','/audit')] %}
-    <a href="{{ url(path) }}"{% if page == key %} class="active" aria-current="page"{% endif %}>{{ t['nav_' ~ key] }}</a>
-    {% endfor %}
-  </nav>
-  <form method="post" action="{{ url('/logout') }}" class="inline">
-    <input type="hidden" name="csrf_token" value="{{ csrf }}">
-    <label class="chk" title="{{ t.logout_hint }}"><input type="checkbox" name="all_sessions" value="1"> {{ t.logout_all_short }}</label>
-    <button type="submit" class="link">{{ t.logout }} ({{ login }})</button>
-  </form>
-</header>
-<div id="apply-banner">{% include '_banner.html' %}</div>
+<div class="shell">
+  <header class="topbar">
+    <button type="button" class="icon" data-nav-toggle aria-label="{{ t.menu }}" aria-controls="sidebar">{{ icon('menu') }}</button>
+    <span class="brand">{{ icon('shield') }} {{ t.app_name }}</span>
+  </header>
+  <aside class="sidebar" id="sidebar" aria-label="{{ t.menu }}">
+    <div class="brand">{{ icon('shield') }} {{ t.app_name }}</div>
+    <nav class="nav">
+      {% for key, path, ic in [('dashboard','/','dashboard'),('users','/users','users'),('create','/users/new','user-plus'),('import','/import','import'),('requests','/requests','inbox'),('broadcast','/broadcast','megaphone'),('settings','/settings','settings'),('backups','/backups','archive'),('audit','/audit','list')] %}
+      <a href="{{ url(path) }}"{% if page == key %} class="active" aria-current="page"{% endif %}>{{ icon(ic) }} {{ t['nav_' ~ key] }}</a>
+      {% endfor %}
+    </nav>
+    <div class="side-foot">
+      <button type="button" data-theme-toggle aria-label="{{ t.theme_toggle }}" title="{{ t.theme_toggle }}"><span class="theme-sun">{{ icon('sun') }}</span><span class="theme-moon">{{ icon('moon') }}</span> {{ t.theme }}</button>
+      <form method="post" action="{{ url('/logout') }}">
+        <input type="hidden" name="csrf_token" value="{{ csrf }}">
+        <label class="chk" title="{{ t.logout_hint }}"><input type="checkbox" name="all_sessions" value="1"> {{ t.logout_all_short }}</label>
+        <button type="submit" class="wide">{{ icon('logout') }} {{ t.logout }}</button>
+      </form>
+      <div class="who">{{ login }}</div>
+    </div>
+  </aside>
+  <div class="scrim" data-nav-toggle></div>
+  <div class="content">
+    <div id="apply-banner">{% include '_banner.html' %}</div>
+{% else %}
+<main class="login-wrap">
 {% endif %}
-<main>
-{% if flash %}<div class="alert {{ 'err' if flash.kind == 'err' else 'ok' }}" role="status">{{ flash.text }}</div>{% endif %}
-{% block content %}{% endblock %}
+    {% if flash %}<div class="alert {{ 'err' if flash.kind == 'err' else 'ok' }}" role="status">{{ flash.text }}</div>{% endif %}
+    {% block content %}{% endblock %}
+{% if login %}
+  </div>
+</div>
+{% else %}
 </main>
+{% endif %}
 </body>
 </html>

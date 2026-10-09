@@ -257,3 +257,31 @@ async def test_relay_healthy_uses_healthz_only() -> None:
     assert not await relay_healthy(fake)
     assert {c[1] for c in fake.calls_of("http_get")} == {"http://127.0.0.1:8081/healthz"}
     assert HttpResult(200).status == 200
+
+
+async def test_global_series_merges_users_and_tiers(env: Env) -> None:
+    second = _user(env.db, 2)
+    h = (NOW - timedelta(days=2)).replace(minute=0, second=0)
+    for m in (0, 30):  # minute tier, two users in the same hour -> one bucket
+        env.add("minute", h + timedelta(minutes=m), 10, 1)
+        env.add("minute", h + timedelta(minutes=m), 5, 2, uid=second)
+    env.add("hour", h - timedelta(hours=1), 1000, 100, uid=second)  # hour tier
+    env.add("day", (NOW - timedelta(days=9)).replace(hour=0, minute=0, second=0), 7, 7)  # day tier
+    res = await env.svc.global_series(NOW - timedelta(days=20), NOW, fill_gaps=False)
+    assert res.granularity == "hour"
+    by_ts = {p.ts: p for p in res.points}
+    assert (by_ts[h].up, by_ts[h].down) == (30, 6)
+    assert by_ts[h - timedelta(hours=1)].up == 1000
+    assert res.total_up == 30 + 1000 + 7 and res.total_down == 6 + 100 + 7
+    # a per-user series is unaffected by the other user
+    own = await env.svc.user_series(env.uid, NOW - timedelta(days=20), NOW, fill_gaps=False)
+    assert own.total_up == 20 + 7
+
+
+async def test_global_series_granularity_and_empty_window(env: Env) -> None:
+    day = timedelta(days=1)
+    assert (await env.svc.global_series(NOW - day, NOW)).granularity == "minute"
+    assert (await env.svc.global_series(NOW - 30 * day, NOW)).granularity == "hour"
+    assert (await env.svc.global_series(NOW - 300 * day, NOW)).granularity == "day"
+    res = await env.svc.global_series(NOW - timedelta(hours=1), NOW, fill_gaps=False)
+    assert res.points == () and (res.total_up, res.total_down) == (0, 0)

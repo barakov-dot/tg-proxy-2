@@ -1,0 +1,12 @@
+{% macro icon(name, cls='') -%}
+<svg class="ic {{ cls }}" aria-hidden="true" focusable="false"><use href="{{ url('/static/icons.svg') }}#i-{{ name }}"></use></svg>
+{%- endmacro %}
+
+{% macro status_badge(status) -%}
+{%- set kind = {'active': 'good', 'disabled': 'warn', 'expired': 'bad'}.get(status, '') -%}
+<span class="badge {{ kind }}">{{ t['status_' ~ status] }}</span>
+{%- endmacro %}
+
+{% macro online_dot(is_online) -%}
+<span class="dot{{ ' on' if is_online else '' }}" role="img" aria-label="{{ t.online if is_online else t.offline }}" title="{{ t.online if is_online else t.offline }}"></span>
+{%- endmacro %}

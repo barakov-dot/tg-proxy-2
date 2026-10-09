@@ -1,0 +1,39 @@
+{% from '_macros.html' import icon with context %}
+{% macro bar(pct) -%}
+{%- set cls = 'crit' if pct >= 90 else ('warn' if pct >= 75 else '') -%}
+<progress class="{{ cls }}" max="100" value="{{ pct|round(1) }}" aria-label="{{ pct|round(0)|int }}%"></progress>
+{%- endmacro %}
+{% if m is none %}
+<div class="metric"><div class="head">{{ icon('server') }} {{ t.metrics_title }}</div><div class="muted">{{ t.no_data }}</div></div>
+{% else %}
+<div class="metric">
+  <div class="head">{{ icon('cpu') }} {{ t.metric_cpu }}</div>
+  <div class="big">{{ fmt_pct(m.cpu_pct) }}</div>
+  {% if m.cpu_pct is not none %}{{ bar(m.cpu_pct) }}{% endif %}
+  <div class="hint">{% if m.load %}{{ t.metric_load }}: {{ '%.2f'|format(m.load[0]) }} / {{ '%.2f'|format(m.load[1]) }} / {{ '%.2f'|format(m.load[2]) }}{% endif %}{% if m.cores %} · {{ m.cores }} {{ t.metric_cores }}{% endif %}</div>
+</div>
+<div class="metric">
+  <div class="head">{{ icon('memory') }} {{ t.metric_memory }}</div>
+  {% if m.mem_total %}
+  <div class="big">{{ fmt_pct(m.mem_pct) }}</div>{{ bar(m.mem_pct) }}
+  <div class="hint">{{ human_bytes(m.mem_used) }} / {{ human_bytes(m.mem_total) }}</div>
+  {% else %}<div class="muted">{{ t.no_data }}</div>{% endif %}
+</div>
+<div class="metric">
+  <div class="head">{{ icon('disk') }} {{ t.metric_disk }}</div>
+  {% for d in m.disks %}
+  <div class="hint">{{ d.path }}: {{ human_bytes(d.used) }} / {{ human_bytes(d.total) }} ({{ fmt_pct(d.pct) }})</div>{{ bar(d.pct) }}
+  {% else %}<div class="muted">{{ t.no_data }}</div>{% endfor %}
+</div>
+<div class="metric">
+  <div class="head">{{ icon('activity') }} {{ t.metric_network }}{% if m.net_iface %} <span class="badge">{{ m.net_iface }}</span>{% endif %}</div>
+  {% if m.rx_mbit is not none %}
+  <div class="rates"><span class="down">{{ icon('arrow-down') }} {{ fmt_mbit(m.rx_mbit) }}</span><span class="up">{{ icon('arrow-up') }} {{ fmt_mbit(m.tx_mbit) }}</span></div>
+  <div class="hint">{{ t.metric_net_hint }}</div>
+  {% else %}<div class="muted">{{ t.no_data }}</div>{% endif %}
+</div>
+<div class="metric">
+  <div class="head">{{ icon('clock') }} {{ t.metric_uptime }}</div>
+  <div class="big">{{ fmt_uptime(m.uptime_s) }}</div>
+</div>
+{% endif %}

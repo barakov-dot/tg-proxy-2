@@ -1,7 +1,7 @@
 {% extends 'base.html' %}
+{% from '_macros.html' import icon with context %}
 {% block title %}{{ t.broadcast_report }}{% endblock %}
 {% block content %}
-<h1>{{ t.broadcast_report }} #{{ r.broadcast_id }}</h1>
-{% include '_broadcast_report.html' %}
-<p><a href="{{ url('/broadcast') }}">‹ {{ t.nav_broadcast }}</a></p>
+<div class="page-head"><a class="btn icon" href="{{ url('/broadcast') }}" aria-label="{{ t.nav_broadcast }}">{{ icon('chevron-left') }}</a><h1>{{ t.broadcast_report }} #{{ r.broadcast_id }}</h1></div>
+<section class="card">{% include '_broadcast_report.html' %}</section>
 {% endblock %}

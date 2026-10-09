@@ -1,18 +1,19 @@
 {% extends 'base.html' %}
+{% from '_macros.html' import icon with context %}
 {% block title %}{{ t.created_title }}{% endblock %}
 {% block content %}
-<h1>{{ t.created_title }}</h1>
-<div class="alert ok">{{ t.created_ok.format(n=created|length) }}</div>
-<form id="created-form" method="post" action="{{ url('/users/reveal-many') }}">
+<div class="page-head"><h1>{{ t.created_title }}</h1></div>
+<div class="alert ok">{{ icon('check') }} {{ t.created_ok.format(n=created|length) }}</div>
+<form id="created-form" class="card pad-0" method="post" action="{{ url('/users/reveal-many') }}">
 <input type="hidden" name="csrf_token" value="{{ csrf }}">
-<table><thead><tr><th></th><th>ID</th><th>{{ t.col_name }}</th><th>{{ t.col_expires_at }}</th><th></th></tr></thead><tbody>
+<div class="table-wrap"><table><thead><tr><th></th><th>ID</th><th>{{ t.col_name }}</th><th>{{ t.col_expires_at }}</th><th></th></tr></thead><tbody>
 {% for u in created %}
-<tr><td><input type="checkbox" name="ids" value="{{ u.id }}" checked></td><td>{{ u.id }}</td><td><a href="{{ url('/users/' ~ u.id) }}">{{ u.name }}</a></td>
+<tr><td><input type="checkbox" name="ids" value="{{ u.id }}" checked aria-label="{{ u.name }}"></td><td>{{ u.id }}</td><td><a href="{{ url('/users/' ~ u.id) }}">{{ u.name }}</a></td>
 <td>{{ fmt(u.expires_at) if u.expires_at else t.no_expiry }}</td>
-<td><button type="button" hx-post="{{ url('/users/' ~ u.id ~ '/reveal') }}" hx-target="#reveal-{{ u.id }}" hx-swap="innerHTML" hx-include="[name=csrf_token]">{{ t.reveal }}</button><div id="reveal-{{ u.id }}"></div></td></tr>
+<td><button type="button" hx-post="{{ url('/users/' ~ u.id ~ '/reveal') }}" hx-target="#reveal-{{ u.id }}" hx-swap="innerHTML" hx-include="[name=csrf_token]">{{ icon('eye') }} {{ t.reveal }}</button><div id="reveal-{{ u.id }}"></div></td></tr>
 {% endfor %}
-</tbody></table>
-<button type="button" hx-post="{{ url('/users/reveal-many') }}" hx-target="#reveal-many" hx-include="#created-form">{{ t.reveal_all }}</button>
+</tbody></table></div>
+<div class="bulk"><button type="button" hx-post="{{ url('/users/reveal-many') }}" hx-target="#reveal-many" hx-include="#created-form">{{ icon('eye') }} {{ t.reveal_all }}</button></div>
 </form>
 <div id="reveal-many"></div>
 {% endblock %}

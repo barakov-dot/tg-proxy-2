@@ -96,7 +96,9 @@ def create_app(ctx: WebContext, root_path: str) -> FastAPI:
         h["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
         path = request.scope.get("path", "")
         if "/static/" in path and response.status_code == 200:
-            h.setdefault("Cache-Control", "public, max-age=86400")
+            h.setdefault(
+                "Cache-Control", "no-cache"
+            )  # revalidate (ETag): CSS/JS edits show up at once
         else:
             h["Cache-Control"] = "no-store"
         return response

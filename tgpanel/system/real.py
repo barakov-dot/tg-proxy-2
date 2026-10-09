@@ -33,6 +33,7 @@ from typing import Any
 from tgpanel.system.ops import (
     CertInfo,
     CheckResult,
+    DiskUsage,
     FileStat,
     HttpResult,
     LocalFile,
@@ -417,6 +418,16 @@ class RealSystemOps:
             )
 
         return await _fs(_stat)
+
+    async def disk_usage(self, path: str) -> DiskUsage:
+        validate_path(path)
+
+        def _usage() -> DiskUsage:
+            st = os.statvfs(path)
+            total = st.f_blocks * st.f_frsize
+            return DiskUsage(total=total, used=total - st.f_bfree * st.f_frsize)
+
+        return await _fs(_usage)
 
     async def list_dir(self, path: str) -> list[str]:
         validate_path(path)

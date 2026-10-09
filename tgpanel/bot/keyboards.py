@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
-from tgpanel.bot import texts
+from tgpanel.bot import icons, texts
 from tgpanel.services.api import UserRow
 
 PAGE_SIZE = 10  # divides the service page size (50)
@@ -70,8 +70,11 @@ def user_list(
     next_filter = FILTERS[(FILTERS.index(flt) + 1) % len(FILTERS)]
     next_sort = SORTS[(SORTS.index(sort) + 1) % len(SORTS)]
     controls = [
-        btn(f"Фильтр: {texts.FILTER_NAMES[flt]}", list_state(0, next_filter, sort, search)),
-        btn(f"Сортировка: {texts.SORT_NAMES[sort]}", list_state(0, flt, next_sort, search)),
+        btn(
+            f"{icons.FILTER} Фильтр: {texts.FILTER_NAMES[flt]}",
+            list_state(0, next_filter, sort, search),
+        ),
+        btn(f"{icons.SORT} Сорт.: {texts.SORT_NAMES[sort]}", list_state(0, flt, next_sort, search)),
     ]
     search_row = [btn(texts.BTN_SEARCH, "se")]
     if search:
@@ -125,15 +128,18 @@ def skip_button(data: str) -> InlineKeyboardMarkup:
 def mode_menu(mode: str) -> InlineKeyboardMarkup:
     other = "approval" if mode == "open" else "open"
     return kb(
-        [btn(f"Переключить: {texts.mode_label(other)}", f"ms:{other}")],
+        [btn(f"{icons.SWITCH} {texts.mode_label(other).capitalize()}", f"ms:{other}")],
         menu_row(),
     )
 
 
 def broadcast_menu(selected: int) -> InlineKeyboardMarkup:
     return kb(
-        [btn("Всем", "bca"), btn(f"Выбранным ({selected})", "bcs")],
-        [btn("Сбросить выбор", "bcx")],
+        [
+            btn(f"{icons.BROADCAST} Всем", "bca"),
+            btn(f"{icons.SELECT} Выбранным ({selected})", "bcs"),
+        ],
+        [btn(f"{icons.CLEAR} Сбросить выбор", "bcx")],
         menu_row(),
     )
 

@@ -275,3 +275,11 @@ async def test_caddy_validate_sets_throwaway_xdg_dirs(tmp_path: Path) -> None:
     ops = RealSystemOps(caddy_bin=str(script))
     res = await ops.caddy_validate("/etc/caddy/Caddyfile", {})
     assert res.output == "/run/tgpanel/caddy-validate /run/tgpanel/caddy-validate"
+
+
+async def test_real_disk_usage_uses_statvfs(tmp_path: Path) -> None:
+    usage = await RealSystemOps().disk_usage(str(tmp_path))
+    st = os.statvfs(tmp_path)
+    assert usage.total == st.f_blocks * st.f_frsize and 0 <= usage.used <= usage.total
+    with pytest.raises(SystemOpsError):
+        await RealSystemOps().disk_usage(str(tmp_path / "missing"))

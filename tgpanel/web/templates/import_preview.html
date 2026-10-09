@@ -1,15 +1,16 @@
 {% extends 'base.html' %}
+{% from '_macros.html' import icon with context %}
 {% block title %}{{ t.nav_import }}{% endblock %}
 {% block content %}
-<h1>{{ t.import_preview_title }}</h1>
-<div class="alert warn">{{ t.import_stop_old_bot }}</div>
+<div class="page-head"><h1>{{ t.import_preview_title }}</h1></div>
+<div class="alert warn">{{ icon('alert') }} {{ t.import_stop_old_bot }}</div>
 {% for w in p.warnings %}<div class="alert warn">{{ w }}</div>{% endfor %}
 {% for n in notes %}<div class="alert err">{{ n }}</div>{% endfor %}
 {% for e in p.errors %}<div class="alert err" role="alert">{{ e }}</div>{% endfor %}
-<form method="post" action="{{ url('/import/confirm') }}" id="import-form">
+<form method="post" action="{{ url('/import/confirm') }}" id="import-form" class="card pad-0">
   <input type="hidden" name="csrf_token" value="{{ csrf }}">
   <input type="hidden" name="regex" value="{{ regex }}">
-  <textarea name="csv_text" hidden>{{ csv_text }}</textarea>
+  <textarea name="csv_text" hidden aria-hidden="true">{{ csv_text }}</textarea>
   <input type="hidden" name="n" value="{{ p.rows|length }}">
   <div class="table-wrap"><table>
   <thead><tr><th>{{ t.import_source }}</th><th>{{ t.col_tg_id }}</th><th>{{ t.col_name }}</th><th>{{ t.col_comment }}</th><th>{{ t.col_pool_id }}</th><th>{{ t.import_address }}</th><th>{{ t.import_skip }}</th></tr></thead>
@@ -18,21 +19,23 @@
   <tr>
     <td>{{ row.source_name }}<input type="hidden" name="src_{{ loop.index0 }}" value="{{ row.source_name }}"></td>
     {% if row.will_import %}
-    <td><input name="tg_{{ loop.index0 }}" value="{{ row.tg_id if row.tg_id is not none else '' }}" inputmode="numeric"><input type="hidden" name="otg_{{ loop.index0 }}" value="{{ row.tg_id if row.tg_id is not none else '' }}"></td>
-    <td><input name="dn_{{ loop.index0 }}" value="{{ row.display_name }}"><input type="hidden" name="odn_{{ loop.index0 }}" value="{{ row.display_name }}"></td>
-    <td><input name="cm_{{ loop.index0 }}" value="{{ row.comment }}"><input type="hidden" name="ocm_{{ loop.index0 }}" value="{{ row.comment }}"></td>
-    <td>{{ r.pool_id }}{% if r.new_pool %} ({{ t.import_new_pool }}){% endif %} :{{ r.pool_port }}</td>
-    <td>{{ r.loopback_ip }}</td>
-    <td><input type="checkbox" name="skip_{{ loop.index0 }}" value="1"></td>
+    <td><input name="tg_{{ loop.index0 }}" value="{{ row.tg_id if row.tg_id is not none else '' }}" inputmode="numeric" aria-label="{{ t.col_tg_id }}" class="short"><input type="hidden" name="otg_{{ loop.index0 }}" value="{{ row.tg_id if row.tg_id is not none else '' }}"></td>
+    <td><input name="dn_{{ loop.index0 }}" value="{{ row.display_name }}" aria-label="{{ t.col_name }}"><input type="hidden" name="odn_{{ loop.index0 }}" value="{{ row.display_name }}"></td>
+    <td><input name="cm_{{ loop.index0 }}" value="{{ row.comment }}" aria-label="{{ t.col_comment }}"><input type="hidden" name="ocm_{{ loop.index0 }}" value="{{ row.comment }}"></td>
+    <td>{{ r.pool_id }}{% if r.new_pool %} <span class="badge info">{{ t.import_new_pool }}</span>{% endif %} <code>:{{ r.pool_port }}</code></td>
+    <td><code>{{ r.loopback_ip }}</code></td>
+    <td><input type="checkbox" name="skip_{{ loop.index0 }}" value="1" aria-label="{{ t.import_skip }}"></td>
     {% else %}
-    <td colspan="6">{{ t.import_skipped }}: {{ row.skip_reason }}</td>
+    <td colspan="6" class="muted">{{ t.import_skipped }}: {{ row.skip_reason }}</td>
     {% endif %}
   </tr>
   {% endfor %}
   </tbody></table></div>
-  <p>{{ t.import_will.format(n=p.importable) }}</p>
-  <label class="chk"><input type="checkbox" name="ack_old_bot" value="1"> {{ t.import_ack }}</label>
-  <button type="submit" formaction="{{ url('/import/preview') }}" name="action" value="recalc">{{ t.import_recalc }}</button>
-  <button type="submit" class="primary"{% if p.blocked %} disabled{% endif %}>{{ t.import_confirm }}</button>
+  <div class="bulk">
+    <span>{{ t.import_will.format(n=p.importable) }}</span><span class="spacer"></span>
+    <label class="chk"><input type="checkbox" name="ack_old_bot" value="1"> {{ t.import_ack }}</label>
+    <button type="submit" formaction="{{ url('/import/preview') }}" name="action" value="recalc">{{ icon('refresh') }} {{ t.import_recalc }}</button>
+    <button type="submit" class="primary"{% if p.blocked %} disabled{% endif %}>{{ icon('import') }} {{ t.import_confirm }}</button>
+  </div>
 </form>
 {% endblock %}

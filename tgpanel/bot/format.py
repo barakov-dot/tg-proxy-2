@@ -6,7 +6,7 @@ import html
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
-from tgpanel.bot import texts
+from tgpanel.bot import icons, texts
 
 
 def esc(value: object) -> str:
@@ -29,7 +29,9 @@ def fmt_dt(value: datetime | None, tz: str, empty: str = "—") -> str:
 
 
 def status_mark(status: str) -> str:
-    return {"active": "●", "disabled": "○", "expired": "×"}.get(status, "?")
+    return {"active": icons.ACTIVE, "disabled": icons.DISABLED, "expired": icons.EXPIRED}.get(
+        status, "?"
+    )
 
 
 def status_ru(status: str) -> str:

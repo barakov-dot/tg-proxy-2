@@ -1,21 +1,33 @@
 {% extends 'base.html' %}
+{% from '_macros.html' import icon, status_badge with context %}
 {% block title %}{{ u.name }}{% endblock %}
+{% block head %}
+<script src="{{ url('/static/vendor/echarts.min.js') }}" defer></script>
+<script src="{{ url('/static/chart.js') }}" defer></script>
+{% endblock %}
 {% block content %}
-<p><a href="{{ url('/users') }}">‹ {{ t.nav_users }}</a></p>
-<h1>{{ u.name }} <small>#{{ u.id }}</small></h1>
+<div class="page-head">
+  <a class="btn icon" href="{{ url('/users') }}" aria-label="{{ t.nav_users }}" title="{{ t.nav_users }}">{{ icon('chevron-left') }}</a>
+  <h1>{{ u.name }} <small>#{{ u.id }}</small></h1>
+  {{ status_badge(u.status.value) }}
+</div>
 <div class="grid">
 <section class="card">
+  <h2>{{ t.card_profile }}</h2>
   <form method="post" action="{{ url('/users/' ~ u.id ~ '/meta') }}">
     <input type="hidden" name="csrf_token" value="{{ csrf }}">
-    <label>{{ t.col_name }} <input name="name" value="{{ u.name }}" maxlength="100" required></label>
-    <label>{{ t.col_tg_id }} <input name="tg_id" inputmode="numeric" value="{{ u.tg_id if u.tg_id is not none else '' }}"></label>
-    <label class="chk"><input type="checkbox" name="clear_tg_id" value="1"> {{ t.clear_tg_id }}</label>
-    <label>{{ t.col_tg_username }} <input name="tg_username" value="{{ extra.tg_username if extra and extra.tg_username else '' }}" maxlength="64"></label>
-    <label>{{ t.col_comment }} <textarea name="comment" rows="5" maxlength="2000" class="wide">{{ u.comment }}</textarea></label>
-    <button type="submit" class="primary">{{ t.save }}</button>
+    <div class="form-grid">
+      <label>{{ t.col_name }} <input name="name" value="{{ u.name }}" maxlength="100" required class="wide"></label>
+      <label>{{ t.col_tg_id }} <input name="tg_id" inputmode="numeric" value="{{ u.tg_id if u.tg_id is not none else '' }}" class="wide"></label>
+      <label class="chk"><input type="checkbox" name="clear_tg_id" value="1"> {{ t.clear_tg_id }}</label>
+      <label>{{ t.col_tg_username }} <input name="tg_username" value="{{ extra.tg_username if extra and extra.tg_username else '' }}" maxlength="64" class="wide"></label>
+      <label class="wide-field">{{ t.col_comment }} <textarea name="comment" rows="4" maxlength="2000">{{ u.comment }}</textarea></label>
+    </div>
+    <p><button type="submit" class="primary">{{ icon('save') }} {{ t.save }}</button></p>
   </form>
 </section>
 <section class="card">
+  <h2>{{ t.card_info }}</h2>
   <dl>
     <dt>{{ t.col_status }}</dt><dd>{{ t['status_' ~ u.status.value] }}{% if extra and extra.disabled_reason %} ({{ extra.disabled_reason }}){% endif %}</dd>
     <dt>{{ t.col_created_at }}</dt><dd>{{ fmt(extra.created_at) if extra else '—' }}</dd>
@@ -28,61 +40,61 @@
     <dt>{{ t.imported }}</dt><dd>{{ (t.yes ~ (' — ' ~ u.source_profile_name if u.source_profile_name else '')) if u.imported else t.no }}</dd>
   </dl>
 </section>
+<section class="card">
+  <h2>{{ t.access }}</h2>
+  <button type="button" hx-post="{{ url('/users/' ~ u.id ~ '/reveal') }}" hx-target="#reveal" hx-swap="innerHTML">{{ icon('eye') }} {{ t.reveal }}</button>
+  <div id="reveal"></div>
+</section>
 </div>
 
 <section class="card">
-  <h2>{{ t.access }}</h2>
-  <button type="button" hx-post="{{ url('/users/' ~ u.id ~ '/reveal') }}" hx-target="#reveal" hx-swap="innerHTML">{{ t.reveal }}</button>
-  <div id="reveal"></div>
-</section>
-
-<section class="card">
-  <h2>{{ t.traffic }}</h2>
-  <div class="presets">
-    {% for p in ['24h','7d','30d','all'] %}<button type="button" data-preset="{{ p }}">{{ t['period_' ~ p] }}</button>{% endfor %}
+  <div class="card-head">
+    <h2>{{ icon('activity') }} {{ t.traffic }}</h2>
+    <div class="segmented" role="group" aria-label="{{ t.f_period }}">
+      {% for p in ['24h','7d','30d','all'] %}<button type="button" data-preset="{{ p }}" aria-pressed="{{ 'true' if p == '30d' else 'false' }}">{{ t['period_' ~ p] }}</button>{% endfor %}
+    </div>
   </div>
-  <div id="traffic-chart" class="chart" data-url="{{ url('/users/' ~ u.id ~ '/traffic.json') }}" data-label-up="{{ t.up }}" data-label-down="{{ t.down }}" data-label-total="{{ t.total }}" data-label-error="{{ t.traffic_unavailable }}"></div>
-  <p id="traffic-totals" aria-live="polite"></p>
+  <div id="traffic-chart" class="chart small" data-totals="traffic-totals" data-default="30d" data-zoom="1" role="img" aria-label="{{ t.traffic }}" data-url="{{ url('/users/' ~ u.id ~ '/traffic.json') }}" data-label-up="{{ t.up }}" data-label-down="{{ t.down }}" data-label-total="{{ t.total }}" data-label-error="{{ t.traffic_unavailable }}"></div>
+  <p id="traffic-totals" class="hint" aria-live="polite"></p>
 </section>
 
 <section class="card">
   <h2>{{ t.actions }}</h2>
-  <div class="actions">
-  {% macro act(action, label, cls='') %}
+  {% macro act(action, label, ic, cls='') %}
   <form method="post" action="{{ url('/users/' ~ u.id ~ '/action') }}" class="inline">
     <input type="hidden" name="csrf_token" value="{{ csrf }}"><input type="hidden" name="action" value="{{ action }}">
-    <button type="submit" class="{{ cls }}">{{ label }}</button></form>
+    <button type="submit" class="{{ cls }}">{{ icon(ic) }} {{ label }}</button></form>
   {% endmacro %}
-  {{ act('send_link', t.act_send_link) }}
-  {% if u.status.value == 'active' %}{{ act('disable', t.act_disable) }}{% else %}{{ act('enable', t.act_enable) }}{% endif %}
-  {{ act('clear_expiry', t.act_clear_expiry) }}
+  <div class="actions">
+  {{ act('send_link', t.act_send_link, 'send') }}
+  {% if u.status.value == 'active' %}{{ act('disable', t.act_disable, 'power') }}{% else %}{{ act('enable', t.act_enable, 'power') }}{% endif %}
+  {{ act('clear_expiry', t.act_clear_expiry, 'clock') }}
   </div>
+  <div class="form-grid">
   <form method="post" action="{{ url('/users/' ~ u.id ~ '/action') }}" class="inline">
     <input type="hidden" name="csrf_token" value="{{ csrf }}"><input type="hidden" name="action" value="extend">
-    <input name="days" type="number" min="1" max="3650" value="30" class="short"> {{ t.days }} <button type="submit">{{ t.act_extend }}</button></form>
+    <input name="days" type="number" min="1" max="3650" value="30" class="short" aria-label="{{ t.days }}"> {{ t.days }} <button type="submit">{{ icon('calendar') }} {{ t.act_extend }}</button></form>
   <form method="post" action="{{ url('/users/' ~ u.id ~ '/action') }}" class="inline">
     <input type="hidden" name="csrf_token" value="{{ csrf }}"><input type="hidden" name="action" value="set_expiry">
-    <input type="date" name="expires_date" required> <label class="chk"><input type="checkbox" name="confirm_past" value="1"> {{ t.expiry_past_label }}</label> <button type="submit">{{ t.act_set_expiry }}</button></form>
+    <input type="date" name="expires_date" required aria-label="{{ t.act_set_expiry }}"> <label class="chk"><input type="checkbox" name="confirm_past" value="1"> {{ t.expiry_past_label }}</label> <button type="submit">{{ icon('calendar') }} {{ t.act_set_expiry }}</button></form>
   <form method="post" action="{{ url('/users/' ~ u.id ~ '/action') }}" class="inline">
     <input type="hidden" name="csrf_token" value="{{ csrf }}"><input type="hidden" name="action" value="carrier">
-    <select name="carrier"><option value="">{{ t.carrier_default }}</option>{% for m in modes %}<option value="{{ m }}"{% if u.carrier_mode and u.carrier_mode.value == m %} selected{% endif %}>{{ m }}</option>{% endfor %}</select>
+    <select name="carrier" aria-label="{{ t.carrier }}"><option value="">{{ t.carrier_default }}</option>{% for m in modes %}<option value="{{ m }}"{% if u.carrier_mode and u.carrier_mode.value == m %} selected{% endif %}>{{ m }}</option>{% endfor %}</select>
     <button type="submit">{{ t.act_carrier }}</button></form>
   <form method="post" action="{{ url('/users/' ~ u.id ~ '/action') }}" class="inline">
     <input type="hidden" name="csrf_token" value="{{ csrf }}"><input type="hidden" name="action" value="reissue">
-    <label class="chk"><input type="checkbox" name="confirm" value="1"> {{ t.reissue_confirm }}</label> <button type="submit" class="danger">{{ t.act_reissue }}</button></form>
+    <label class="chk"><input type="checkbox" name="confirm" value="1"> {{ t.reissue_confirm }}</label> <button type="submit" class="danger">{{ icon('refresh') }} {{ t.act_reissue }}</button></form>
   <form method="post" action="{{ url('/users/' ~ u.id ~ '/action') }}" class="inline">
     <input type="hidden" name="csrf_token" value="{{ csrf }}"><input type="hidden" name="action" value="delete">
-    <input name="confirm_name" placeholder="{{ t.delete_type_name }}" autocomplete="off"> <button type="submit" class="danger">{{ t.act_delete }}</button></form>
+    <input name="confirm_name" placeholder="{{ t.delete_type_name }}" aria-label="{{ t.delete_type_name }}" autocomplete="off"> <button type="submit" class="danger">{{ icon('trash') }} {{ t.act_delete }}</button></form>
+  </div>
 </section>
 
-<section class="card">
-  <h2>{{ t.events }}</h2>
-  <table><thead><tr><th>{{ t.col_time }}</th><th>{{ t.col_actor }}</th><th>{{ t.col_action }}</th><th>{{ t.col_details }}</th></tr></thead><tbody>
-  {% for e in events %}<tr><td>{{ fmt(e.ts) }}</td><td>{{ e.actor }}</td><td>{{ e.action }}</td><td>{{ e.details }}</td></tr>{% else %}<tr><td colspan="4">{{ t.no_data }}</td></tr>{% endfor %}
-  </tbody></table>
+<section class="card pad-0">
+  <div class="card-head"><h2>{{ t.events }}</h2></div>
+  <div class="table-wrap">
+  <table><caption class="sr-only">{{ t.events }}</caption><thead><tr><th>{{ t.col_time }}</th><th>{{ t.col_actor }}</th><th>{{ t.col_action }}</th><th>{{ t.col_details }}</th></tr></thead><tbody>
+  {% for e in events %}<tr><td class="nowrap">{{ fmt(e.ts) }}</td><td>{{ e.actor }}</td><td>{{ e.action }}</td><td>{{ e.details }}</td></tr>{% else %}<tr><td colspan="4" class="muted">{{ t.no_data }}</td></tr>{% endfor %}
+  </tbody></table></div>
 </section>
-{% endblock %}
-{% block head %}
-<script src="{{ url('/static/vendor/echarts.min.js') }}" defer></script>
-<script src="{{ url('/static/chart.js') }}" defer></script>
 {% endblock %}

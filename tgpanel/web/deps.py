@@ -24,6 +24,7 @@ from tgpanel.services.backups import BackupOpener, BackupService
 from tgpanel.services.bulk import BulkService
 from tgpanel.services.container import AppContext
 from tgpanel.services.dashboard import DashboardView, PoolView
+from tgpanel.services.server_metrics import MetricsView
 from tgpanel.web.security import GlobalFailureLimiter, LoginLimiter
 
 log = logging.getLogger("tgpanel.web")
@@ -52,8 +53,15 @@ class TrafficPort(Protocol):
     async def user_series(
         self, user_id: int, start: datetime | None, end: datetime, max_points: int
     ) -> SeriesResult: ...
+    async def global_series(
+        self, start: datetime, end: datetime, max_points: int
+    ) -> SeriesResult: ...
     async def user_totals(self, user_id: int, period: Period) -> Totals: ...
     async def dashboard(self) -> DashboardView: ...
+
+
+class MetricsPort(Protocol):
+    async def snapshot(self) -> MetricsView: ...
 
 
 # ------------------------------------------------------------------------- requests port
@@ -132,6 +140,7 @@ class WebContext:
     clock: Callable[[], datetime] | None = None  # defaults to the pipeline clock
     global_limiter: GlobalFailureLimiter = field(default_factory=GlobalFailureLimiter)
     sleep: Callable[[float], Awaitable[None]] = asyncio.sleep  # login delay (tests inject)
+    metrics: MetricsPort | None = None  # server metrics (CPU/memory/disk/network)
     restart_bot: RestartBot | None = None  # restarts only the bot task; True if it will do
     backup_opener: BackupOpener | None = None
     write_env: WriteEnv | None = None  # writes TGPANEL_BOT_TOKEN to the env file (0600, atomic)
@@ -179,6 +188,8 @@ __all__ = [
     "DashboardView",
     "DecisionResult",
     "LinkSendResult",
+    "MetricsPort",
+    "MetricsView",
     "OperationResult",
     "PoolView",
     "RequestsPort",

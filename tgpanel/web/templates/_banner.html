@@ -1,5 +1,6 @@
+{% from '_macros.html' import icon with context %}
 {% if banner and banner.applying %}
-<div class="alert warn" role="status" hx-get="{{ url('/apply/status') }}" hx-trigger="every 2s" hx-target="#apply-banner" hx-swap="innerHTML">{{ t.applying }}{% if banner.reason %} ({{ banner.reason }}){% endif %}</div>
+<div class="alert warn" role="status" hx-get="{{ url('/apply/status') }}" hx-trigger="every 2s" hx-target="#apply-banner" hx-swap="innerHTML">{{ icon('refresh') }} {{ t.applying }}{% if banner.reason %} ({{ banner.reason }}){% endif %}</div>
 {% elif banner and banner.failure %}
-<div class="alert err" role="alert">{{ t.last_apply_failed }} #{{ banner.failure.id }}: {{ banner.failure.error }} <a href="{{ url('/audit?tab=apply') }}">{{ t.details }}</a></div>
+<div class="alert err" role="alert">{{ icon('alert') }} {{ t.last_apply_failed }} #{{ banner.failure.id }}: {{ banner.failure.error }} <a href="{{ url('/audit?tab=apply') }}">{{ t.details }}</a></div>
 {% endif %}

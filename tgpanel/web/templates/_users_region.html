@@ -1,0 +1,66 @@
+{% from '_macros.html' import icon, status_badge, online_dot with context %}
+{% macro th(key) %}
+<th><a href="{{ qurl('/users', canon, sort=key, dir=('desc' if sort == key and not desc else 'asc'), page=None) }}"
+  hx-get="{{ qurl('/users', canon, sort=key, dir=('desc' if sort == key and not desc else 'asc'), page=None) }}" hx-target="#users-region" hx-swap="outerHTML" hx-push-url="true">{{ t['col_' ~ key] }}</a>{% if sort == key %}{{ icon('arrow-down' if desc else 'arrow-up') }}{% endif %}</th>
+{% endmacro %}
+<div id="users-region" class="region card pad-0" aria-live="polite">
+<input type="hidden" name="sort" value="{{ sort }}" form="filters">
+<input type="hidden" name="dir" value="{{ 'desc' if desc else 'asc' }}" form="filters">
+<form method="post" action="{{ url('/users/bulk') }}" id="bulk-form" data-bulk>
+  <input type="hidden" name="csrf_token" value="{{ csrf }}">
+  <input type="hidden" name="filter_qs" value="{{ filter_qs }}">
+  <input type="hidden" name="expected_total" value="{{ total }}">
+  <div class="bulk">
+    <span class="badge info" title="{{ t.found }}">{{ total }}</span>
+    <label class="chk"><input type="checkbox" id="select-page" data-select-all="ids"> {{ t.select_page }}</label>
+    <label class="chk"><input type="checkbox" name="all_matching" value="1"> {{ t.select_matching.format(n=total) }}</label>
+    <span class="count" data-selected-count data-label="{{ t.selected }}" aria-live="polite"></span>
+    <span class="spacer"></span>
+    <select name="action" aria-label="{{ t.bulk_action }}" data-bulk-action>
+      <option value="send_link">{{ t.act_send_link }}</option><option value="enable">{{ t.act_enable }}</option>
+      <option value="disable">{{ t.act_disable }}</option><option value="extend">{{ t.act_extend }}</option>
+      <option value="set_comment">{{ t.act_set_comment }}</option><option value="delete">{{ t.act_delete }}</option>
+    </select>
+    <input name="days" type="number" min="1" max="3650" placeholder="{{ t.days }}" aria-label="{{ t.days }}" class="short" data-for="extend" hidden>
+    <input name="comment" placeholder="{{ t.col_comment }}" aria-label="{{ t.col_comment }}" maxlength="2000" data-for="set_comment" hidden>
+    <input name="confirm" placeholder="{{ t.delete_word }}" aria-label="{{ t.delete_word }}" class="short" autocomplete="off" data-for="delete" hidden>
+    <button type="submit" class="primary">{{ icon('check') }} {{ t.run }}</button>
+    <button type="button" hx-post="{{ url('/users/reveal-many') }}" hx-include="input[name=ids]:checked" hx-target="#reveal-many" hx-swap="innerHTML">{{ icon('eye') }} {{ t.reveal_links }}</button>
+  </div>
+</form>
+<div class="table-wrap">
+<table class="users">
+<thead><tr><th><span class="sr-only">{{ t.select_page }}</span></th>
+{% for c in cols %}{{ th(c) }}{% endfor %}
+<th><span class="sr-only">{{ t.actions }}</span></th></tr></thead>
+<tbody>
+{% for rv in rows %}{% set u = rv.user %}
+<tr>
+  <td><input type="checkbox" name="ids" value="{{ u.id }}" form="bulk-form" aria-label="{{ t.select_row.format(name=u.name) }}"></td>
+  {% for c in cols %}<td{% if c in ('id', 'name', 'traffic', 'created_at', 'expires_at', 'first_seen_at', 'last_seen_at') %} class="nowrap"{% endif %}>
+  {%- if c == 'id' %}{{ u.id }}
+  {%- elif c == 'name' %}<a href="{{ url('/users/' ~ u.id) }}">{{ u.name }}</a>
+  {%- elif c == 'comment' %}{% with error=none, saved=false %}{% include '_comment_cell.html' %}{% endwith %}
+  {%- elif c == 'tg_id' %}{{ u.tg_id if u.tg_id is not none else '—' }}
+  {%- elif c == 'tg_username' %}{{ ('@' ~ rv.extra.tg_username) if rv.extra and rv.extra.tg_username else '—' }}
+  {%- elif c == 'status' %}{{ status_badge(u.status.value) }}
+  {%- elif c == 'online' %}{{ online_dot(rv.row.online) }}
+  {%- elif c == 'created_at' %}{{ fmt(rv.extra.created_at) if rv.extra else '—' }}
+  {%- elif c == 'expires_at' %}{{ fmt(u.expires_at) if u.expires_at else t.no_expiry }}
+  {%- elif c == 'first_seen_at' %}{{ fmt(rv.row.first_seen_at) }}
+  {%- elif c == 'last_seen_at' %}{{ fmt(rv.row.last_seen_at) }}
+  {%- elif c == 'traffic' %}↑ {{ human_bytes(rv.row.bytes_up) }} ↓ {{ human_bytes(rv.row.bytes_down) }} Σ {{ human_bytes(rv.row.bytes_up + rv.row.bytes_down) }}
+  {%- elif c == 'pool_id' %}{{ u.pool_id }}
+  {%- elif c == 'bot_started' %}{{ t.yes if rv.extra and rv.extra.bot_started else t.no }}
+  {%- endif -%}
+  </td>{% endfor %}
+  <td><div class="row-actions"><a class="btn icon" href="{{ url('/users/' ~ u.id) }}" aria-label="{{ t.open }}: {{ u.name }}" title="{{ t.open }}">{{ icon('chevron-right') }}</a></div></td>
+</tr>
+{% else %}<tr><td colspan="{{ cols|length + 2 }}" class="muted">{{ t.no_data }}</td></tr>{% endfor %}
+</tbody></table></div>
+<nav class="pager" aria-label="{{ t.pages }}">
+  {% if q.page > 1 %}<a class="btn" href="{{ qurl('/users', canon, page=q.page - 1) }}" hx-get="{{ qurl('/users', canon, page=q.page - 1) }}" hx-target="#users-region" hx-swap="outerHTML" hx-push-url="true">{{ icon('chevron-left') }} {{ t.prev }}</a>{% endif %}
+  <span>{{ q.page }} / {{ pages }}</span>
+  {% if q.page < pages %}<a class="btn" href="{{ qurl('/users', canon, page=q.page + 1) }}" hx-get="{{ qurl('/users', canon, page=q.page + 1) }}" hx-target="#users-region" hx-swap="outerHTML" hx-push-url="true">{{ t.next }} {{ icon('chevron-right') }}</a>{% endif %}
+</nav>
+</div>

@@ -10,7 +10,7 @@ from urllib.parse import urlencode
 from zoneinfo import ZoneInfo
 
 from fastapi import Path, Request, Response
-from fastapi.responses import RedirectResponse
+from fastapi.responses import JSONResponse, RedirectResponse
 from starlette.datastructures import FormData, UploadFile
 from starlette.templating import Jinja2Templates
 
@@ -282,6 +282,29 @@ def _human_bytes(value: int | float | None) -> str:
     return f"{n:.1f} ТБ"
 
 
+def _fmt_pct(value: float | None) -> str:
+    return "—" if value is None else f"{value:.0f}%"
+
+
+def _fmt_mbit(value: float | None) -> str:
+    if value is None:
+        return "—"
+    if value < 1:
+        return f"{value * 1000:.0f} кбит/с"
+    return f"{value:.1f} Мбит/с"
+
+
+def _fmt_uptime(seconds: int | None) -> str:
+    if seconds is None:
+        return "—"
+    days, rest = divmod(seconds, 86400)
+    hours, rest = divmod(rest, 3600)
+    minutes = rest // 60
+    if days:
+        return f"{days} д {hours} ч"
+    return f"{hours} ч {minutes} мин" if hours else f"{minutes} мин"
+
+
 async def banner_state(web: WebContext) -> dict[str, Any]:
     runs = await web.app.db.run(repo.list_apply_runs, 1)
     last = runs[0] if runs else None
@@ -340,6 +363,9 @@ async def render(
         "fmt": fmt,
         "qurl": lambda p, params=None, **o: url(qurl(p, params, **o)),
         "human_bytes": _human_bytes,
+        "fmt_pct": _fmt_pct,
+        "fmt_mbit": _fmt_mbit,
+        "fmt_uptime": _fmt_uptime,
         "csrf": auth.session.csrf if auth else "",
         "login": auth.session.login if auth else "",
         "page": page,
@@ -359,3 +385,20 @@ async def render(
     if flash_value is not None:
         delete_cookie(response, request, FLASH_COOKIE)
     return response
+
+
+def series_response(series: Any) -> Response:
+    """JSON for the charts: ``points`` = ``[ms, up, down]`` plus granularity and totals."""
+    points: list[list[int]] = []
+    for p in series.points:
+        ts, up, down = (p.ts, p.up, p.down) if hasattr(p, "ts") else (p[0], p[1], p[2])
+        ms = int(ts.timestamp() * 1000) if isinstance(ts, datetime) else int(float(ts) * 1000)
+        points.append([ms, int(up), int(down)])
+    return JSONResponse(
+        {
+            "granularity": series.granularity,
+            "points": points,
+            "total_up": int(series.total_up),
+            "total_down": int(series.total_down),
+        }
+    )

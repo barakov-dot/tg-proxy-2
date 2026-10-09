@@ -218,7 +218,14 @@ class Tg:
         )
 
     async def press(
-        self, uid: int, data: str, chat_type: str = "private", *, inaccessible: bool = False
+        self,
+        uid: int,
+        data: str,
+        chat_type: str = "private",
+        *,
+        inaccessible: bool = False,
+        name: str = "Tester",
+        username: str | None = None,
     ) -> None:
         self._uid += 1
         host: Message | InaccessibleMessage = Message(
@@ -232,7 +239,7 @@ class Tg:
             host = InaccessibleMessage(chat=Chat(id=uid, type=chat_type), message_id=1, date=0)
         cb = CallbackQuery(
             id=str(self._uid),
-            from_user=self._user(uid),
+            from_user=self._user(uid, name, username),
             chat_instance="ci",
             message=host,
             data=data,

@@ -15,7 +15,7 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, InlineKeyboardMarkup, Message, TelegramObject
 
 from tgpanel.apply.errors import OperationRejected
-from tgpanel.bot import keyboards, texts
+from tgpanel.bot import icons, keyboards, texts
 from tgpanel.bot.delivery import alert, send_link, show
 from tgpanel.bot.deps import BotDeps, totals_pair
 from tgpanel.bot.format import esc, fmt_dt, human_bytes, status_mark, status_ru
@@ -155,11 +155,12 @@ async def _render_list(
     rows = result.rows[offset : offset + per]
     sel = await _selected(state)
     marks = {
-        r.user.id: status_mark(r.user.status) + ("+" if r.user.id in sel else "") for r in rows
+        r.user.id: status_mark(r.user.status) + (icons.SELECTED if r.user.id in sel else "")
+        for r in rows
     }
-    head = f"Пользователи: {result.total}, страница {page + 1} из {pages}"
+    head = f"{icons.USERS} Пользователи: {result.total}, страница {page + 1} из {pages}"
     if search and query:
-        head += f"\nПоиск: «{esc(query)}»"
+        head += f"\n{icons.SEARCH} Поиск: «{esc(query)}»"
     if not rows:
         head += "\n" + texts.LIST_EMPTY
     markup = keyboards.user_list(
@@ -201,9 +202,10 @@ async def _traffic_line(deps: BotDeps, user_id: int) -> str:
         p: Period = period  # type: ignore[assignment]
         try:
             up, down = totals_pair(await deps.traffic.user_totals(user_id, p))
-            parts.append(f"{label}: ↑{human_bytes(up)} ↓{human_bytes(down)}")
+            traffic = f"{icons.UP}{human_bytes(up)} {icons.DOWN}{human_bytes(down)}"
+            parts.append(f"{icons.APPLY} {label}: {traffic}")
         except Exception:
-            parts.append(f"{label}: нет данных")
+            parts.append(f"{icons.APPLY} {label}: нет данных")
     return "\n".join(parts)
 
 
@@ -222,13 +224,13 @@ async def _card(
     if extra.bot_started and not extra.can_message:
         bot_state = "заблокирован"
     lines = [
-        f"<b>{esc(user.name)}</b> (#{user.id})",
-        f"Статус: {status_ru(user.status)}",
-        f"Срок: {fmt_dt(user.expires_at, tz, 'без срока')}",
-        f"Комментарий: {esc(user.comment) if user.comment else '—'}",
-        f"Telegram: {tg}",
-        f"Бот: {bot_state}",
-        f"Последняя активность: {fmt_dt(extra.last_seen_at, tz)}",
+        f"{icons.USER} <b>{esc(user.name)}</b> (#{user.id})",
+        f"{status_mark(user.status)} Статус: {status_ru(user.status)}",
+        f"{icons.TERM} Срок: {fmt_dt(user.expires_at, tz, 'без срока')}",
+        f"{icons.COMMENT} Комментарий: {esc(user.comment) if user.comment else '—'}",
+        f"{icons.TELEGRAM} Telegram: {tg}",
+        f"{icons.BOT} Бот: {bot_state}",
+        f"{icons.DATE} Последняя активность: {fmt_dt(extra.last_seen_at, tz)}",
         await _traffic_line(deps, uid),
     ]
     selected = uid in await _selected(state)
@@ -396,7 +398,7 @@ async def cb_requests(cb: CallbackQuery, deps: BotDeps, bot: Bot) -> None:
     if not pending:
         await show(cb, texts.NO_REQUESTS, keyboards.kb(keyboards.menu_row()))
         return
-    await show(cb, f"Заявок: {len(pending)}", keyboards.kb(keyboards.menu_row()))
+    await show(cb, f"{icons.REQUESTS} Заявок: {len(pending)}", keyboards.kb(keyboards.menu_row()))
     tz = (await deps.settings.snapshot()).timezone
     for req in pending[:20]:
         text = texts.request_card(
@@ -502,7 +504,9 @@ async def cb_apply_status(cb: CallbackQuery, deps: BotDeps) -> None:
     runs = await deps.db.run(repo.list_apply_runs, 5)
     tz = (await deps.settings.snapshot()).timezone
     lines = [
-        "Применяется сейчас." if deps.pipeline.is_applying else "Сейчас ничего не применяется."
+        f"{icons.APPLY} Применяется сейчас."
+        if deps.pipeline.is_applying
+        else f"{icons.APPLY} Сейчас ничего не применяется."
     ]
     for run in runs:
         line = f"#{run.id} {esc(run.status)}: {esc(run.reason)}, {fmt_dt(run.started_at, tz)}"
@@ -525,9 +529,13 @@ async def cb_backup(cb: CallbackQuery, deps: BotDeps) -> None:
             if isinstance(exc, OperationRejected | RuntimeError)
             else texts.ERROR_GENERIC
         )
-        await show(cb, "Бэкап не создан: " + text, keyboards.kb(keyboards.menu_row()))
+        await show(cb, f"{icons.WARN} Бэкап не создан: " + text, keyboards.kb(keyboards.menu_row()))
         return
-    await show(cb, f"Бэкап создан, {human_bytes(info.size)}.", keyboards.kb(keyboards.menu_row()))
+    await show(
+        cb,
+        f"{icons.OK} Бэкап создан, {human_bytes(info.size)}.",
+        keyboards.kb(keyboards.menu_row()),
+    )
 
 
 # ------------------------------------------------------------------ create user dialog
@@ -652,9 +660,11 @@ async def cb_broadcast_scope(cb: CallbackQuery, state: FSMContext) -> None:
 
 
 def _preview_text(preview: BroadcastPreview) -> str:
-    lines = [f"Получат: {len(preview.included)}. Исключены: {len(preview.excluded)}."]
+    lines = [
+        f"{icons.BROADCAST} Получат: {len(preview.included)}. Исключены: {len(preview.excluded)}."
+    ]
     for r in preview.excluded[:15]:
-        lines.append(f"• {esc(r.name)}: {r.reason_text}")
+        lines.append(f"{icons.WARN} {esc(r.name)}: {r.reason_text}")
     if len(preview.excluded) > 15:
         lines.append(f"…и ещё {len(preview.excluded) - 15}")
     return "\n".join(lines)
@@ -688,13 +698,13 @@ async def cb_broadcast_go(cb: CallbackQuery, deps: BotDeps, state: FSMContext, b
     await state.update_data(bc=None)  # a second click finds no draft: no double send
     admin = cb.from_user.id
     ids, template = draft.get("ids"), str(draft["tpl"])
-    await show(cb, "Рассылка запущена.", keyboards.kb(keyboards.menu_row()))
+    await show(cb, f"{icons.BROADCAST} Рассылка запущена.", keyboards.kb(keyboards.menu_row()))
 
     async def job() -> None:
         try:
             rep = await deps.broadcast.start(template, actor_of(admin), ids)
             text = (
-                f"Рассылка #{rep.broadcast_id} завершена: отправлено {rep.sent}, "
+                f"{icons.OK} Рассылка #{rep.broadcast_id} завершена: отправлено {rep.sent}, "
                 f"бот заблокирован {rep.forbidden}, ошибок {rep.errors}, "
                 f"пропущено {rep.skipped}."
             )
@@ -718,7 +728,9 @@ async def cb_broadcast_report(cb: CallbackQuery, deps: BotDeps, m: re.Match[str]
     except OperationRejected as exc:
         await alert(cb, str(exc))
         return
-    lines = [f"Рассылка #{rep.broadcast_id}: всего {rep.total}, отправлено {rep.sent}."]
+    lines = [
+        f"{icons.REPORT} Рассылка #{rep.broadcast_id}: всего {rep.total}, отправлено {rep.sent}."
+    ]
     for item in rep.items[:60]:
         lines.append(f"• {esc(item.name or item.tg_id or '?')}: {item.result_text}")
     if rep.total > 60:

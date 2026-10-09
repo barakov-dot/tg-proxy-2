@@ -1,7 +1,8 @@
 {% extends 'base.html' %}
+{% from '_macros.html' import icon with context %}
 {% block title %}{{ t.nav_broadcast }}{% endblock %}
 {% block content %}
-<h1>{{ t.nav_broadcast }}</h1>
+<div class="page-head"><h1>{{ t.nav_broadcast }}</h1></div>
 {% if error %}<div class="alert err" role="alert">{{ error }}</div>{% endif %}
 <form method="post" action="{{ url('/broadcast/preview') }}" class="card">
   <input type="hidden" name="csrf_token" value="{{ csrf }}">
@@ -9,16 +10,16 @@
     <label class="chk"><input type="radio" name="audience" value="active"{% if audience == 'active' %} checked{% endif %}> {{ t.audience_active }}</label>
     <label class="chk"><input type="radio" name="audience" value="all"{% if audience == 'all' %} checked{% endif %}> {{ t.audience_all }}</label>
   </fieldset>
-  <label>{{ t.broadcast_template }} <textarea name="template" rows="6" maxlength="3500" class="wide" required>{{ template }}</textarea></label>
+  <p><label>{{ t.broadcast_template }} <textarea name="template" rows="6" maxlength="3500" required>{{ template }}</textarea></label></p>
   <p class="hint">{{ t.broadcast_placeholders }}</p>
-  <button type="submit">{{ t.preview }}</button>
+  <div class="actions"><button type="submit">{{ icon('eye') }} {{ t.preview }}</button></div>
   {% if preview %}
   <input type="hidden" name="form_token" value="{{ form_token }}">
   <div class="alert ok">
     <p>{{ t.broadcast_recipients }}: {{ preview.recipients }}; {{ t.broadcast_sendable }}: {{ preview.sendable }}; {{ t.broadcast_skipped }}: {{ preview.skipped }}</p>
     <pre class="sample">{{ preview.sample }}</pre>
   </div>
-  <button type="submit" class="primary" formaction="{{ url('/broadcast/start') }}">{{ t.broadcast_send }}</button>
+  <button type="submit" class="primary" formaction="{{ url('/broadcast/start') }}">{{ icon('send') }} {{ t.broadcast_send }}</button>
   {% endif %}
 </form>
 {% endblock %}

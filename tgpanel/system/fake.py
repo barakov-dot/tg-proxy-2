@@ -23,6 +23,7 @@ from typing import Any, Literal
 from tgpanel.system.ops import (
     CertInfo,
     CheckResult,
+    DiskUsage,
     FileStat,
     HttpResult,
     LocalFile,
@@ -89,6 +90,7 @@ class FakeSystemOps:
         # files / dirs
         self.files: dict[str, FakeFile] = {}
         self.dirs: set[str] = {"/"}
+        self.disks: dict[str, DiskUsage] = {"/": DiskUsage(100 * 2**30, 40 * 2**30)}
         self.strict_dirs = strict_dirs
         # call log: (method, *args). Secrets-bearing payloads (file data) are never logged.
         self.calls: list[tuple[Any, ...]] = []
@@ -368,6 +370,19 @@ class FakeSystemOps:
         self._enter("stat", path)
         f = self._get(path)
         return FileStat(f.mode, f.owner, f.group, len(f.data))
+
+    async def disk_usage(self, path: str) -> DiskUsage:
+        validate_path(path)
+        self._enter("disk_usage", path)
+        best = ""
+        for mount in self.disks:  # longest matching mount point wins
+            if (path == mount or path.startswith(mount.rstrip("/") + "/")) and len(mount) > len(
+                best
+            ):
+                best = mount
+        if not best:
+            raise SystemOpsError("disk usage failed: no such mount")
+        return self.disks[best]
 
     async def list_dir(self, path: str) -> list[str]:
         validate_path(path)

@@ -31,6 +31,10 @@ class TrafficAdapter:
         res = await self._svc.user_series(user_id, lo, end, max_points)
         return SeriesResult(res.granularity, res.points, res.total_up, res.total_down)
 
+    async def global_series(self, start: datetime, end: datetime, max_points: int) -> SeriesResult:
+        res = await self._svc.global_series(start, end, max_points)
+        return SeriesResult(res.granularity, res.points, res.total_up, res.total_down)
+
     async def user_totals(self, user_id: int, period: Period) -> Totals:
         t = await self._svc.user_totals(user_id, period)
         return Totals(t.up, t.down)

@@ -22,6 +22,7 @@ from tgpanel.domain.expiry import Term
 from tgpanel.domain.queries import Period
 from tgpanel.services.api import NewUser
 from tgpanel.services.container import AppContext, build_context
+from tgpanel.services.server_metrics import DiskView, MetricsView
 from tgpanel.system.fake import FakeSystemOps
 from tgpanel.web.app import create_app
 from tgpanel.web.deps import (
@@ -67,6 +68,7 @@ class FakeTraffic:
     def __init__(self) -> None:
         self.fail = False
         self.calls: list[tuple[int, datetime | None]] = []
+        self.global_calls: list[tuple[datetime, datetime]] = []
 
     async def user_series(
         self, user_id: int, start: datetime | None, end: datetime, max_points: int
@@ -75,6 +77,12 @@ class FakeTraffic:
             raise RuntimeError("boom")
         self.calls.append((user_id, start))
         return SeriesResult("hour", [(end, 10, 20), (end, 5, 5)], 15, 25)
+
+    async def global_series(self, start: datetime, end: datetime, max_points: int) -> SeriesResult:
+        if self.fail:
+            raise RuntimeError("boom")
+        self.global_calls.append((start, end))
+        return SeriesResult("hour", [(start, 100, 200), (end, 50, 60)], 150, 260)
 
     async def user_totals(self, user_id: int, period: Period) -> Totals:
         return Totals(1, 2)
@@ -94,6 +102,27 @@ class FakeTraffic:
             relay_ok=True,
             services={"tproxy-server": True},
             cert_days_left=40,
+        )
+
+
+class FakeMetrics:
+    def __init__(self) -> None:
+        self.fail = False
+
+    async def snapshot(self) -> MetricsView:
+        if self.fail:
+            raise RuntimeError("boom")
+        return MetricsView(
+            cpu_pct=37.0,
+            cores=4,
+            load=(0.5, 0.4, 0.3),
+            mem_used=2 * 2**30,
+            mem_total=8 * 2**30,
+            disks=(DiskView("/", 40 * 2**30, 100 * 2**30),),
+            net_iface="eth0",
+            rx_mbit=12.5,
+            tx_mbit=3.2,
+            uptime_s=90_000,
         )
 
 
@@ -140,6 +169,7 @@ class Web:
     fake: FakeSystemOps
     clock: Clock
     traffic: FakeTraffic
+    metrics: FakeMetrics
     requests: FakeRequests
     broadcast: FakeBroadcast
     env_writes: list[tuple[str, str]] = field(default_factory=list)
@@ -214,6 +244,7 @@ async def build(tmp_path: Path, variant: str) -> AsyncIterator[Web]:
     assert out.ok, out.error
     await ctx.users.load_hostname()
     traffic, requests, broadcast = FakeTraffic(), FakeRequests(), FakeBroadcast()
+    metrics = FakeMetrics()
     env_writes: list[tuple[str, str]] = []
     delays = Recorder()
     bot_restarts = FakeBotRestart()
@@ -227,6 +258,7 @@ async def build(tmp_path: Path, variant: str) -> AsyncIterator[Web]:
         limiter=LoginLimiter(lambda: float(clock.now.timestamp())),
         trusted_proxies=frozenset({"127.0.0.1"}),
         extra_hosts=frozenset({"testserver"}),
+        metrics=metrics,
         backup_opener=lambda path: io.BytesIO(fake.files[path].data),
         sleep=delays.append_async,
         restart_bot=bot_restarts.restart,
@@ -242,6 +274,7 @@ async def build(tmp_path: Path, variant: str) -> AsyncIterator[Web]:
             fake,
             clock,
             traffic,
+            metrics,
             requests,
             broadcast,
             env_writes,

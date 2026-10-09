@@ -1,46 +1,55 @@
 {% extends 'base.html' %}
+{% from '_macros.html' import icon with context %}
 {% block title %}{{ t.nav_settings }}{% endblock %}
 {% block content %}
-<h1>{{ t.nav_settings }}</h1>
+<div class="page-head"><h1>{{ t.nav_settings }}</h1></div>
 <form method="post" action="{{ url('/settings') }}" class="card">
   <input type="hidden" name="csrf_token" value="{{ csrf }}">
+  <div class="form-grid">
   {% for f in fields %}
   <label>{{ f.title }}{% if f.proxy %} <small>({{ t.settings_proxy_note }})</small>{% endif %}
-    {% if f.choices %}<select name="{{ f.key }}">{% for val, lab in f.choices %}<option value="{{ val }}"{% if f.value == val %} selected{% endif %}>{{ lab }}</option>{% endfor %}</select>
-    {% else %}<input name="{{ f.key }}" type="{{ f.type }}" value="{{ f.value }}">{% endif %}
+    {% if f.choices %}<select name="{{ f.key }}" class="wide">{% for val, lab in f.choices %}<option value="{{ val }}"{% if f.value == val %} selected{% endif %}>{{ lab }}</option>{% endfor %}</select>
+    {% else %}<input name="{{ f.key }}" type="{{ f.type }}" value="{{ f.value }}" class="wide">{% endif %}
     {% if f.error %}<small class="bad" role="alert">{{ f.error }}</small>{% endif %}</label>
   {% endfor %}
-  <button type="submit" class="primary">{{ t.save }}</button>
+  </div>
+  <p><button type="submit" class="primary">{{ icon('save') }} {{ t.save }}</button></p>
 </form>
 
+<div class="grid">
 <section class="card"><h2>{{ t.settings_admins }}</h2>
   <ul>{% for a in admins %}<li>{{ a }}
-    <form method="post" action="{{ url('/settings/admins') }}" class="inline"><input type="hidden" name="csrf_token" value="{{ csrf }}"><input type="hidden" name="action" value="remove"><input type="hidden" name="tg_id" value="{{ a }}"><button type="submit" class="danger">{{ t.remove }}</button></form></li>
-  {% else %}<li>{{ t.no_data }}</li>{% endfor %}</ul>
-  <form method="post" action="{{ url('/settings/admins') }}"><input type="hidden" name="csrf_token" value="{{ csrf }}"><input type="hidden" name="action" value="add">
-  <input name="tg_id" inputmode="numeric" placeholder="Telegram ID" required> <button type="submit">{{ t.add }}</button></form>
+    <form method="post" action="{{ url('/settings/admins') }}" class="inline"><input type="hidden" name="csrf_token" value="{{ csrf }}"><input type="hidden" name="action" value="remove"><input type="hidden" name="tg_id" value="{{ a }}"><button type="submit" class="icon danger" aria-label="{{ t.remove }} {{ a }}" title="{{ t.remove }}">{{ icon('trash') }}</button></form></li>
+  {% else %}<li class="muted">{{ t.no_data }}</li>{% endfor %}</ul>
+  <form method="post" action="{{ url('/settings/admins') }}" class="actions"><input type="hidden" name="csrf_token" value="{{ csrf }}"><input type="hidden" name="action" value="add">
+  <input name="tg_id" inputmode="numeric" placeholder="Telegram ID" aria-label="Telegram ID" required> <button type="submit">{{ icon('plus') }} {{ t.add }}</button></form>
 </section>
 
 <section class="card"><h2>{{ t.settings_bot_token }}</h2>
-  <p>{% if token_set_at %}{{ t.token_set }} ({{ token_set_at }}){% else %}{{ t.token_unset }}{% endif %}</p>
-  <form method="post" action="{{ url('/settings/bot-token') }}" autocomplete="off"><input type="hidden" name="csrf_token" value="{{ csrf }}">
-  <input type="password" name="token" placeholder="{{ t.token_placeholder }}" autocomplete="new-password" required> <button type="submit">{{ t.save }}</button></form>
+  <p>{% if token_set_at %}<span class="badge good">{{ icon('check') }} {{ t.token_set }}</span> <small>{{ token_set_at }}</small>{% else %}<span class="badge warn">{{ t.token_unset }}</span>{% endif %}</p>
+  <form method="post" action="{{ url('/settings/bot-token') }}" autocomplete="off" class="actions"><input type="hidden" name="csrf_token" value="{{ csrf }}">
+  <input type="password" name="token" placeholder="{{ t.token_placeholder }}" aria-label="{{ t.token_placeholder }}" autocomplete="new-password" required> <button type="submit">{{ icon('save') }} {{ t.save }}</button></form>
   <p class="hint">{{ t.token_restart_hint }}</p>
-</section>
-
-<section class="card"><h2>{{ t.settings_templates }}</h2>
-  <form method="post" action="{{ url('/settings/templates') }}"><input type="hidden" name="csrf_token" value="{{ csrf }}">
-  {% for tp in templates %}<label>{{ tp.label }} <textarea name="{{ tp.key }}" rows="3" maxlength="3500" class="wide">{{ tp.value }}</textarea></label>{% endfor %}
-  <p class="hint">{{ t.broadcast_placeholders }}</p>
-  <button type="submit" class="primary">{{ t.save }}</button></form>
 </section>
 
 <section class="card"><h2>{{ t.settings_password }}</h2>
   <form method="post" action="{{ url('/settings/password') }}" autocomplete="off"><input type="hidden" name="csrf_token" value="{{ csrf }}">
-  <label>{{ t.password_current }} <input type="password" name="current" autocomplete="current-password" required></label>
-  <label>{{ t.password_new }} <input type="password" name="new" autocomplete="new-password" required minlength="12"></label>
-  <label>{{ t.password_again }} <input type="password" name="again" autocomplete="new-password" required></label>
-  <button type="submit" class="primary">{{ t.password_change }}</button></form>
-  <form method="post" action="{{ url('/settings/logout-all') }}"><input type="hidden" name="csrf_token" value="{{ csrf }}"><button type="submit" class="danger">{{ t.logout_all }}</button></form>
+  <div class="form-grid">
+  <label>{{ t.password_current }} <input type="password" name="current" autocomplete="current-password" required class="wide"></label>
+  <label>{{ t.password_new }} <input type="password" name="new" autocomplete="new-password" required minlength="12" class="wide"></label>
+  <label>{{ t.password_again }} <input type="password" name="again" autocomplete="new-password" required class="wide"></label>
+  </div>
+  <p class="actions"><button type="submit" class="primary">{{ icon('lock') }} {{ t.password_change }}</button></p></form>
+  <form method="post" action="{{ url('/settings/logout-all') }}"><input type="hidden" name="csrf_token" value="{{ csrf }}"><button type="submit" class="danger">{{ icon('logout') }} {{ t.logout_all }}</button></form>
+</section>
+</div>
+
+<section class="card"><h2>{{ t.settings_templates }}</h2>
+  <form method="post" action="{{ url('/settings/templates') }}"><input type="hidden" name="csrf_token" value="{{ csrf }}">
+  <div class="form-grid">
+  {% for tp in templates %}<label>{{ tp.label }} <textarea name="{{ tp.key }}" rows="3" maxlength="3500">{{ tp.value }}</textarea></label>{% endfor %}
+  </div>
+  <p class="hint">{{ t.broadcast_placeholders }}</p>
+  <button type="submit" class="primary">{{ icon('save') }} {{ t.save }}</button></form>
 </section>
 {% endblock %}
