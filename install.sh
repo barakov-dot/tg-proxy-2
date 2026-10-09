@@ -659,6 +659,10 @@ first_apply_and_start() {
     3) warn "apply отложен (см. сообщение выше): tgpanel apply --adopt или tgpanel import" ;;
     *) die "применение не удалось; изменения откатены" ;;
   esac
+  # apply already loaded the table; start the unit so it is active (and reloaded at boot/nftables restart)
+  if [ -f /etc/tgpanel/tgpanel.nft ]; then
+    systemctl start tgpanel-firewall.service || warn "tgpanel-firewall не запустилась: journalctl -u tgpanel-firewall"
+  fi
   systemctl restart tgpanel.service
   wait_panel_port || warn "панель не открыла порт 8090 за 20 секунд: journalctl -u tgpanel"
   if ! "$CLI_LINK" doctor; then

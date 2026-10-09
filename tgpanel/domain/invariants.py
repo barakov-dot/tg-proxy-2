@@ -197,7 +197,7 @@ def capacity_warnings(state: DesiredState) -> list[str]:
     """Non-blocking capacity hints (PLAN 3.7): pool -C budget vs max_streams_global."""
     managed = sum(1 for p in state.pools if p.managed)
     capacity = state.mtp_max_connections * managed
-    if capacity < state.relay_limits.max_streams_global:
+    if managed and capacity < state.relay_limits.max_streams_global:
         return [
             f"sum of pool max connections {capacity} is below max_streams_global "
             f"{state.relay_limits.max_streams_global}"
