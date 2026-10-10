@@ -84,7 +84,7 @@ async def cb_my_link(cb: CallbackQuery, deps: BotDeps, bot: Bot) -> None:
     if user is None:
         await cb.answer(texts.NO_ACCESS, show_alert=True)
         return
-    user = await deps.requests.adopt_telegram_name(
+    user = await deps.requests.adopt_telegram_display_name(
         user, cb.from_user.username, cb.from_user.full_name
     )
     if user.status is not UserStatus.ACTIVE:

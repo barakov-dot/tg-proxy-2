@@ -36,9 +36,10 @@
 <tbody>
 {% for rv in rows %}{% set u = rv.user %}
 <tr>
-  <td><input type="checkbox" name="ids" value="{{ u.id }}" form="bulk-form" aria-label="{{ t.select_row.format(name=u.name) }}"></td>
-  {% for c in cols %}<td{% if c in ('id', 'name', 'traffic', 'created_at', 'expires_at', 'first_seen_at', 'last_seen_at') %} class="nowrap"{% endif %}>
+  <td><input type="checkbox" name="ids" value="{{ u.id }}" form="bulk-form" aria-label="{{ t.select_row.format(name=shown_name(u)) }}"></td>
+  {% for c in cols %}<td{% if c in ('id', 'display_name', 'name', 'traffic', 'created_at', 'expires_at', 'first_seen_at', 'last_seen_at') %} class="nowrap"{% endif %}>
   {%- if c == 'id' %}{{ u.id }}
+  {%- elif c == 'display_name' %}<a href="{{ url('/users/' ~ u.id) }}"{% if not u.display_name %} class="muted"{% endif %}>{{ shown_name(u) }}</a>
   {%- elif c == 'name' %}<a href="{{ url('/users/' ~ u.id) }}">{{ u.name }}</a>
   {%- elif c == 'comment' %}{% with error=none, saved=false %}{% include '_comment_cell.html' %}{% endwith %}
   {%- elif c == 'tg_id' %}{{ u.tg_id if u.tg_id is not none else '—' }}
@@ -54,7 +55,7 @@
   {%- elif c == 'bot_started' %}{{ t.yes if rv.extra and rv.extra.bot_started else t.no }}
   {%- endif -%}
   </td>{% endfor %}
-  <td><div class="row-actions"><a class="btn icon" href="{{ url('/users/' ~ u.id) }}" aria-label="{{ t.open }}: {{ u.name }}" title="{{ t.open }}">{{ icon('chevron-right') }}</a></div></td>
+  <td><div class="row-actions"><a class="btn icon" href="{{ url('/users/' ~ u.id) }}" aria-label="{{ t.open }}: {{ shown_name(u) }}" title="{{ t.open }}">{{ icon('chevron-right') }}</a></div></td>
 </tr>
 {% else %}<tr><td colspan="{{ cols|length + 2 }}" class="muted">{{ t.no_data }}</td></tr>{% endfor %}
 </tbody></table></div>

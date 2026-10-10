@@ -30,7 +30,7 @@ from tgpanel.domain.expiry import (
     extend_expiry,
     status_after_extend,
 )
-from tgpanel.domain.models import CarrierMode, UserRecord, UserStatus
+from tgpanel.domain.models import CarrierMode, UserRecord, UserStatus, clean_display_name
 from tgpanel.domain.pools import allocate_pools
 from tgpanel.domain.secrets_ import base_secret, generate_secret
 from tgpanel.render.links import https_link, tg_link
@@ -59,6 +59,13 @@ def _check_name(name: str) -> str:
     if not value or len(value) > MAX_NAME or "\n" in value or "\r" in value:
         raise UserServiceError(f"Имя должно быть от 1 до {MAX_NAME} символов в одну строку")
     return value
+
+
+def _check_display_name(display_name: str) -> str:
+    try:
+        return clean_display_name(display_name)
+    except ValueError as exc:
+        raise UserServiceError(str(exc)) from None
 
 
 def _check_comment(comment: str) -> str:
@@ -161,9 +168,11 @@ class UserServiceImpl:
             now = self._now()
             cfg = read_settings(conn)
             names: list[str] = []
+            display_names: list[str] = []
             seen_tg: set[int] = set()
             for nu in users:
                 names.append(_check_name(nu.name))
+                display_names.append(_check_display_name(nu.display_name))
                 _check_comment(nu.comment)
                 if nu.tg_id is not None:
                     _check_tg_id(nu.tg_id)
@@ -193,7 +202,9 @@ class UserServiceImpl:
                 bases.add(base_secret(sentinel))
             default_exp: datetime | None = None
             ids: list[int] = []
-            for nu, name, pool_id, ip in zip(users, names, alloc.pool_ids, ips, strict=True):
+            for nu, name, dname, pool_id, ip in zip(
+                users, names, display_names, alloc.pool_ids, ips, strict=True
+            ):
                 secret = generate_secret()
                 while secret in bases:  # pragma: no cover - 2^-128
                     secret = generate_secret()
@@ -206,6 +217,7 @@ class UserServiceImpl:
                 uid = repo.insert_user(
                     conn,
                     name=name,
+                    display_name=dname,
                     secret=secret,
                     status=UserStatus.ACTIVE,
                     pool_id=pool_id,
@@ -376,11 +388,12 @@ class UserServiceImpl:
         actor: Actor,
         *,
         name: str | None = None,
+        display_name: str | None = None,
         comment: str | None = None,
         tg_id: int | None = None,
         tg_username: str | None = None,
     ) -> None:
-        """Name / comment / Telegram data: DB only, never touches the proxy (no apply)."""
+        """Name / display name / comment / Telegram data: DB only, no apply."""
 
         def work(conn: sqlite3.Connection) -> None:
             with transaction(conn):
@@ -398,6 +411,9 @@ class UserServiceImpl:
                         raise UserServiceError(f"Имя «{value}» уже занято")
                     fields["name"] = value
                     changed.append("name")
+                if display_name is not None:
+                    fields["display_name"] = _check_display_name(display_name)
+                    changed.append("display_name")
                 if comment is not None:
                     fields["comment"] = _check_comment(comment)
                     changed.append("comment")

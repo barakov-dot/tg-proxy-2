@@ -78,6 +78,7 @@ def user_from_row(row: sqlite3.Row) -> UserRecord:
         tg_id=None if row["tg_id"] is None else int(row["tg_id"]),
         imported=bool(row["imported"]),
         source_profile_name=row["source_profile_name"],
+        display_name=str(row["display_name"]),
     )
 
 
@@ -118,6 +119,7 @@ def insert_user(
     carrier_mode: CarrierMode | None = None,
     expires_at: datetime | None = None,
     comment: str = "",
+    display_name: str = "",
     tg_id: int | None = None,
     tg_username: str | None = None,
     imported: bool = False,
@@ -131,8 +133,8 @@ def insert_user(
     cur = conn.execute(
         "INSERT INTO users (name, comment, tg_id, tg_username, secret, status, disabled_reason,"
         " pool_id, loopback_ip, carrier_mode, created_at, expires_at, can_message, bot_started,"
-        " imported, source_profile_name, first_seen_at, last_seen_at)"
-        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        " imported, source_profile_name, first_seen_at, last_seen_at, display_name)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (
             name,
             comment,
@@ -152,6 +154,7 @@ def insert_user(
             source_profile_name,
             to_db_opt(first_seen_at),
             to_db_opt(last_seen_at),
+            display_name,
         ),
     )
     return _rowid(cur)
@@ -201,6 +204,7 @@ def used_loopback_ips(conn: sqlite3.Connection) -> list[str]:
 _UPDATABLE = frozenset(
     {
         "name",
+        "display_name",
         "comment",
         "tg_id",
         "tg_username",
@@ -278,6 +282,7 @@ _TRAFFIC = "(COALESCE(t.up, 0) + COALESCE(t.down, 0))"
 SORT_EXPRESSIONS: dict[str, tuple[str, bool, bool]] = {
     "id": ("u.id", False, False),
     "name": ("u.name", False, True),
+    "display_name": ("COALESCE(NULLIF(u.display_name, ''), u.name)", False, True),
     "comment": ("u.comment", False, True),
     "tg_id": ("u.tg_id", True, False),
     "tg_username": ("u.tg_username", True, True),
@@ -438,10 +443,11 @@ def list_users(
         pat = _like(f.query)
         where.append(
             "(py_lower(u.name) LIKE ? ESCAPE '\\' OR py_lower(u.comment) LIKE ? ESCAPE '\\'"
+            " OR py_lower(u.display_name) LIKE ? ESCAPE '\\'"
             " OR CAST(u.tg_id AS TEXT) LIKE ? ESCAPE '\\'"
             " OR py_lower(COALESCE(u.tg_username, '')) LIKE ? ESCAPE '\\')"
         )
-        params += [pat, pat, pat, pat]
+        params += [pat, pat, pat, pat, pat]
     if f.statuses:
         where.append(f"u.status IN ({','.join('?' * len(f.statuses))})")
         params += [UserStatus(s).value for s in f.statuses]

@@ -5,6 +5,7 @@ from __future__ import annotations
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 from tgpanel.bot import icons, texts
+from tgpanel.domain.models import shown_name
 from tgpanel.services.api import UserRow
 
 PAGE_SIZE = 10  # divides the service page size (50)
@@ -61,7 +62,7 @@ def user_list(
     search: bool,
     marks: dict[int, str],
 ) -> InlineKeyboardMarkup:
-    lines = [[btn(f"{marks[r.user.id]} {r.user.name[:34]}", f"c:{r.user.id}")] for r in rows]
+    lines = [[btn(f"{marks[r.user.id]} {shown_name(r.user)[:34]}", f"c:{r.user.id}")] for r in rows]
     nav: list[InlineKeyboardButton] = []
     if page > 0:
         nav.append(btn(texts.BTN_PREV, list_state(page - 1, flt, sort, search)))
@@ -93,6 +94,7 @@ def user_card(uid: int, *, enabled: bool, selected: bool) -> InlineKeyboardMarku
         ],
         [btn(texts.BTN_LINK, f"k:{uid}"), btn(texts.BTN_QR, f"q:{uid}")],
         [btn(texts.BTN_SEND_LINK, f"s:{uid}"), btn(texts.BTN_COMMENT, f"ce:{uid}")],
+        [btn(texts.BTN_EDIT_NAME, f"en:{uid}")],
         [btn(texts.BTN_UNSELECT if selected else texts.BTN_SELECT, f"sel:{uid}")],
         [btn(texts.BTN_DELETE, f"d:{uid}"), btn(texts.BTN_TO_LIST, "l:0:a:n:0")],
     )

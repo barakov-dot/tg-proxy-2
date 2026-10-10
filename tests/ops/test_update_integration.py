@@ -21,6 +21,7 @@ import pytest
 
 from tgpanel import ops_cli
 from tgpanel.apply.config import ApplyConfig, ApplyTiming
+from tgpanel.db.migrations import MIGRATIONS
 from tgpanel.system import tools as tools_mod
 from tgpanel.system.fake import FakeSystemOps
 from tgpanel.system.tools import RealShellTools
@@ -61,7 +62,9 @@ json.dump({"code": code, "tgpanel_code": ops_cli.__file__,
 sys.exit(1 if os.environ.get("TEST_FAIL") == "1" else code)
 """
 
-MIGRATION_2 = """SQL = "CREATE TABLE added_in_v2 (x INTEGER);"\n"""
+MIGRATION_NEW = """SQL = "CREATE TABLE added_in_v2 (x INTEGER);"\n"""
+BASE = MIGRATIONS[-1][0]  # schema version of the checked-out code ("v1" in this test)
+NEW = BASE + 1
 
 
 def git(*args: str, cwd: Path) -> str:
@@ -112,13 +115,14 @@ class Env:
         git("checkout", "-q", "--detach", self.v1, cwd=self.install)
         # commit 2: migration, new unit, old unit dropped
         mig = self.work / "tgpanel" / "db" / "migrations"
-        (mig / "m0002_test.py").write_text(MIGRATION_2)
+        (mig / f"m{NEW:04d}_test.py").write_text(MIGRATION_NEW)
         init = (mig / "__init__.py").read_text()
         (mig / "__init__.py").write_text(
             init.replace(
-                "MIGRATIONS: tuple[tuple[int, str], ...] = ((1, _M1),)",
-                "from tgpanel.db.migrations.m0002_test import SQL as _M2\n\n"
                 "MIGRATIONS: tuple[tuple[int, str], ...] = ((1, _M1), (2, _M2))",
+                f"from tgpanel.db.migrations.m{NEW:04d}_test import SQL as _MN\n\n"
+                "MIGRATIONS: tuple[tuple[int, str], ...] = ((1, _M1), (2, _M2), "
+                f"({NEW}, _MN))",
             )
         )
         (self.work / "deploy" / "tgpanel-extra.service").write_text(
@@ -216,11 +220,11 @@ def env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Env:
 
 
 def test_stage2_runs_new_code_in_a_new_process(env: Env) -> None:
-    assert env.schema() == 1
+    assert env.schema() == BASE
     code, out = env.run("update", "--ref", "main")
     assert code == 0, out
     assert env.head() == env.v2
-    assert env.schema() == 2  # the NEW migration ran: only new code knows m0002
+    assert env.schema() == NEW  # the NEW migration ran: only new code knows it
     report = json.loads(env.out.read_text())
     assert report["code"] == 0
     assert str(env.install) in report["tgpanel_code"]  # imported from the checked-out tree
@@ -240,7 +244,7 @@ def test_failed_stage2_rolls_back_code_and_database(env: Env) -> None:
     code, out = env.run("update", "--ref", "main")
     assert code == 1, out
     assert env.head() == env.v1
-    assert env.schema() == 1  # snapshot restored: the schema went back
+    assert env.schema() == BASE  # snapshot restored: the schema went back
     conn = sqlite3.connect(env.db)
     try:
         assert conn.execute("SELECT value FROM settings WHERE key='marker'").fetchone()[0] == "kept"

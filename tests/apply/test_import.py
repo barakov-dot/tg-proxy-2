@@ -37,7 +37,7 @@ async def test_preview_owner_fixture(owner: Env) -> None:
     assert OLD_BOT_WARNING in prev.warnings
     first = prev.rows[0]
     assert first.row.source_name == "user_93455874" and first.row.tg_id == 93455874
-    assert first.row.display_name == "user_93455874"
+    assert first.row.name == "user_93455874" and first.row.display_name == ""
     assert first.pool_id == 1 and first.pool_port == 2400 and first.new_pool
     ips = [r.loopback_ip for r in prev.rows]
     assert ips[0] == "127.64.0.1" and len(set(ips)) == 15
@@ -219,8 +219,11 @@ async def test_csv_and_edits(owner: Env) -> None:
     res = await imp.confirm(prev, edits)
     assert res.ok
     by_src = {u.source_profile_name: u for u in owner.users()}
-    assert by_src["user_12345"].name == "Vasya" and by_src["user_12345"].tg_id == 555000111
-    assert by_src["user_93455874"].name == "Petya" and by_src["user_93455874"].tg_id == 777
+    # the technical name always stays the source profile name; the CSV/edit sets display_name
+    assert by_src["user_12345"].name == "user_12345"
+    assert by_src["user_12345"].display_name == "Vasya" and by_src["user_12345"].tg_id == 555000111
+    assert by_src["user_93455874"].name == "user_93455874"
+    assert by_src["user_93455874"].display_name == "Petya" and by_src["user_93455874"].tg_id == 777
     assert by_src["user_93455874"].comment == "import; boss"
 
 

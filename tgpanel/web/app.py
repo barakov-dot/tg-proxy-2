@@ -24,6 +24,7 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.templating import Jinja2Templates
 
 from tgpanel.db import repo
+from tgpanel.domain.models import shown_name
 from tgpanel.system.validation import scrub
 from tgpanel.web.deps import WebContext
 from tgpanel.web.guards import BodyLimit, HostGuard
@@ -52,6 +53,7 @@ def make_templates() -> Jinja2Templates:
         trim_blocks=True,
         lstrip_blocks=True,
     )
+    env.globals["shown_name"] = shown_name
     return Jinja2Templates(env=env)
 
 

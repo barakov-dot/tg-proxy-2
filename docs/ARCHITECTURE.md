@@ -65,6 +65,17 @@ transaction. Waiting is bounded (30 s by default) and ends in `DbWriteTimeout` w
 the collector uses a shorter bound and drops a sample instead of blocking. Reads may use `db.run`.
 Schema and migrations: `db/` (`migrations/`, `repo.py`).
 
+User names: `users.name` is the unique technical profile name (never rewritten automatically;
+imported users keep the source profile name). `users.display_name` (migration 2, `TEXT NOT NULL
+DEFAULT ''`) is a free single-line Unicode label (<= 100 chars, may be empty or repeated), validated
+by `domain.models.clean_display_name` and written only through `UserService.update_meta` / `create`.
+`domain.models.shown_name(user)` is the one label to display (display name, else name). It is
+searched by `list_users` (`py_lower`, Unicode-aware) and sortable (`display_name` sorts by
+`COALESCE(NULLIF(display_name, ''), name)`). The bot fills an EMPTY display name from the Telegram
+name (`RequestService.adopt_telegram_display_name`), the importer maps the CSV "имя" column to it.
+Backups copy common columns only, and a snapshot of an older schema restores (missing columns get
+their defaults); a snapshot of a NEWER schema is refused.
+
 ## Collector, scheduler, bot
 
 - `collector.Collector.poll_once` reads `nft list set` counters (never `/readyz`), turns them into

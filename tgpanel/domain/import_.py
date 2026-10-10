@@ -7,7 +7,7 @@ from collections import Counter
 from collections.abc import Collection, Iterable
 from dataclasses import dataclass, field
 
-from tgpanel.domain.models import CarrierMode
+from tgpanel.domain.models import CarrierMode, clean_display_name
 from tgpanel.domain.secrets_ import ParsedSecret, parse_imported_secret
 
 SENTINEL_NAME = "_tgpanel_sentinel"
@@ -39,13 +39,18 @@ class CsvRow:
 class PlanRow:
     source_name: str
     tg_id: int | None
-    display_name: str
+    display_name: str  # label for people (may be empty); the user `name` is source_name
     comment: str
     secret: str = field(repr=False)  # kept as-is (with 'dd' prefix if it had one)
     base_secret: str = field(repr=False)
     carrier_mode: CarrierMode | None
     source_backend: str
     skip_reason: str | None = None
+
+    @property
+    def name(self) -> str:
+        """Technical user name: always the source profile name (never replaced by the CSV)."""
+        return self.source_name
 
     @property
     def will_import(self) -> bool:
@@ -113,7 +118,10 @@ def parse_mtproxy_secrets_text(text: str) -> set[str]:
 
 
 def parse_csv_rows(text: str) -> tuple[list[CsvRow], list[str]]:
-    """Parse `profile;telegram_id;display name;comment` lines. Returns (rows, errors)."""
+    """Parse `profile;telegram_id;display name;comment` lines. Returns (rows, errors).
+
+    The 3rd column is the user's DISPLAY name; the technical name stays the profile name.
+    """
     rows: list[CsvRow] = []
     errors: list[str] = []
     for lineno, line in enumerate(text.splitlines(), start=1):
@@ -215,7 +223,12 @@ def plan_import(
                 mode = CarrierMode(prof.carrier_mode)
             except ValueError:
                 errors.append(f"{prof.name}: unknown carrier_mode")
-        display = csv.display_name if csv and csv.display_name else prof.name
+        display = ""
+        if csv is not None:
+            try:
+                display = clean_display_name(csv.display_name)
+            except ValueError as exc:
+                errors.append(f"{prof.name}: {exc}")
         comment = IMPORT_COMMENT
         if csv and csv.comment:
             comment = f"{IMPORT_COMMENT}; {csv.comment}"

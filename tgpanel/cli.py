@@ -232,7 +232,7 @@ def _print_preview(preview: ImportPreview, out: TextIO) -> None:
         tg = row.tg_id if row.tg_id is not None else "—"
         new = " (новый пул)" if pr.new_pool else ""
         print(
-            f"  {row.source_name} → {tg} → {row.display_name} → пул {pr.pool_id}{new}"
+            f"  {row.source_name} → {tg} → {row.display_name or '—'} → пул {pr.pool_id}{new}"
             f" (порт {pr.pool_port}) → {pr.loopback_ip}",
             file=out,
         )

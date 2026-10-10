@@ -14,6 +14,7 @@
   </fieldset>
   <div class="form-grid">
     <label>{{ t.col_name }} <input name="name" value="{{ values.get('name', '') }}" maxlength="100" class="wide"></label>
+    <label>{{ t.create_display_name }} <input name="display_name" value="{{ values.get('display_name', '') }}" maxlength="100" class="wide"></label>
     <label>{{ t.col_tg_id }} <input name="tg_id" inputmode="numeric" value="{{ values.get('tg_id', '') }}" class="wide"></label>
     <label>{{ t.create_prefix }} <input name="prefix" value="{{ values.get('prefix', '') }}" maxlength="80" class="wide"></label>
     <label>{{ t.create_number }} <input name="count" type="number" min="1" max="200" value="{{ values.get('count', '') }}" class="wide"></label>

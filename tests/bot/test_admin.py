@@ -107,6 +107,7 @@ async def test_send_link_rules(env: Env) -> None:
 async def test_create_user_dialog(env: Env) -> None:
     await env.tg.press(ADMIN, "cr")
     await env.tg.send(ADMIN, "Новый <клиент>")
+    await env.tg.send(ADMIN, "Иван 🐉 <b>Петров</b>")  # display name step
     await env.tg.send(ADMIN, "abc")  # not a number: asked again
     assert any("число" in t for t in env.session.texts(ADMIN))
     await env.tg.send(ADMIN, "4242")
@@ -116,6 +117,7 @@ async def test_create_user_dialog(env: Env) -> None:
     assert len(env.svc.runs()) == runs + 1
     user = env.svc.ctx.db.call(repo.get_user_by_tg_id, 4242)
     assert user and user.name == "Новый <клиент>" and user.comment == "friend"
+    assert user.display_name == "Иван 🐉 <b>Петров</b>"
     assert user.expires_at is not None
     assert any(env.link_html(user) in t for t in env.session.texts(ADMIN))
     assert env.session.photos(ADMIN)
@@ -124,11 +126,13 @@ async def test_create_user_dialog(env: Env) -> None:
 async def test_create_user_dialog_skips(env: Env) -> None:
     await env.tg.press(ADMIN, "cr")
     await env.tg.send(ADMIN, "Minimal")
+    await env.tg.press(ADMIN, "cs:dn")
     await env.tg.press(ADMIN, "cs:tg")
     await env.tg.press(ADMIN, "ct:df")
     await env.tg.press(ADMIN, "cs:cm")
     user = env.svc.ctx.db.call(repo.all_users)[0]
     assert user.name == "Minimal" and user.tg_id is None and user.comment == ""
+    assert user.display_name == ""
     assert any(env.link_html(user) in t for t in env.session.texts(ADMIN))
 
 

@@ -1,6 +1,6 @@
 {% extends 'base.html' %}
 {% from '_macros.html' import icon, status_badge with context %}
-{% block title %}{{ u.name }}{% endblock %}
+{% block title %}{{ shown_name(u) }}{% endblock %}
 {% block head %}
 <script src="{{ url('/static/vendor/echarts.min.js') }}" defer></script>
 <script src="{{ url('/static/chart.js') }}" defer></script>
@@ -8,7 +8,7 @@
 {% block content %}
 <div class="page-head">
   <a class="btn icon" href="{{ url('/users') }}" aria-label="{{ t.nav_users }}" title="{{ t.nav_users }}">{{ icon('chevron-left') }}</a>
-  <h1>{{ u.name }} <small>#{{ u.id }}</small></h1>
+  <h1>{{ shown_name(u) }} <small>#{{ u.id }}</small></h1>
   {{ status_badge(u.status.value) }}
 </div>
 <div class="grid">
@@ -17,6 +17,7 @@
   <form method="post" action="{{ url('/users/' ~ u.id ~ '/meta') }}">
     <input type="hidden" name="csrf_token" value="{{ csrf }}">
     <div class="form-grid">
+      <label>{{ t.col_display_name }} <input name="display_name" value="{{ u.display_name }}" maxlength="100" class="wide"></label>
       <label>{{ t.col_name }} <input name="name" value="{{ u.name }}" maxlength="100" required class="wide"></label>
       <label>{{ t.col_tg_id }} <input name="tg_id" inputmode="numeric" value="{{ u.tg_id if u.tg_id is not none else '' }}" class="wide"></label>
       <label class="chk"><input type="checkbox" name="clear_tg_id" value="1"> {{ t.clear_tg_id }}</label>

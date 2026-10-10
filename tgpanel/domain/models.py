@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import unicodedata
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import StrEnum
@@ -44,6 +45,7 @@ class UserRecord:
     tg_id: int | None = None
     imported: bool = False
     source_profile_name: str | None = None
+    display_name: str = ""  # free-form label for people; `name` stays the technical one
 
     @property
     def profile_name(self) -> str:
@@ -53,6 +55,28 @@ class UserRecord:
     def mtproxy_secret(self) -> str:
         """Base secret passed to MTProxy: lowercase, no 'dd' prefix."""
         return base_secret(self.secret)
+
+
+MAX_DISPLAY_NAME = 100
+
+
+def clean_display_name(raw: str) -> str:
+    """Normalized display name: stripped, single line, no control characters, <= 100 chars.
+
+    Any Unicode (Cyrillic, emoji, CJK, spaces) is allowed; the empty string is valid.
+    Raises ValueError (Russian message) otherwise.
+    """
+    value = raw.strip()
+    if len(value) > MAX_DISPLAY_NAME:
+        raise ValueError(f"Имя длиннее {MAX_DISPLAY_NAME} символов")
+    if any(unicodedata.category(ch) in ("Cc", "Zl", "Zp") for ch in value):
+        raise ValueError("Имя должно быть в одну строку, без управляющих символов")
+    return value
+
+
+def shown_name(user: UserRecord) -> str:
+    """The single label to show for a user: the display name, else the technical name."""
+    return user.display_name or user.name
 
 
 @dataclass(frozen=True, slots=True)

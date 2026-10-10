@@ -33,6 +33,7 @@ def test_schema_has_all_tables_and_user_columns() -> None:
         "id", "name", "comment", "tg_id", "tg_username", "secret", "status", "disabled_reason",
         "pool_id", "loopback_ip", "carrier_mode", "created_at", "expires_at", "first_seen_at",
         "last_seen_at", "can_message", "bot_started", "imported", "source_profile_name",
+        "display_name",
     }  # fmt: skip
 
 
@@ -152,3 +153,29 @@ def test_migration_is_not_repeated_by_a_second_process(tmp_path):  # type: ignor
     assert migrate(second) == MIGRATIONS[-1][0]
     rows = first.execute("SELECT COUNT(*) FROM schema_version").fetchone()[0]
     assert rows == len(MIGRATIONS)
+
+
+def test_migration_2_adds_display_name_with_empty_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A database created by the previous schema keeps its users and gets display_name ''."""
+    from tgpanel.db import connection
+
+    conn = connect()
+    with monkeypatch.context() as patch:
+        patch.setattr(connection, "MIGRATIONS", MIGRATIONS[:1])
+        assert migrate(conn) == 1
+    assert "display_name" not in {r["name"] for r in conn.execute("PRAGMA table_info(users)")}
+    conn.execute(
+        "INSERT INTO pools (id, port, stats_port, managed, created_at)"
+        " VALUES (1, 2400, 8900, 1, 'x')"
+    )
+    conn.execute(
+        "INSERT INTO users (name, secret, status, pool_id, loopback_ip, created_at)"
+        " VALUES ('user_93455874', ?, 'active', 1, '127.64.0.1', 'x')",
+        ("a" * 32,),
+    )
+    conn.commit()
+    assert migrate(conn) == MIGRATIONS[-1][0]
+    row = conn.execute("SELECT name, display_name FROM users").fetchone()
+    assert (row["name"], row["display_name"]) == ("user_93455874", "")

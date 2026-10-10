@@ -17,7 +17,7 @@ from markupsafe import Markup
 
 from tgpanel.apply.errors import OperationRejected
 from tgpanel.db import repo
-from tgpanel.domain.models import CarrierMode, UserRecord
+from tgpanel.domain.models import CarrierMode, UserRecord, shown_name
 from tgpanel.services.api import OperationResult, UserListQuery, UserRow
 from tgpanel.services.errors import UserServiceError
 from tgpanel.web.deps import WebContext, safe
@@ -304,6 +304,7 @@ async def user_meta(request: Request, user_id: PathId) -> Response:
     if user is None:
         raise HttpError(404, T["not_found"])
     name = fstr(form, "name")
+    display_name = fstr(form, "display_name")
     comment = str(form.get("comment") or "")
     username = fstr(form, "tg_username").lstrip("@")
     tg_raw = fstr(form, "tg_id")
@@ -313,6 +314,8 @@ async def user_meta(request: Request, user_id: PathId) -> Response:
     fields: dict[str, Any] = {}
     if name and name != user.name:
         fields["name"] = name
+    if display_name != user.display_name:
+        fields["display_name"] = display_name
     if comment != user.comment:
         fields["comment"] = comment
     tg_new: int | None = None
@@ -462,7 +465,7 @@ async def users_reveal_many(request: Request) -> Response:
         for uid in ids:
             user = await web.app.users.get(uid)
             if user is not None:
-                lines.append(f"{user.name}: {web.app.users.link(user)}")
+                lines.append(f"{shown_name(user)}: {web.app.users.link(user)}")
     except UserServiceError as exc:
         return await render(request, "_reveal_many.html", 409, error=clean(str(exc)), text="")
 

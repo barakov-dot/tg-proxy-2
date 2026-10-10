@@ -10,7 +10,7 @@ from fastapi import APIRouter, Depends, Request, Response
 
 from tgpanel.apply.errors import OperationRejected
 from tgpanel.domain.expiry import Term, default_expiry
-from tgpanel.domain.models import CarrierMode
+from tgpanel.domain.models import CarrierMode, clean_display_name
 from tgpanel.services.api import NewUser
 from tgpanel.services.errors import UserServiceError
 from tgpanel.web.inputs import parse_day, parse_uint
@@ -39,15 +39,16 @@ class FormError(Exception):
 
 
 def parse_list(text: str) -> list[NewUser]:
-    """Lines ``name; telegram id; comment`` (comment may contain ';')."""
+    """Lines ``profile name; telegram id; comment; display name`` (last three optional)."""
     users: list[NewUser] = []
     for lineno, line in enumerate(text.splitlines(), start=1):
         if not line.strip() or line.lstrip().startswith("#"):
             continue
-        parts = [p.strip() for p in line.split(";", 2)]
+        parts = [p.strip() for p in line.split(";", 3)]
         name = parts[0]
         raw_id = parts[1] if len(parts) > 1 else ""
         comment = parts[2] if len(parts) > 2 else ""
+        display = parts[3] if len(parts) > 3 else ""
         if not name:
             raise FormError(T["create_line_noname"].format(n=lineno))
         tg_id: int | None = None
@@ -55,7 +56,11 @@ def parse_list(text: str) -> list[NewUser]:
             tg_id = parse_uint(raw_id, max_digits=16)
             if tg_id is None or tg_id == 0:
                 raise FormError(T["create_line_badid"].format(n=lineno))
-        users.append(NewUser(name=name, tg_id=tg_id, comment=comment))
+        try:
+            display = clean_display_name(display)
+        except ValueError:
+            raise FormError(T["create_line_badname"].format(n=lineno)) from None
+        users.append(NewUser(name=name, tg_id=tg_id, comment=comment, display_name=display))
     return users
 
 
@@ -78,6 +83,13 @@ def parse_term(form_term: str, date_raw: str, tz: ZoneInfo, now: datetime) -> da
         raise FormError(T["bad_date"]) from None
 
 
+def _display(form: Any) -> str:
+    try:
+        return clean_display_name(fraw(form, "display_name"))
+    except ValueError:
+        raise FormError(T["bad_display_name"]) from None
+
+
 def build_users(
     form_mode: str, form: Any, expires: datetime | None, mode: CarrierMode | None
 ) -> list[NewUser]:
@@ -94,6 +106,7 @@ def build_users(
                 name=name,
                 tg_id=single_id,
                 comment=fraw(form, "comment").strip(),
+                display_name=_display(form),
             )
         ]
     elif form_mode == "count":
@@ -106,7 +119,15 @@ def build_users(
             raise FormError(T["create_badcount"].format(limit=MAX_BATCH))
         width = len(str(n))
         comment = fraw(form, "comment").strip()
-        users = [NewUser(name=f"{prefix}-{i:0{width}d}", comment=comment) for i in range(1, n + 1)]
+        label = _display(form)
+        users = [
+            NewUser(
+                name=f"{prefix}-{i:0{width}d}",
+                comment=comment,
+                display_name=f"{label} {i:0{width}d}" if label else "",
+            )
+            for i in range(1, n + 1)
+        ]
     elif form_mode == "list":
         users = parse_list(fraw(form, "list"))
         if not users:
@@ -116,7 +137,15 @@ def build_users(
     else:
         raise FormError(T["bad_request"])
     return [
-        NewUser(u.name, u.tg_id, u.comment, expires_at=expires, carrier_mode=mode) for u in users
+        NewUser(
+            u.name,
+            u.tg_id,
+            u.comment,
+            expires_at=expires,
+            carrier_mode=mode,
+            display_name=u.display_name,
+        )
+        for u in users
     ]
 
 

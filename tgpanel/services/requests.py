@@ -14,6 +14,7 @@ import contextlib
 import logging
 import re
 import sqlite3
+import unicodedata
 from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -82,6 +83,15 @@ def display_name(full_name: str, username: str | None, tg_id: int) -> str:
     if not name and username:
         name = "@" + username.lstrip("@")
     return name or f"tg{tg_id}"
+
+
+def telegram_display_name(full_name: str, username: str | None = None) -> str:
+    """Display name from Telegram data: collapsed full name (<= 100), else ``@username``."""
+    clean = "".join(ch for ch in full_name if unicodedata.category(ch) not in ("Cc", "Zl", "Zp"))
+    wanted = " ".join(clean.split())[:MAX_NAME].strip()
+    if not wanted and username:
+        wanted = "@" + username.lstrip("@")
+    return wanted
 
 
 def _bind_user(conn: sqlite3.Connection, user_id: int, username: str | None) -> None:
@@ -201,32 +211,22 @@ class RequestService:
 
     # ------------------------------------------------------------------ bot /start
 
-    async def adopt_telegram_name(
+    async def adopt_telegram_display_name(
         self, user: UserRecord, username: str | None, full_name: str | None
     ) -> UserRecord:
-        """Replace the auto-name of an IMPORTED user (``user_<id>``) by the Telegram name.
+        """Fill an EMPTY display name from the Telegram name (first + last, emoji kept).
 
-        Only while the name still equals ``source_profile_name`` (the admin never edited it).
-        DB-only (``update_meta``: audited, no apply). Returns the (possibly renamed) user.
+        Never overwrites a non-empty display name (e.g. set by the admin) and never touches the
+        technical ``name``. DB-only (``update_meta``: audited, no apply).
         """
-        if not user.imported or user.name != user.source_profile_name:
+        if user.display_name:
             return user
-        wanted = " ".join((full_name or "").split())[:MAX_NAME].strip()
-        if not wanted and username:
-            wanted = "@" + username.lstrip("@")
-        if not wanted or wanted == user.name:
+        wanted = telegram_display_name(full_name or "", username)
+        if not wanted:
             return user
-        taken = await self._db.run(
-            lambda c: c.execute(
-                "SELECT 1 FROM users WHERE name = ? AND id != ?", (wanted, user.id)
-            ).fetchone()
-        )
-        if taken:
-            suffix = f" ({user.tg_id})"
-            wanted = wanted[: MAX_NAME - len(suffix)] + suffix
         try:
-            await self._users.update_meta(user.id, "system", name=wanted)
-        except Exception as exc:  # a lost race on UNIQUE etc.: keep the old name
+            await self._users.update_meta(user.id, "system", display_name=wanted)
+        except Exception as exc:  # e.g. a vanished user: keep things as they are
             log.info("telegram name was not adopted: %s", type(exc).__name__)
             return user
         return await self._users.get(user.id) or user
@@ -238,7 +238,7 @@ class RequestService:
         user = await self._db.run(repo.get_user_by_tg_id, tg_id)
         if user is None:
             return StartInfo(None, False)
-        user = await self.adopt_telegram_name(user, username, full_name)
+        user = await self.adopt_telegram_display_name(user, username, full_name)
         extra = await self._db.run(repo.get_user_extra, user.id)
         first = extra is None or not extra.bot_started
         wanted = (username or "").lstrip("@") or None
@@ -414,7 +414,12 @@ class RequestService:
                         (
                             index,
                             req,
-                            NewUser(name=name, tg_id=req.tg_id, comment="заявка из бота"),
+                            NewUser(
+                                name=name,
+                                tg_id=req.tg_id,
+                                comment="заявка из бота",
+                                display_name=telegram_display_name(req.full_name, req.tg_username),
+                            ),
                         )
                     )
             if todo:
@@ -465,7 +470,15 @@ class RequestService:
         if term is not None:
             expires = default_expiry(term, self._pipeline.now())
         result = await self._users.create(
-            [NewUser(name=name, tg_id=req.tg_id, comment="заявка из бота", expires_at=expires)],
+            [
+                NewUser(
+                    name=name,
+                    tg_id=req.tg_id,
+                    comment="заявка из бота",
+                    expires_at=expires,
+                    display_name=telegram_display_name(req.full_name, req.tg_username),
+                )
+            ],
             actor,
         )
         if not result.ok or not result.user_ids:

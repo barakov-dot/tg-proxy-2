@@ -69,7 +69,7 @@ def _edit_lines(form: FormData) -> tuple[list[str], dict[str, RowEdit], list[str
             errors.append(T["import_bad_tg"].format(name=src))
             continue
         tg_id = tg_value if tg_raw and tg_raw != orig_tg else None
-        changed_dn = dn if dn and dn != odn else None
+        changed_dn = dn if dn != odn else None
         changed_cm = cm if cm != ocm else None
         if skip or tg_id is not None or changed_dn is not None or changed_cm is not None:
             edits[src] = RowEdit(

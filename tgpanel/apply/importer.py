@@ -51,7 +51,7 @@ class RowEdit:
     """User edits of one preview row (keyed by the source profile name)."""
 
     tg_id: int | None = None
-    display_name: str | None = None
+    display_name: str | None = None  # the user's display name ("Имя"), not the profile name
     comment: str | None = None
     skip: bool = False  # do not import: the profile stays an unmanaged pass-through entry
 
@@ -209,19 +209,19 @@ class Importer:
                         by_id[pool_id].port,
                         ip,
                         pool_id in new_ids,
-                        row.display_name in existing_names,
+                        row.name in existing_names,
                     )
                 )
             errors = [*plan.errors, *csv_errors]
             seen_names: set[str] = set()
             for pr in rows:
                 if pr.row.will_import:
-                    if pr.row.display_name in seen_names:
-                        errors.append(f"имя «{pr.row.display_name}» встречается дважды")
-                    seen_names.add(pr.row.display_name)
+                    if pr.row.name in seen_names:
+                        errors.append(f"имя «{pr.row.name}» встречается дважды")
+                    seen_names.add(pr.row.name)
             for pr in rows:
                 if pr.name_conflict:
-                    errors.append(f"{pr.row.source_name}: имя «{pr.row.display_name}» уже занято")
+                    errors.append(f"{pr.row.source_name}: имя «{pr.row.name}» уже занято")
             warnings = [OLD_BOT_WARNING, *plan.warnings]
             return ImportPreview(plan, tuple(rows), tuple(warnings), tuple(errors), None, sources)
 
@@ -340,12 +340,13 @@ class Importer:
         taken = {u.name for u in users}
         ids: list[int] = []
         for row, pool_id, ip in zip(rows, alloc.pool_ids, ips, strict=True):
-            if row.display_name in taken:
-                raise OperationRejected(f"Имя «{row.display_name}» уже занято")
-            taken.add(row.display_name)
+            if row.name in taken:
+                raise OperationRejected(f"Имя «{row.name}» уже занято")
+            taken.add(row.name)
             uid = repo.insert_user(
                 conn,
-                name=row.display_name,
+                name=row.name,
+                display_name=row.display_name,
                 secret=row.secret,
                 status=UserStatus.ACTIVE,
                 pool_id=pool_id,

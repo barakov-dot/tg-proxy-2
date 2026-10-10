@@ -39,6 +39,8 @@ async def test_preview_stack_serves_the_redesigned_panel(tmp_path: Path) -> None
             assert chart["points"] and chart["total_down"] > chart["total_up"] > 0
             users = await c.get(root + "/users", headers={"HX-Request": "true"})
             assert users.status_code == 200 and "<html" not in users.text
+            assert "Дмитрий Жабкин" in users.text and "Инга Базанова 🐉" in users.text
+            assert "user_93455874" in users.text  # the technical profile name column
             for page in ("/users", "/requests", "/backups", "/audit", "/settings"):
                 assert (await c.get(root + page)).status_code == 200, page
     finally:

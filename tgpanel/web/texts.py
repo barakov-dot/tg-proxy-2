@@ -88,7 +88,8 @@ T: dict[str, str] = {
     "dash_cert_warn": "автопродление не работает?",
     # table columns
     "col_id": "ID",
-    "col_name": "Имя",
+    "col_display_name": "Имя",
+    "col_name": "Профиль",
     "col_comment": "Комментарий",
     "col_tg_id": "Telegram ID",
     "col_tg_username": "Username",
@@ -156,8 +157,8 @@ T: dict[str, str] = {
     "deleted": "Пользователь удалён",
     "delete_word": "удалить",
     "delete_confirm_bad_bulk": "Для удаления введите слово «{word}»",
-    "delete_type_name": "Введите имя для подтверждения",
-    "delete_name_mismatch": "Имя введено неверно, удаление отменено",
+    "delete_type_name": "Введите имя профиля для подтверждения",
+    "delete_name_mismatch": "Имя профиля введено неверно, удаление отменено",
     "links_sent": "Ссылки отправлены: {sent}, не удалось: {failed}.",
     "link_sent": "Ссылка отправлена",
     # card
@@ -186,7 +187,13 @@ T: dict[str, str] = {
     "create_list": "Пакет по списку",
     "create_prefix": "Префикс имени (для пакета)",
     "create_number": "Количество",
-    "create_list_label": "Список: «имя; telegram id; комментарий», по строке на пользователя",
+    "create_list_label": (
+        "Список: «имя профиля; telegram id; комментарий; имя», по строке на пользователя "
+        "(telegram id, комментарий и имя необязательны)"
+    ),
+    "create_display_name": "Имя (необязательно; для пакета по количеству к нему добавляется номер)",
+    "bad_display_name": "Имя не длиннее 100 символов, в одну строку",
+    "create_line_badname": "Строка {n}: некорректное имя",
     "create_submit": "Создать",
     "create_wait_hint": (
         "Страница дождётся применения изменений; ссылки доступны только после успеха."

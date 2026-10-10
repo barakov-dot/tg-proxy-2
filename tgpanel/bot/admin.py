@@ -22,7 +22,7 @@ from tgpanel.bot.format import esc, fmt_dt, human_bytes, status_mark, status_ru
 from tgpanel.bot.user import deliver_outcome
 from tgpanel.db import repo
 from tgpanel.domain.expiry import Term, default_expiry
-from tgpanel.domain.models import UserRecord, UserStatus
+from tgpanel.domain.models import UserRecord, UserStatus, clean_display_name, shown_name
 from tgpanel.domain.queries import Period, SortField, UserFilter, UserListQuery
 from tgpanel.services.api import NewUser
 from tgpanel.services.broadcast import BroadcastPreview
@@ -34,7 +34,7 @@ log = logging.getLogger("tgpanel.bot")
 SERVICE_PAGE = 50
 MAX_TG_ID = 2**53
 SORTS: dict[str, tuple[SortField, bool]] = {
-    "n": ("name", False),
+    "n": ("display_name", False),
     "l": ("last_seen_at", True),
     "t": ("traffic", True),
     "x": ("expires_at", False),
@@ -57,11 +57,16 @@ class AdminFilter(Filter):
 
 class CreateUser(StatesGroup):
     name = State()
+    display_name = State()
     tg_id = State()
     comment = State()
 
 
 class EditComment(StatesGroup):
+    text = State()
+
+
+class EditName(StatesGroup):
     text = State()
 
 
@@ -224,7 +229,8 @@ async def _card(
     if extra.bot_started and not extra.can_message:
         bot_state = "заблокирован"
     lines = [
-        f"{icons.USER} <b>{esc(user.name)}</b> (#{user.id})",
+        f"{icons.USER} <b>{esc(shown_name(user))}</b> (#{user.id})",
+        *([f"{icons.USER} Профиль: <code>{esc(user.name)}</code>"] if user.display_name else []),
         f"{status_mark(user.status)} Статус: {status_ru(user.status)}",
         f"{icons.TERM} Срок: {fmt_dt(user.expires_at, tz, 'без срока')}",
         f"{icons.COMMENT} Комментарий: {esc(user.comment) if user.comment else '—'}",
@@ -294,7 +300,9 @@ async def cb_delete_ask(cb: CallbackQuery, deps: BotDeps, m: re.Match[str]) -> N
     if user is None:
         await alert(cb, texts.USER_NOT_FOUND)
         return
-    await show(cb, texts.CONFIRM_DELETE.format(name=esc(user.name)), keyboards.confirm_delete(uid))
+    await show(
+        cb, texts.CONFIRM_DELETE.format(name=esc(shown_name(user))), keyboards.confirm_delete(uid)
+    )
 
 
 @router.callback_query(uid_cb("dy"))
@@ -318,7 +326,7 @@ async def cb_link(cb: CallbackQuery, deps: BotDeps, bot: Bot, m: re.Match[str]) 
     if user is None:
         return
     await cb.answer()
-    intro = texts.LINK_OF.format(name=user.name)
+    intro = texts.LINK_OF.format(name=shown_name(user))
     if not await send_link(bot, deps, cb.from_user.id, user, intro, notify_blocked=False):
         await bot.send_message(cb.from_user.id, texts.LINK_UNAVAILABLE)
 
@@ -388,6 +396,31 @@ async def msg_comment(message: Message, deps: BotDeps, state: FSMContext) -> Non
     await _show_card(message, deps, state, uid, texts.COMMENT_SAVED)
 
 
+@router.callback_query(uid_cb("en"))
+async def cb_name_edit(cb: CallbackQuery, state: FSMContext, m: re.Match[str]) -> None:
+    await state.set_state(EditName.text)
+    await state.update_data(edit_uid=_uid(m))
+    await show(cb, texts.NAME_PROMPT)
+
+
+@router.message(EditName.text, F.text, ~F.text.startswith("/"))
+async def msg_display_name(message: Message, deps: BotDeps, state: FSMContext) -> None:
+    data = await state.get_data()
+    uid = int(data.get("edit_uid", 0))
+    raw = (message.text or "").strip()
+    try:
+        await deps.users.update_meta(
+            uid,
+            actor_of(message.from_user.id if message.from_user else 0),
+            display_name="" if raw == "-" else raw,
+        )
+    except (UserServiceError, OperationRejected) as exc:
+        await message.answer(esc(str(exc)))  # stay in the state: the admin can retry
+        return
+    await state.set_state(None)
+    await _show_card(message, deps, state, uid, texts.NAME_SAVED)
+
+
 # ------------------------------------------------------------------ requests
 
 
@@ -431,7 +464,7 @@ async def cb_request_term(cb: CallbackQuery, deps: BotDeps, bot: Bot, m: re.Matc
     await cb.answer(texts.OPERATION_RUNNING)
     out = await deps.requests.approve(rid, term, actor_of(cb.from_user.id))
     if out.kind is RequestKind.ISSUED and out.request is not None:
-        name = out.user.name if out.user else out.request.full_name
+        name = shown_name(out.user) if out.user else out.request.full_name
         await show(cb, texts.CREATED.format(name=esc(name)), keyboards.kb(keyboards.menu_row()))
         await deliver_outcome(
             bot,
@@ -555,8 +588,28 @@ async def msg_create_name(message: Message, state: FSMContext) -> None:
         await message.answer(texts.CREATE_BAD_TEXT)
         return
     await state.update_data(cu={"name": name})
+    await state.set_state(CreateUser.display_name)
+    await message.answer(texts.CREATE_DISPLAY_NAME, reply_markup=keyboards.skip_button("cs:dn"))
+
+
+@router.message(CreateUser.display_name, F.text, ~F.text.startswith("/"))
+async def msg_create_display_name(message: Message, state: FSMContext) -> None:
+    try:
+        value = clean_display_name(message.text or "")
+    except ValueError:
+        await message.answer(texts.CREATE_BAD_TEXT)
+        return
+    data = (await state.get_data())["cu"]
+    data["display_name"] = value
+    await state.update_data(cu=data)
     await state.set_state(CreateUser.tg_id)
     await message.answer(texts.CREATE_TG_ID, reply_markup=keyboards.skip_button("cs:tg"))
+
+
+@router.callback_query(F.data == "cs:dn", CreateUser.display_name)
+async def cb_create_skip_display_name(cb: CallbackQuery, state: FSMContext) -> None:
+    await state.set_state(CreateUser.tg_id)
+    await show(cb, texts.CREATE_TG_ID, keyboards.skip_button("cs:tg"))
 
 
 async def _ask_term(target: Message | CallbackQuery) -> None:
@@ -615,7 +668,15 @@ async def _finish_create(
     expires = None if term_code == "df" else default_expiry(Term(term_code), deps.pipeline.now())
     await show(target, texts.CREATING)
     res = await deps.users.create(
-        [NewUser(name=data["name"], tg_id=data.get("tg_id"), comment=comment, expires_at=expires)],
+        [
+            NewUser(
+                name=data["name"],
+                tg_id=data.get("tg_id"),
+                comment=comment,
+                expires_at=expires,
+                display_name=data.get("display_name", ""),
+            )
+        ],
         actor_of(admin),
     )
     if not res.ok or not res.user_ids:
@@ -624,12 +685,17 @@ async def _finish_create(
     user = await deps.users.get(res.user_ids[0])
     await bot.send_message(
         admin,
-        texts.CREATED.format(name=esc(data["name"])),
+        texts.CREATED.format(name=esc(data.get("display_name") or data["name"])),
         reply_markup=keyboards.kb(keyboards.menu_row()),
     )
     if user is not None:
         await send_link(
-            bot, deps, admin, user, texts.LINK_OF.format(name=user.name), notify_blocked=False
+            bot,
+            deps,
+            admin,
+            user,
+            texts.LINK_OF.format(name=shown_name(user)),
+            notify_blocked=False,
         )
 
 

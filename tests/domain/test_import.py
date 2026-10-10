@@ -24,7 +24,7 @@ def test_import_fifteen_profiles() -> None:
     assert not plan.blocked and plan.warnings == ()
     assert len(plan.importable) == 15
     r = plan.rows[0]
-    assert r.tg_id == 93455871 and r.display_name == "user_93455871"
+    assert r.tg_id == 93455871 and r.name == "user_93455871" and r.display_name == ""
     assert r.comment == "import" and r.carrier_mode is CarrierMode.HTTPS
     assert r.secret == secret_for(1) and r.source_backend == "127.0.0.1:2398"
 
@@ -102,6 +102,23 @@ def test_csv_overrides_and_unknown_names() -> None:
     r = plan.rows[0]
     assert (r.tg_id, r.display_name, r.comment) == (555, "Alice", "import; vip")
     assert any("ghost" in w for w in plan.warnings)
+
+
+def test_csv_display_name_is_unicode_and_never_replaces_the_name() -> None:
+    rows, errs = parse_csv_rows("user_12345;;Инга Базанова 🐉;\nuser_12346;;山田 太郎;vip")
+    assert errs == []
+    plan = plan_import([prof("user_12345", 1), prof("user_12346", 2)], csv_rows=rows)
+    assert [(r.name, r.display_name) for r in plan.rows] == [
+        ("user_12345", "Инга Базанова 🐉"),
+        ("user_12346", "山田 太郎"),
+    ]
+
+
+def test_csv_display_name_too_long_or_multiline_is_an_error() -> None:
+    plan = plan_import([prof("user_12345", 1)], csv_rows=[CsvRow("user_12345", None, "я" * 101)])
+    assert plan.blocked
+    plan = plan_import([prof("user_12345", 1)], csv_rows=[CsvRow("user_12345", None, "a\x00b")])
+    assert plan.blocked
 
 
 def test_csv_row_without_id_keeps_regex_id() -> None:

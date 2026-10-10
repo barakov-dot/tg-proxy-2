@@ -370,3 +370,44 @@ def test_list_users_load_300_users_14_days_of_minutes() -> None:
     assert total == 300 and len(page) == 50
     assert page[0].bytes_up == 1000 * minutes
     assert elapsed < 0.5, f"list page took {elapsed:.3f}s"
+
+
+def test_display_name_default_roundtrip_and_update_whitelist() -> None:
+    conn = fresh_db()
+    plain = add_user(conn, 1)
+    labelled = add_user(conn, 2, display_name="Инга Базанова 🐉")
+    assert repo.get_user(conn, plain).display_name == ""  # type: ignore[union-attr]
+    assert repo.get_user(conn, labelled).display_name == "Инга Базанова 🐉"  # type: ignore[union-attr]
+    repo.update_user(conn, plain, display_name="山田 太郎")
+    assert repo.get_user(conn, plain).display_name == "山田 太郎"  # type: ignore[union-attr]
+    row = repo.list_users(conn, UserListQuery(), NOW, timedelta(seconds=90))[0][0]
+    assert row.user.display_name  # the list rows carry it too
+
+
+def _ids(conn: object, **kw: object) -> list[int]:
+    rows, _ = repo.list_users(conn, UserListQuery(**kw), NOW, timedelta(seconds=90))  # type: ignore[arg-type]
+    return [r.user.id for r in rows]
+
+
+def test_query_matches_display_name_unicode_case_insensitive() -> None:
+    conn = fresh_db()
+    a = add_user(conn, 1, name="user_93455874", display_name="Дмитрий Жабкин")
+    b = add_user(conn, 2, name="user_2", display_name="Инга Базанова 🐉")
+    c = add_user(conn, 3, name="user_3", display_name="")
+    assert _ids(conn, filter=UserFilter(query="ЖАБКИН")) == [a]
+    assert _ids(conn, filter=UserFilter(query="инга")) == [b]
+    assert _ids(conn, filter=UserFilter(query="🐉")) == [b]
+    assert _ids(conn, filter=UserFilter(query="user_93455874")) == [a]  # technical name too
+    assert _ids(conn, filter=UserFilter(query="user_3")) == [c]
+    assert _ids(conn, filter=UserFilter(query="100%")) == []  # wildcards are escaped
+    assert _ids(conn, filter=UserFilter(query="%")) == []
+
+
+def test_sort_display_name_falls_back_to_name_and_is_case_insensitive() -> None:
+    conn = fresh_db()
+    b = add_user(conn, 1, name="n1", display_name="бета")
+    a = add_user(conn, 2, name="n2", display_name="Альфа")
+    g = add_user(conn, 3, name="n3", display_name="Гамма")
+    z = add_user(conn, 4, name="Яблоко", display_name="")  # falls back to the name
+    assert _ids(conn, sort="display_name") == [a, b, g, z]
+    assert _ids(conn, sort="display_name", descending=True) == [z, g, b, a]

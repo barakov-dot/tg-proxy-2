@@ -13,14 +13,14 @@
   <textarea name="csv_text" hidden aria-hidden="true">{{ csv_text }}</textarea>
   <input type="hidden" name="n" value="{{ p.rows|length }}">
   <div class="table-wrap"><table>
-  <thead><tr><th>{{ t.import_source }}</th><th>{{ t.col_tg_id }}</th><th>{{ t.col_name }}</th><th>{{ t.col_comment }}</th><th>{{ t.col_pool_id }}</th><th>{{ t.import_address }}</th><th>{{ t.import_skip }}</th></tr></thead>
+  <thead><tr><th>{{ t.import_source }}</th><th>{{ t.col_tg_id }}</th><th>{{ t.col_display_name }}</th><th>{{ t.col_comment }}</th><th>{{ t.col_pool_id }}</th><th>{{ t.import_address }}</th><th>{{ t.import_skip }}</th></tr></thead>
   <tbody>
   {% for r in p.rows %}{% set row = r.row %}
   <tr>
     <td>{{ row.source_name }}<input type="hidden" name="src_{{ loop.index0 }}" value="{{ row.source_name }}"></td>
     {% if row.will_import %}
     <td><input name="tg_{{ loop.index0 }}" value="{{ row.tg_id if row.tg_id is not none else '' }}" inputmode="numeric" aria-label="{{ t.col_tg_id }}" class="short"><input type="hidden" name="otg_{{ loop.index0 }}" value="{{ row.tg_id if row.tg_id is not none else '' }}"></td>
-    <td><input name="dn_{{ loop.index0 }}" value="{{ row.display_name }}" aria-label="{{ t.col_name }}"><input type="hidden" name="odn_{{ loop.index0 }}" value="{{ row.display_name }}"></td>
+    <td><input name="dn_{{ loop.index0 }}" value="{{ row.display_name }}" aria-label="{{ t.col_display_name }}" maxlength="100"><input type="hidden" name="odn_{{ loop.index0 }}" value="{{ row.display_name }}"></td>
     <td><input name="cm_{{ loop.index0 }}" value="{{ row.comment }}" aria-label="{{ t.col_comment }}"><input type="hidden" name="ocm_{{ loop.index0 }}" value="{{ row.comment }}"></td>
     <td>{{ r.pool_id }}{% if r.new_pool %} <span class="badge info">{{ t.import_new_pool }}</span>{% endif %} <code>:{{ r.pool_port }}</code></td>
     <td><code>{{ r.loopback_ip }}</code></td>

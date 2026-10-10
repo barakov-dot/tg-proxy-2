@@ -18,6 +18,7 @@ BOT_TOKEN = "123456789:" + "A" * 35
 async def test_non_ascii_digits_are_rejected_not_crashing(env: Env) -> None:
     await env.tg.press(ADMIN, "cr")
     await env.tg.send(ADMIN, "Name")
+    await env.tg.press(ADMIN, "cs:dn")
     await env.tg.send(ADMIN, "١٢٣")  # Arabic-Indic digits: str.isdigit() is True
     await env.tg.send(ADMIN, "²")
     assert sum("Нужно положительное число" in t for t in env.session.texts(ADMIN)) == 2

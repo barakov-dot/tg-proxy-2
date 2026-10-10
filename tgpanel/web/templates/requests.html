@@ -5,7 +5,7 @@
 <div class="page-head"><h1>{{ t.nav_requests }}</h1></div>
 <section class="card pad-0">
 <div class="card-head" ><h2>{{ t.requests_pending }} <span class="badge info">{{ pending|length }}</span></h2></div>
-<div class="table-wrap"><table><thead><tr><th>#</th><th>Telegram ID</th><th>{{ t.col_tg_username }}</th><th>{{ t.col_name }}</th><th>{{ t.col_created_at }}</th><th></th></tr></thead><tbody>
+<div class="table-wrap"><table><thead><tr><th>#</th><th>Telegram ID</th><th>{{ t.col_tg_username }}</th><th>{{ t.col_display_name }}</th><th>{{ t.col_created_at }}</th><th></th></tr></thead><tbody>
 {% for r in pending %}
 <tr><td>{{ r.id }}</td><td>{{ r.tg_id }}</td><td>{{ ('@' ~ r.tg_username) if r.tg_username else '—' }}</td><td>{{ r.full_name }}</td><td class="nowrap">{{ fmt(r.created_at) }}</td>
 <td><div class="actions">
@@ -19,7 +19,7 @@
 </section>
 <section class="card pad-0">
 <div class="card-head"><h2>{{ t.requests_history }}</h2></div>
-<div class="table-wrap"><table><thead><tr><th>#</th><th>Telegram ID</th><th>{{ t.col_name }}</th><th>{{ t.col_status }}</th><th>{{ t.decided_by }}</th><th>{{ t.col_time }}</th></tr></thead><tbody>
+<div class="table-wrap"><table><thead><tr><th>#</th><th>Telegram ID</th><th>{{ t.col_display_name }}</th><th>{{ t.col_status }}</th><th>{{ t.decided_by }}</th><th>{{ t.col_time }}</th></tr></thead><tbody>
 {% for r in decided %}<tr><td>{{ r.id }}</td><td>{{ r.tg_id }}</td><td>{{ r.full_name }}</td><td><span class="badge {{ 'good' if r.status == 'approved' else 'bad' }}">{{ r.status }}</span></td><td>{{ r.decided_by or '—' }}</td><td class="nowrap">{{ fmt(r.decided_at) }}</td></tr>{% else %}<tr><td colspan="6" class="muted">{{ t.no_data }}</td></tr>{% endfor %}
 </tbody></table></div>
 </section>

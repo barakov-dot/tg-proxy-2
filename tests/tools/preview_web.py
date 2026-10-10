@@ -129,7 +129,20 @@ class PreviewOps(FakeSystemOps):
         return await super().read_file(path)
 
 
+SHOWCASE_DISPLAY_NAMES = ("Дмитрий Жабкин", "Инга Базанова 🐉", "Макс")
+
+
 def synthetic_name(i: int) -> str:
+    """Technical profile name, like the imported ones (`user_<telegram id>`)."""
+    return f"user_{93455874 + i * 7919}"
+
+
+def synthetic_display_name(i: int) -> str:
+    """Russian/emoji display names; every 7th user has none (the table shows the profile)."""
+    if i < len(SHOWCASE_DISPLAY_NAMES):
+        return SHOWCASE_DISPLAY_NAMES[i]
+    if i % 7 == 6:
+        return ""
     return f"{FIRST_NAMES[i % len(FIRST_NAMES)]} {chr(ord('А') + (i * 3) % 26)}."
 
 
@@ -222,7 +235,10 @@ async def build_preview(root: Path, *, clock_seed: int = 7) -> Stack:
         raise RuntimeError(out.error)
     await stack.ctx.users.load_hostname()
 
-    users = [NewUser(name=synthetic_name(i), comment="") for i in range(USERS)]
+    users = [
+        NewUser(name=synthetic_name(i), comment="", display_name=synthetic_display_name(i))
+        for i in range(USERS)
+    ]
     result = await stack.ctx.users.create(users, "system")
     if not result.ok:
         raise RuntimeError(result.error)

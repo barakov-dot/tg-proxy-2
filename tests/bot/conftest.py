@@ -33,9 +33,16 @@ class Env:
     traffic: FakeTraffic
 
     async def make_user(
-        self, name: str = "Vasya", tg_id: int | None = None, *, started: bool = False
+        self,
+        name: str = "Vasya",
+        tg_id: int | None = None,
+        *,
+        started: bool = False,
+        display_name: str = "",
     ) -> UserRecord:
-        res = await self.svc.users.create([NewUser(name=name, tg_id=tg_id)], "web:admin")
+        res = await self.svc.users.create(
+            [NewUser(name=name, tg_id=tg_id, display_name=display_name)], "web:admin"
+        )
         assert res.ok, res.error
         uid = res.user_ids[0]
         if started:

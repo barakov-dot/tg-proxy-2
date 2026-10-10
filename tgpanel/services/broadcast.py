@@ -22,7 +22,7 @@ from tgpanel.apply.settings_spec import read_settings
 from tgpanel.db import repo
 from tgpanel.db.connection import Database, transaction
 from tgpanel.db.times import from_db_opt
-from tgpanel.domain.models import UserStatus
+from tgpanel.domain.models import UserStatus, shown_name
 from tgpanel.services.api import UserService
 from tgpanel.services.notifier import (
     FORBIDDEN,
@@ -194,7 +194,7 @@ class BroadcastService:
                     reason = "bot_not_started"
                 elif not extra.can_message:
                     reason = "cannot_message"
-                out.append(Recipient(u.id, u.name, u.tg_id, reason))
+                out.append(Recipient(u.id, shown_name(u), u.tg_id, reason))
             return out
 
         return BroadcastPreview(tuple(await self._db.run(load)))
@@ -335,7 +335,8 @@ class BroadcastService:
             if head is None:
                 raise OperationRejected("Рассылка не найдена")
             rows = conn.execute(
-                "SELECT i.user_id, u.name, i.tg_id, i.result FROM broadcast_items i"
+                "SELECT i.user_id, COALESCE(NULLIF(u.display_name, ''), u.name) AS name, i.tg_id,"
+                " i.result FROM broadcast_items i"
                 " LEFT JOIN users u ON u.id = i.user_id WHERE i.broadcast_id = ? ORDER BY i.id",
                 (broadcast_id,),
             ).fetchall()

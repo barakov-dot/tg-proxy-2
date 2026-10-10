@@ -12,6 +12,7 @@ PER_PAGE_CHOICES = (50, 100, 200)
 
 SortField = Literal[
     "id",
+    "display_name",
     "name",
     "comment",
     "tg_id",

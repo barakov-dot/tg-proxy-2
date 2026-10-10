@@ -37,6 +37,7 @@ class NewUser:
     comment: str = ""
     expires_at: datetime | None = None
     carrier_mode: CarrierMode | None = None
+    display_name: str = ""  # free-form label ("Имя"); `name` is the technical profile name
 
 
 @dataclass(frozen=True, slots=True)
@@ -87,6 +88,7 @@ class UserService(Protocol):
         actor: Actor,
         *,
         name: str | None = None,
+        display_name: str | None = None,
         comment: str | None = None,
         tg_id: int | None = None,
         tg_username: str | None = None,

@@ -8,7 +8,7 @@ from fastapi import APIRouter, Depends, Request, Response
 from fastapi.responses import JSONResponse
 
 from tgpanel.db import repo
-from tgpanel.domain.models import UserStatus
+from tgpanel.domain.models import UserStatus, shown_name
 from tgpanel.services.api import UserFilter, UserListQuery
 from tgpanel.services.dashboard import DashboardView
 from tgpanel.web.deps import WebContext, safe
@@ -54,7 +54,7 @@ async def _online(web: WebContext) -> tuple[list[dict[str, object]], int]:
         out.append(
             {
                 "id": r.user.id,
-                "name": r.user.name,
+                "name": shown_name(r.user),
                 "tg_id": r.user.tg_id,
                 "tg_username": ex.tg_username if ex else None,
                 "pool_id": r.user.pool_id,

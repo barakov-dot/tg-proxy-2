@@ -53,7 +53,7 @@ async def test_import_preview_edit_skip_confirm(owner_web: Web) -> None:
     users = w.ctx.db.call(repo.all_users)
     assert len(users) == 14 and all(u.imported for u in users)
     assert users[0].tg_id == 999999
-    assert any(u.name == "Второй" for u in users)
+    assert any(u.display_name == "Второй" and u.name.startswith("user_") for u in users)
     assert any("заметка" in u.comment for u in users), [u.comment for u in users]
     # idempotent: a second import has nothing to do
     again = await w.post("/import/preview", {"regex": r"^user_(\d{5,15})$"})

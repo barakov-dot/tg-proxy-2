@@ -147,12 +147,14 @@ async def test_create_batch_by_count_single_apply(aw: Web) -> None:
 
 
 async def test_create_batch_by_list(aw: Web) -> None:
-    text = "ann; 111; first; note\n# skip\nbob;;\ncarl; 333; с;точкой"
+    text = "ann; 111; first; Анна 🐉\n# skip\nbob;;\ncarl; 333; с точкой; 山田"
     r = await aw.post("/users/new", {"mode": "list", "list": text, "term": "1m"})
     assert r.status_code == 200
     users = {u.name: u for u in aw.ctx.db.call(repo.all_users)}
-    assert users["ann"].tg_id == 111 and users["ann"].comment == "first; note"
-    assert users["bob"].tg_id is None and users["carl"].comment == "с;точкой"
+    assert users["ann"].tg_id == 111 and users["ann"].comment == "first"
+    assert users["ann"].display_name == "Анна 🐉" and users["bob"].display_name == ""
+    assert users["bob"].tg_id is None and users["carl"].comment == "с точкой"
+    assert users["carl"].display_name == "山田" and users["carl"].name == "carl"
 
 
 async def test_create_validation_errors(aw: Web) -> None:

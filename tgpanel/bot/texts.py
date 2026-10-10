@@ -21,6 +21,7 @@ BTN_LINK = f"{icons.LINK} " + "Ссылка"
 BTN_QR = f"{icons.QR} " + "QR-код"
 BTN_SEND_LINK = f"{icons.SEND} " + "Отправить ссылку"
 BTN_COMMENT = f"{icons.COMMENT} " + "Комментарий"
+BTN_EDIT_NAME = f"{icons.COMMENT} " + "Имя"
 BTN_DELETE = f"{icons.DELETE} " + "Удалить"
 BTN_DELETE_CONFIRM = f"{icons.DELETE} " + "Да, удалить"
 BTN_TO_LIST = f"{icons.USERS} " + "К списку"
@@ -146,12 +147,18 @@ CANCELLED = f"{icons.CANCEL} " + "Отменено."
 NOTHING_TO_CANCEL = f"{icons.WARN} " + "Нечего отменять."
 USER_NOT_FOUND = f"{icons.WARN} " + "Пользователь не найден."
 LIST_EMPTY = f"{icons.WARN} " + "Никого не найдено."
-SEARCH_PROMPT = f"{icons.SEARCH} " + "Введите часть имени, комментария или Telegram ID."
+SEARCH_PROMPT = f"{icons.SEARCH} " + "Введите часть имени, профиля, комментария или Telegram ID."
 COMMENT_PROMPT = (
     f"{icons.COMMENT} "
     + "Отправьте новый комментарий одним сообщением (до 2000 символов) или /cancel."
 )
 COMMENT_SAVED = f"{icons.OK} " + "Комментарий сохранён."
+NAME_PROMPT = (
+    f"{icons.USER} "
+    + "Отправьте новое имя одним сообщением (до 100 символов, можно кириллицу и эмодзи), "
+    + "«-» чтобы очистить, или /cancel."
+)
+NAME_SAVED = f"{icons.OK} " + "Имя сохранено."
 CONFIRM_DELETE = (
     f"{icons.WARN} " + "Удалить пользователя «{name}» вместе со статистикой? Это необратимо."
 )
@@ -182,6 +189,7 @@ BROADCAST_NO_ONE = f"{icons.WARN} " + "В рассылке некому полу
 BROADCAST_NO_SELECTION = f"{icons.WARN} " + "Никто не выбран."
 
 CREATE_NAME = f"{icons.USER} " + "Имя нового пользователя (до 100 символов) или /cancel:"
+CREATE_DISPLAY_NAME = f"{icons.USER} " + "Отображаемое имя (можно пропустить):"
 CREATE_TG_ID = f"{icons.TELEGRAM} " + "Telegram ID пользователя (число) или «Пропустить»:"
 CREATE_TERM = f"{icons.TERM} " + "Срок действия:"
 CREATE_COMMENT = f"{icons.COMMENT} " + "Комментарий или «Пропустить»:"

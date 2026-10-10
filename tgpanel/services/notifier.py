@@ -25,7 +25,7 @@ from aiogram.exceptions import TelegramForbiddenError, TelegramRetryAfter
 from tgpanel.apply.pipeline import ApplyFailure, ApplyPipeline
 from tgpanel.db import repo
 from tgpanel.db.connection import Database, transaction
-from tgpanel.domain.models import UserRecord
+from tgpanel.domain.models import UserRecord, shown_name
 from tgpanel.system.validation import scrub
 
 log = logging.getLogger("tgpanel.notifier")
@@ -72,7 +72,13 @@ def message_values(
     if user.expires_at is not None:
         expires = user.expires_at.astimezone(ZoneInfo(tz)).strftime("%d.%m.%Y %H:%M")
         days = str(max(0, math.ceil((user.expires_at - now).total_seconds() / 86400)))
-    return {"name": user.name, "link": link, "tg_link": tg_link, "expires": expires, "days": days}
+    return {
+        "name": shown_name(user),
+        "link": link,
+        "tg_link": tg_link,
+        "expires": expires,
+        "days": days,
+    }
 
 
 class Templates:

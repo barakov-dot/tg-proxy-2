@@ -237,7 +237,12 @@ def snapshot_database(db: Database, db_path: str | None, dest: Path, *, slim: bo
                 if str(r[0]) not in SLIM_EXCLUDED
             ]
             for table in tables:
-                dst.execute(f"INSERT INTO main.{table} SELECT * FROM live.{table}")  # noqa: S608
+                # explicit common columns: robust against column order / older live schemas
+                live_cols = {str(r[1]) for r in dst.execute(f"PRAGMA live.table_info({table})")}
+                cols = ", ".join(c for c in _columns(dst, table) if c in live_cols)
+                dst.execute(
+                    f"INSERT INTO main.{table} ({cols}) SELECT {cols} FROM live.{table}"  # noqa: S608
+                )
             dst.execute("DELETE FROM main.sqlite_sequence")
             dst.execute(
                 "INSERT INTO main.sqlite_sequence SELECT name, seq FROM live.sqlite_sequence"
@@ -457,8 +462,9 @@ def _copy_tables(src: sqlite3.Connection, dst: sqlite3.Connection, *, slim: bool
     check = src.execute("PRAGMA integrity_check").fetchone()
     if check is None or str(check[0]) != "ok":
         raise BackupError("снимок БД не прошёл проверку целостности")
-    if current_version_readonly(src) != current_version(dst):
-        raise BackupError("версия схемы снимка БД отличается от текущей")
+    # Older snapshots restore too (columns they lack get their defaults); newer ones do not.
+    if current_version_readonly(src) > current_version(dst):
+        raise BackupError("снимок БД создан более новой версией схемы, чем текущая")
     dst.execute("PRAGMA defer_foreign_keys = ON")
     # Credentials are never resurrected from a backup: the `admins` table is left untouched
     # and the panel login/password/session version and bot-token settings keep their CURRENT
