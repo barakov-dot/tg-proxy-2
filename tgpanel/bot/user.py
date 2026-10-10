@@ -49,7 +49,9 @@ async def cmd_start(message: Message, deps: BotDeps, state: FSMContext) -> None:
         return
     await state.clear()
     uid = message.from_user.id
-    info = await deps.requests.register_start(uid, message.from_user.username)
+    info = await deps.requests.register_start(
+        uid, message.from_user.username, message.from_user.full_name
+    )
     is_admin = await deps.db.run(repo.is_admin, uid)
     suffix = texts.ADMIN_HINT if is_admin else ""
     if info.user is not None:
@@ -82,6 +84,9 @@ async def cb_my_link(cb: CallbackQuery, deps: BotDeps, bot: Bot) -> None:
     if user is None:
         await cb.answer(texts.NO_ACCESS, show_alert=True)
         return
+    user = await deps.requests.adopt_telegram_name(
+        user, cb.from_user.username, cb.from_user.full_name
+    )
     if user.status is not UserStatus.ACTIVE:
         await cb.answer(await _status_text(deps, user), show_alert=True)
         return
