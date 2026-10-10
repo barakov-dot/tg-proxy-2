@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from collections.abc import Callable, Coroutine
+from collections.abc import Awaitable, Callable, Coroutine
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
@@ -14,7 +14,7 @@ from tgpanel.apply.settings_spec import AppSettings
 from tgpanel.db.connection import Database
 from tgpanel.domain.queries import Period
 from tgpanel.services.api import OperationResult, UserService
-from tgpanel.services.broadcast import BroadcastService
+from tgpanel.services.broadcast import BroadcastService, LinkDelivery
 from tgpanel.services.notifier import MessageSender, Messenger, Templates, scrub_secrets
 from tgpanel.services.requests import RequestService
 
@@ -58,7 +58,9 @@ class BotDeps:
     traffic: TrafficReader
     sender: MessageSender  # real: AiogramSender bound to the Bot
     messenger: Messenger  # the application-wide one (shared rate limiter)
+    link_delivery: LinkDelivery
     monotonic: Callable[[], float] = time.monotonic
+    sleep: Callable[[float], Awaitable[None]] = asyncio.sleep
     throttle_interval: float = 0.4  # seconds between events of one Telegram user
     templates: Templates = field(init=False)
     tasks: set[asyncio.Task[Any]] = field(default_factory=set, init=False)

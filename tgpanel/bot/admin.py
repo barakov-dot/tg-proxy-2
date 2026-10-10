@@ -16,7 +16,7 @@ from aiogram.types import CallbackQuery, InlineKeyboardMarkup, Message, Telegram
 
 from tgpanel.apply.errors import OperationRejected
 from tgpanel.bot import icons, keyboards, texts
-from tgpanel.bot.delivery import alert, send_link, show
+from tgpanel.bot.delivery import ack, alert, send_link, show
 from tgpanel.bot.deps import BotDeps, totals_pair
 from tgpanel.bot.format import esc, fmt_dt, human_bytes, status_mark, status_ru
 from tgpanel.bot.user import deliver_outcome
@@ -270,7 +270,7 @@ async def cb_toggle(cb: CallbackQuery, deps: BotDeps, state: FSMContext, m: re.M
     if user is None:
         await alert(cb, texts.USER_NOT_FOUND)
         return
-    await cb.answer(texts.OPERATION_RUNNING)
+    await ack(cb, texts.OPERATION_RUNNING)
     if (user.status is UserStatus.ACTIVE) == enable:
         await _show_card(cb, deps, state, uid)
         return
@@ -286,7 +286,7 @@ async def cb_extend_menu(cb: CallbackQuery, m: re.Match[str]) -> None:
 @router.callback_query(F.data.regexp(r"^xe:(\d{1,9}):(7|30|90|365)$").as_("m"))
 async def cb_extend(cb: CallbackQuery, deps: BotDeps, state: FSMContext, m: re.Match[str]) -> None:
     uid = int(m.group(1))
-    await cb.answer(texts.OPERATION_RUNNING)
+    await ack(cb, texts.OPERATION_RUNNING)
     res = await deps.users.extend([uid], int(m.group(2)), actor_of(cb.from_user.id))
     await _show_card(
         cb, deps, state, uid, esc(res.error) if not res.ok and res.error else texts.DONE
@@ -307,7 +307,7 @@ async def cb_delete_ask(cb: CallbackQuery, deps: BotDeps, m: re.Match[str]) -> N
 
 @router.callback_query(uid_cb("dy"))
 async def cb_delete(cb: CallbackQuery, deps: BotDeps, m: re.Match[str]) -> None:
-    await cb.answer(texts.OPERATION_RUNNING)
+    await ack(cb, texts.OPERATION_RUNNING)
     res = await deps.users.delete([_uid(m)], actor_of(cb.from_user.id))
     msg = texts.DELETED if res.ok else esc(res.error or texts.ERROR_GENERIC)
     await show(cb, msg, keyboards.kb(keyboards.menu_row()))
@@ -325,7 +325,7 @@ async def cb_link(cb: CallbackQuery, deps: BotDeps, bot: Bot, m: re.Match[str]) 
     user = await _user_or_alert(cb, deps, _uid(m))
     if user is None:
         return
-    await cb.answer()
+    await ack(cb)
     intro = texts.LINK_OF.format(name=shown_name(user))
     if not await send_link(bot, deps, cb.from_user.id, user, intro, notify_blocked=False):
         await bot.send_message(cb.from_user.id, texts.LINK_UNAVAILABLE)
@@ -427,7 +427,7 @@ async def msg_display_name(message: Message, deps: BotDeps, state: FSMContext) -
 @router.callback_query(F.data == "rq")
 async def cb_requests(cb: CallbackQuery, deps: BotDeps, bot: Bot) -> None:
     pending = await deps.requests.list_pending()
-    await cb.answer()
+    await ack(cb)
     if not pending:
         await show(cb, texts.NO_REQUESTS, keyboards.kb(keyboards.menu_row()))
         return
@@ -461,12 +461,12 @@ async def cb_request_approve(cb: CallbackQuery, deps: BotDeps, m: re.Match[str])
 async def cb_request_term(cb: CallbackQuery, deps: BotDeps, bot: Bot, m: re.Match[str]) -> None:
     rid, code = int(m.group(1)), m.group(2)
     term = None if code == "df" else Term(code)
-    await cb.answer(texts.OPERATION_RUNNING)
+    await ack(cb, texts.OPERATION_RUNNING)
     out = await deps.requests.approve(rid, term, actor_of(cb.from_user.id))
     if out.kind is RequestKind.ISSUED and out.request is not None:
         name = shown_name(out.user) if out.user else out.request.full_name
-        await show(cb, texts.CREATED.format(name=esc(name)), keyboards.kb(keyboards.menu_row()))
-        await deliver_outcome(
+        # deliver FIRST: whatever happens to the admin's screen, the requester gets the link
+        delivered = await deliver_outcome(
             bot,
             deps,
             out.request.tg_id,
@@ -474,6 +474,20 @@ async def cb_request_term(cb: CallbackQuery, deps: BotDeps, bot: Bot, m: re.Matc
             key="msg.approved",
             default=texts.DEFAULT_APPROVED,
         )
+        note = "" if delivered else "\n" + texts.LINK_NOT_DELIVERED
+        retry = (
+            []
+            if delivered or out.user is None
+            else [keyboards.btn(texts.BTN_SEND_LINK, f"s:{out.user.id}")]
+        )
+        try:  # best effort: the requester has the link already
+            await show(
+                cb,
+                texts.CREATED.format(name=esc(name)) + note,
+                keyboards.kb(retry, keyboards.menu_row()),
+            )
+        except Exception as exc:
+            log.warning("approval screen was not updated: %s", type(exc).__name__)
     elif out.kind is RequestKind.ALREADY_DECIDED and out.request is not None:
         await show(
             cb,
@@ -553,7 +567,7 @@ async def cb_apply_status(cb: CallbackQuery, deps: BotDeps) -> None:
 
 @router.callback_query(F.data == "bk")
 async def cb_backup(cb: CallbackQuery, deps: BotDeps) -> None:
-    await cb.answer(texts.BACKUP_RUNNING)
+    await ack(cb, texts.BACKUP_RUNNING)
     try:
         info = await deps.pipeline.create_backup("manual", actor_of(cb.from_user.id))
     except Exception as exc:
@@ -683,9 +697,16 @@ async def _finish_create(
         await bot.send_message(admin, esc(res.error or texts.ERROR_GENERIC))
         return
     user = await deps.users.get(res.user_ids[0])
+    delivery = ""
+    if user is not None and user.tg_id is not None:
+        # the apply has finished: tell the new user their link (or remember to, at /start)
+        (sent,) = await deps.link_delivery.deliver(
+            [user.id], actor_of(admin), default=texts.DEFAULT_LINK_PLAIN
+        )
+        delivery = "\n" + texts.delivery_line(sent.status)
     await bot.send_message(
         admin,
-        texts.CREATED.format(name=esc(data.get("display_name") or data["name"])),
+        texts.CREATED.format(name=esc(data.get("display_name") or data["name"])) + delivery,
         reply_markup=keyboards.kb(keyboards.menu_row()),
     )
     if user is not None:
@@ -801,7 +822,7 @@ async def cb_broadcast_report(cb: CallbackQuery, deps: BotDeps, m: re.Match[str]
         lines.append(f"• {esc(item.name or item.tg_id or '?')}: {item.result_text}")
     if rep.total > 60:
         lines.append(f"…и ещё {rep.total - 60}")
-    await cb.answer()
+    await ack(cb)
     await show(cb, "\n".join(lines), keyboards.kb(keyboards.menu_row()))
 
 

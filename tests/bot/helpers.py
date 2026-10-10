@@ -10,7 +10,7 @@ from typing import Any
 
 from aiogram import Bot, Dispatcher
 from aiogram.client.session.base import BaseSession
-from aiogram.exceptions import TelegramForbiddenError, TelegramRetryAfter
+from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError, TelegramRetryAfter
 from aiogram.methods import SendMessage, TelegramMethod
 from aiogram.types import (
     CallbackQuery,
@@ -36,6 +36,11 @@ class MockSession(BaseSession):
         self.calls: list[tuple[str, Any]] = []
         self.errors: dict[tuple[str, int], list[Exception]] = {}
         self._mid = 1000
+        self.answered: set[str] = set()
+        # Telegram rejects a second answerCallbackQuery for the same query (and any answer
+        # that comes too late); the mock behaves the same so such bugs show up in tests.
+        self.strict_answers = True
+        self.fail_answers = False  # every answerCallbackQuery is rejected (query too old)
 
     async def close(self) -> None:
         return None
@@ -57,6 +62,18 @@ class MockSession(BaseSession):
         queue = self.errors.get((name, int(chat_id) if isinstance(chat_id, int) else 0))
         if queue:
             raise queue.pop(0)
+        if name == "AnswerCallbackQuery" and self.fail_answers:
+            raise TelegramBadRequest(
+                method=method, message="Bad Request: query is too old and response timeout expired"
+            )
+        if name == "AnswerCallbackQuery" and self.strict_answers:
+            qid = str(method.callback_query_id)  # type: ignore[attr-defined]
+            if qid in self.answered:
+                raise TelegramBadRequest(
+                    method=method,
+                    message="Bad Request: query is too old and response timeout expired",
+                )
+            self.answered.add(qid)
         self.calls.append((name, method))
         if name == "GetUpdates":
             await asyncio.sleep(0.01)

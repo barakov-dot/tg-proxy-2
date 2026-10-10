@@ -13,6 +13,7 @@ from tgpanel.domain.expiry import Term, default_expiry
 from tgpanel.domain.models import CarrierMode, clean_display_name
 from tgpanel.services.api import NewUser
 from tgpanel.services.errors import UserServiceError
+from tgpanel.web.deps import safe
 from tgpanel.web.inputs import parse_day, parse_uint
 from tgpanel.web.routes.common import (
     HttpError,
@@ -198,4 +199,22 @@ async def create_submit(request: Request) -> Response:
         user = await web.app.users.get(uid)
         if user is not None:
             created.append(user)
-    return await render(request, "user_created.html", page="create", created=created)
+    # The apply has finished: tell users with a Telegram ID their link (failures never undo the
+    # creation; they are shown per user on the result page).
+    delivery: dict[int, str] = {}
+    if fstr(form, "send_link"):
+        targets = [u.id for u in created if u.tg_id is not None]
+        sent = (
+            await safe(web.broadcast.send_links(targets, auth.actor), "send_links")
+            if targets
+            else []
+        )
+        for uid in targets:
+            delivery[uid] = T["bot_unavailable"]
+        for r in sent or []:
+            delivery[r.user_id] = (
+                T["link_delivered"] if r.ok else clean(r.note, 160) or T["delivery_error"]
+            )
+    return await render(
+        request, "user_created.html", page="create", created=created, delivery=delivery
+    )

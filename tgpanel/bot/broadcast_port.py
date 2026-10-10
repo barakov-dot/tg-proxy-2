@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import sqlite3
 from collections.abc import Sequence
 from typing import Any
 
@@ -16,14 +15,13 @@ from tgpanel.apply.errors import OperationRejected
 from tgpanel.apply.pipeline import ApplyPipeline
 from tgpanel.bot import texts
 from tgpanel.db import repo
-from tgpanel.db.connection import Database, transaction
+from tgpanel.db.connection import Database
 from tgpanel.domain.expiry import Term
 from tgpanel.services.api import UserService
-from tgpanel.services.broadcast import BroadcastService, check_template
+from tgpanel.services.broadcast import BroadcastService, LinkDelivery, check_template
 from tgpanel.services.notifier import (
     FORBIDDEN,
     SENT,
-    LinkButton,
     Messenger,
     Templates,
     message_values,
@@ -51,7 +49,9 @@ class BroadcastPortAdapter:
         db: Database,
         pipeline: ApplyPipeline,
         messenger: Messenger,
+        link_delivery: LinkDelivery,
     ) -> None:
+        self._delivery = link_delivery
         self._service = service
         self._users = users
         self._db = db
@@ -124,58 +124,10 @@ class BroadcastPortAdapter:
         )
 
     async def send_links(self, user_ids: Sequence[int], actor: str) -> list[LinkSendResult]:
-        tz = (await self._db.run(repo.get_setting, "timezone", "UTC")) or "UTC"
-        out: list[LinkSendResult] = []
-        for uid in dict.fromkeys(user_ids):
-            out.append(await self._send_link(uid, tz))
-        sent = sum(1 for r in out if r.ok)
-
-        def audit(conn: sqlite3.Connection) -> None:
-            with transaction(conn):
-                repo.add_audit(
-                    conn,
-                    self._pipeline.now(),
-                    actor,
-                    "user.send_links",
-                    f"users:{len(out)}",
-                    f"sent={sent}",
-                )
-
-        try:
-            await self._pipeline.db_write(audit)
-        except Exception as exc:
-            log.warning("send_links audit failed: %s", type(exc).__name__)
-        return out
-
-    async def _send_link(self, uid: int, tz: str) -> LinkSendResult:
-        user = await self._users.get(uid)
-        extra = await self._db.run(repo.get_user_extra, uid)
-        if user is None or extra is None:
-            return LinkSendResult(uid, False, "Пользователь не найден")
-        if user.tg_id is None:
-            return LinkSendResult(uid, False, _cap(texts.REASON_NO_TG))
-        if user.status.value != "active":
-            return LinkSendResult(uid, False, "Профиль отключён или срок истёк")
-        if not extra.bot_started:
-            return LinkSendResult(uid, False, _cap(texts.REASON_NOT_STARTED))
-        if not extra.can_message:
-            return LinkSendResult(uid, False, _cap(texts.REASON_BLOCKED))
-        try:
-            link, tg_link = self._users.link(user), self._users.tg_link(user)
-        except Exception:
-            return LinkSendResult(uid, False, "Не задано имя хоста прокси")
-        default = texts.DEFAULT_LINK.replace("{intro}", texts.LINK_FROM_ADMIN)
-        text = await self._templates.render(
-            "msg.link", default, message_values(user, link, tg_link, tz, self._pipeline.now())
+        results = await self._delivery.deliver(
+            list(user_ids), actor, default=texts.DEFAULT_LINK_PLAIN
         )
-        result = await self._messenger.deliver(
-            user.tg_id, text, LinkButton(texts.BTN_CONNECT, link)
-        )
-        if result == SENT:
-            return LinkSendResult(uid, True)
-        if result == FORBIDDEN:
-            return LinkSendResult(uid, False, _cap(texts.REASON_BLOCKED))
-        return LinkSendResult(uid, False, "Не удалось отправить сообщение")
+        return [LinkSendResult(r.user_id, r.ok, _cap(r.note)) for r in results]
 
 
 def _cap(text: str) -> str:
@@ -198,31 +150,30 @@ class RequestsPortAdapter:
     """``RequestsPort`` over the SAME ``RequestService`` instance the bot uses."""
 
     def __init__(
-        self, requests: RequestService, users: UserService, db: Database, messenger: Messenger
+        self,
+        requests: RequestService,
+        users: UserService,
+        db: Database,
+        messenger: Messenger,
+        link_delivery: LinkDelivery,
     ) -> None:
         self._requests = requests
         self._users = users
         self._db = db
         self._messenger = messenger
+        self._delivery = link_delivery
         self._templates = Templates(db)
 
     async def approve(self, request_id: int, term: Term | None, actor: str) -> DecisionResult:
         out = await self._requests.approve(request_id, term, actor)
         if out.kind is RequestKind.ISSUED and out.request is not None and out.user is not None:
-            link = out.link or ""
-            try:
-                tg_link = self._users.tg_link(out.user)
-            except Exception:
-                tg_link = ""
-            tz = (await self._db.run(repo.get_setting, "timezone", "UTC")) or "UTC"
-            text = await self._templates.render(
-                "msg.approved",
-                texts.DEFAULT_APPROVED,
-                message_values(out.user, link, tg_link, tz, out.request.created_at),
+            (sent,) = await self._delivery.deliver(
+                [out.user.id], actor, key="msg.approved", default=texts.DEFAULT_APPROVED
             )
-            button = LinkButton(texts.BTN_CONNECT, link) if link else None
-            await self._messenger.deliver(out.request.tg_id, text, button)
-            return DecisionResult(True)
+            if sent.ok:
+                return DecisionResult(True)
+            # the profile exists and the request is closed: report the delivery problem
+            return DecisionResult(True, error=_cap(sent.note) or "Ссылка не доставлена")
         return DecisionResult(False, _error_text(out.kind, out.error))
 
     async def reject(self, request_id: int, actor: str) -> DecisionResult:

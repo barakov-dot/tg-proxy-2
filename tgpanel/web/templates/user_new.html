@@ -27,6 +27,7 @@
     <label class="wide-field">{{ t.col_comment }} <textarea name="comment" rows="2" maxlength="2000">{{ values.get('comment', '') }}</textarea></label>
     <label class="wide-field">{{ t.create_list_label }} <textarea name="list" rows="6">{{ values.get('list', '') }}</textarea></label>
   </div>
+  <label class="chk"><input type="checkbox" name="send_link" value="1"{% if not values or values.get('send_link') %} checked{% endif %}> {{ t.create_send_link }}</label>
   <p class="actions"><button type="submit" class="primary">{{ icon('user-plus') }} {{ t.create_submit }}</button> <span class="hint">{{ t.create_wait_hint }}</span></p>
 </form>
 {% endblock %}

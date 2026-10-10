@@ -9,6 +9,8 @@ a crash may be repeated once). Message texts and links are never stored or logge
 from __future__ import annotations
 
 import asyncio
+import json
+import logging
 import sqlite3
 import time
 from collections.abc import Awaitable, Callable, Sequence
@@ -31,10 +33,12 @@ from tgpanel.services.notifier import (
     MessageSender,
     Messenger,
     RateLimiter,
+    Templates,
     message_values,
     render_message,
 )
 
+log = logging.getLogger("tgpanel.broadcast")
 MAX_TEMPLATE = 3000
 RATE_PER_SECOND = 20.0
 BUTTON_TEXT = "Подключиться"
@@ -357,3 +361,193 @@ class BroadcastService:
             )
 
         return await self._db.run(load)
+
+
+# ------------------------------------------------------------------------ link delivery
+
+KEY_PENDING_LINKS = "link.pending"  # JSON list of user ids waiting for their first /start
+NOT_STARTED_NOTE = "бот не запущен у пользователя — ссылка будет отправлена при первом /start"
+BLOCKED_NOTE = "пользователь заблокировал бота — ссылка будет отправлена после его /start"
+ERROR_NOTE = "ошибка доставки"
+_NO_RETRY = ("TelegramBadRequest", "TelegramUnauthorizedError", "TelegramNotFound")
+LINK_STATUSES = ("sent", "pending", "blocked", "error", "skipped")
+
+
+@dataclass(frozen=True, slots=True)
+class LinkResult:
+    user_id: int
+    status: str  # one of LINK_STATUSES
+    note: str = ""  # Russian, never contains the link
+
+    @property
+    def ok(self) -> bool:
+        return self.status == "sent"
+
+
+class LinkDelivery:
+    """Sends a user their link through the shared Messenger, with retries and a pending flag.
+
+    A user who has not started the bot (or blocked it) gets a "pending" flag; the link is
+    delivered at their next /start. Delivery never raises: the caller learns the outcome from
+    the result, and a failure is logged without the message or link.
+    """
+
+    def __init__(
+        self,
+        pipeline: ApplyPipeline,
+        db: Database,
+        users: UserService,
+        messenger: Messenger,
+        *,
+        sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+        retries: int = 3,
+    ) -> None:
+        self._pipeline = pipeline
+        self._db = db
+        self._users = users
+        self._messenger = messenger
+        self._sleep = sleep
+        self._retries = retries
+        self._templates = Templates(db)
+
+    # ------------------------------------------------------------------ pending flags
+
+    async def pending_ids(self) -> list[int]:
+        raw = await self._db.run(repo.get_setting, KEY_PENDING_LINKS, "[]")
+        return sorted(_parse_id_list(raw or "[]"))
+
+    async def _edit_pending(self, user_id: int, add: bool) -> bool:
+        """Set or clear one flag atomically; returns whether it was set before."""
+
+        def work(conn: sqlite3.Connection) -> bool:
+            with transaction(conn):
+                ids = _parse_id_list(repo.get_setting(conn, KEY_PENDING_LINKS, "[]") or "[]")
+                was = user_id in ids
+                if was == add:
+                    return was
+                if add:
+                    ids.add(user_id)
+                else:
+                    ids.discard(user_id)
+                repo.set_setting(conn, KEY_PENDING_LINKS, json.dumps(sorted(ids)))
+                return was
+
+        return await self._pipeline.db_write(work)
+
+    async def mark_pending(self, user_id: int) -> None:
+        """Remember that this user still has to receive the link (delivered at /start)."""
+        await self._edit_pending(user_id, True)
+
+    async def take_pending(self, user_id: int) -> bool:
+        """True (and the flag is cleared) if a link was waiting for this user's /start."""
+        return await self._edit_pending(user_id, False)
+
+    # ------------------------------------------------------------------ delivery
+
+    async def deliver(
+        self,
+        user_ids: Sequence[int],
+        actor: str,
+        *,
+        key: str = "msg.link",
+        default: str,
+    ) -> list[LinkResult]:
+        tz = (await self._db.run(repo.get_setting, "timezone", "UTC")) or "UTC"
+        out = [await self._one(uid, key, default, tz) for uid in dict.fromkeys(user_ids)]
+        sent = sum(1 for r in out if r.ok)
+
+        def audit(conn: sqlite3.Connection) -> None:
+            with transaction(conn):
+                repo.add_audit(
+                    conn,
+                    self._pipeline.now(),
+                    actor,
+                    "user.send_links",
+                    f"users:{len(out)}",
+                    f"sent={sent}",
+                )
+
+        try:
+            await self._pipeline.db_write(audit)
+        except Exception as exc:
+            log.warning("link delivery audit failed: %s", type(exc).__name__)
+        return out
+
+    async def _one(self, uid: int, key: str, default: str, tz: str) -> LinkResult:
+        user = await self._users.get(uid)
+        extra = await self._db.run(repo.get_user_extra, uid)
+        if user is None or extra is None:
+            return LinkResult(uid, "skipped", "Пользователь не найден")
+        if user.tg_id is None:
+            return LinkResult(uid, "skipped", "Не указан Telegram ID")
+        if user.status is not UserStatus.ACTIVE:
+            return LinkResult(uid, "skipped", "Профиль отключён или срок истёк")
+        adopt = False
+        if not extra.bot_started or not extra.can_message:
+            # A person who asked the bot for access has a chat with it even though they had no
+            # profile (so no bot_started flag): try to deliver, and bind on success.
+            known = not extra.bot_started and await self._had_request(user.tg_id)
+            if not known:
+                await self._edit_pending(uid, True)
+                note = BLOCKED_NOTE if extra.bot_started else NOT_STARTED_NOTE
+                return LinkResult(uid, "blocked" if extra.bot_started else "pending", note)
+            adopt = True
+        try:
+            link, tg_link = self._users.link(user), self._users.tg_link(user)
+        except Exception:
+            return LinkResult(uid, "error", "Не задано имя хоста прокси")
+        text = await self._templates.render(
+            key, default, message_values(user, link, tg_link, tz, self._pipeline.now())
+        )
+        text = text.replace("{intro}", "")
+        result = await self._send(user.tg_id, text, LinkButton(BUTTON_TEXT, link))
+        if result == SENT:
+            await self._edit_pending(uid, False)
+            if adopt:
+                await self._bind(uid)
+            return LinkResult(uid, "sent")
+        if result == FORBIDDEN:
+            await self._edit_pending(uid, True)
+            if adopt:
+                return LinkResult(uid, "pending", NOT_STARTED_NOTE)
+            return LinkResult(uid, "blocked", BLOCKED_NOTE)
+        log.warning("link delivery failed for user %d: %s", uid, result)
+        return LinkResult(uid, "error", ERROR_NOTE)
+
+    async def _had_request(self, tg_id: int) -> bool:
+        def check(conn: sqlite3.Connection) -> bool:
+            row = conn.execute(
+                "SELECT 1 FROM access_requests WHERE tg_id = ? LIMIT 1", (tg_id,)
+            ).fetchone()
+            return row is not None
+
+        return bool(await self._db.run(check))
+
+    async def _bind(self, user_id: int) -> None:
+        def work(conn: sqlite3.Connection) -> None:
+            with transaction(conn):
+                repo.update_user(conn, user_id, bot_started=True, can_message=True)
+
+        try:
+            await self._pipeline.db_write(work)
+        except Exception as exc:
+            log.warning("bot_started was not recorded: %s", type(exc).__name__)
+
+    async def _send(self, tg_id: int, text: str, button: LinkButton) -> str:
+        result = ""
+        for attempt in range(self._retries + 1):
+            result = await self._messenger.deliver(tg_id, text, button)
+            if result == SENT or result == FORBIDDEN:
+                return result
+            if result.removeprefix("error:") in _NO_RETRY or attempt == self._retries:
+                break
+            await self._sleep(2.0**attempt)  # transient (network, server): back off and retry
+        return result
+
+
+def _parse_id_list(raw: str) -> set[int]:
+    try:
+        data = json.loads(raw)
+        return {int(i) for i in data if isinstance(i, int) and not isinstance(i, bool)}
+    except (ValueError, TypeError):
+        return set()

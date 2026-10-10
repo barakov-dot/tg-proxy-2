@@ -161,6 +161,10 @@ T: dict[str, str] = {
     "delete_name_mismatch": "Имя профиля введено неверно, удаление отменено",
     "links_sent": "Ссылки отправлены: {sent}, не удалось: {failed}.",
     "link_sent": "Ссылка отправлена",
+    "link_delivered": "отправлена",
+    "delivery_error": "ошибка доставки",
+    "create_send_link": "Отправить ссылку пользователю в Telegram (если указан Telegram ID)",
+    "col_delivery": "Доставка в Telegram",
     # card
     "access": "Доступ",
     "reveal": "Показать ссылку",

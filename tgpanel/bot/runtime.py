@@ -24,7 +24,7 @@ from tgpanel.bot.deps import BotDeps, TrafficReader
 from tgpanel.bot.sender import AiogramSender, BotNotifier
 from tgpanel.db import repo
 from tgpanel.scheduler.scheduler import Scheduler
-from tgpanel.services.broadcast import BroadcastService
+from tgpanel.services.broadcast import BroadcastService, LinkDelivery
 from tgpanel.services.container import AppContext
 from tgpanel.services.notifier import (
     LateBoundNotifier,
@@ -48,6 +48,7 @@ class Runtime:
     messenger: Messenger
     requests: RequestService  # ONE instance shared by the bot and the web panel
     broadcast: BroadcastService
+    link_delivery: LinkDelivery
     deps: BotDeps
     scheduler: Scheduler
     broadcast_port: BroadcastPortAdapter  # for WebContext.broadcast
@@ -113,6 +114,7 @@ def build_runtime(
     )
     requests = RequestService(ctx.pipeline, ctx.db, ctx.users)
     broadcast = BroadcastService(ctx.pipeline, ctx.db, ctx.users, sender, messenger=messenger)
+    link_delivery = LinkDelivery(ctx.pipeline, ctx.db, ctx.users, messenger, sleep=sleep)
     deps = BotDeps(
         users=ctx.users,
         settings=ctx.settings,
@@ -123,6 +125,8 @@ def build_runtime(
         traffic=traffic,
         sender=sender,
         messenger=messenger,
+        link_delivery=link_delivery,
+        sleep=sleep,
         monotonic=monotonic,
         throttle_interval=throttle_interval,
     )
@@ -145,10 +149,13 @@ def build_runtime(
         messenger=messenger,
         requests=requests,
         broadcast=broadcast,
+        link_delivery=link_delivery,
         deps=deps,
         scheduler=scheduler,
-        broadcast_port=BroadcastPortAdapter(broadcast, ctx.users, ctx.db, ctx.pipeline, messenger),
-        requests_port=RequestsPortAdapter(requests, ctx.users, ctx.db, messenger),
+        broadcast_port=BroadcastPortAdapter(
+            broadcast, ctx.users, ctx.db, ctx.pipeline, messenger, link_delivery
+        ),
+        requests_port=RequestsPortAdapter(requests, ctx.users, ctx.db, messenger, link_delivery),
         token=token,
         session=session,
         ready_timeout_s=ready_timeout_s,

@@ -16,7 +16,12 @@ from tgpanel.web import deps as web_deps
 
 def port(env: Env) -> BroadcastPortAdapter:
     return BroadcastPortAdapter(
-        env.deps.broadcast, env.svc.users, env.svc.ctx.db, env.svc.ctx.pipeline, env.deps.messenger
+        env.deps.broadcast,
+        env.svc.users,
+        env.svc.ctx.db,
+        env.svc.ctx.pipeline,
+        env.deps.messenger,
+        env.deps.link_delivery,
     )
 
 
@@ -88,7 +93,7 @@ async def test_send_links_results(env: Env) -> None:
     assert all(isinstance(r, web_deps.LinkSendResult) for r in out)
     assert [r.ok for r in out] == [True, False, False, False, False]
     assert "не запущен" in out[1].note and "Telegram ID" in out[2].note
-    assert "заблокирован" in out[3].note and "не найден" in out[4].note
+    assert "заблокировал" in out[3].note and "не найден" in out[4].note
     sent = env.sender.to(USER)[0]
     assert sent.button and sent.button.url == env.svc.users.link(ok)
     extra = env.svc.ctx.db.call(repo.get_user_extra, blocked.id)
@@ -102,7 +107,9 @@ async def test_send_links_results(env: Env) -> None:
 
 async def test_requests_port_approve_and_reject_notify_requester(env: Env) -> None:
     env.set_setting("issuance_mode", "approval")
-    rp = RequestsPortAdapter(env.deps.requests, env.svc.users, env.svc.ctx.db, env.deps.messenger)
+    rp = RequestsPortAdapter(
+        env.deps.requests, env.svc.users, env.svc.ctx.db, env.deps.messenger, env.deps.link_delivery
+    )
     await env.tg.press(USER, "req")
     await env.tg.press(USER + 1, "req")
     res = await rp.approve(1, Term.MONTH, "web:admin")

@@ -395,7 +395,7 @@ class RequestService:
                 else:
                     existing = await self._db.run(repo.get_user_by_tg_id, req.tg_id)
                     if existing is not None:
-                        await self._finalize(req, existing.id, "system", "approved")
+                        await self._finalize_safe(req, existing.id, "system")
                         outcomes[index] = RequestOutcome(
                             RequestKind.ISSUED,
                             request=req,
@@ -433,7 +433,7 @@ class RequestService:
                         )
                 else:
                     for (index, req, _), uid in zip(todo, result.user_ids, strict=True):
-                        await self._finalize(req, uid, "system", "approved")
+                        await self._finalize_safe(req, uid, "system")
                         outcomes[index] = RequestOutcome(
                             RequestKind.ISSUED,
                             request=req,
@@ -461,7 +461,7 @@ class RequestService:
             return RequestOutcome(RequestKind.ALREADY_DECIDED, request=req)
         existing = await self._db.run(repo.get_user_by_tg_id, req.tg_id)
         if existing is not None:
-            await self._finalize(req, existing.id, actor, "approved")
+            await self._finalize_safe(req, existing.id, actor)
             return RequestOutcome(
                 RequestKind.ISSUED, request=req, user=existing, link=self._safe_link(existing)
             )
@@ -486,7 +486,7 @@ class RequestService:
                 RequestKind.FAILED, request=req, error=result.error or "Не удалось создать доступ"
             )
         uid = result.user_ids[0]
-        await self._finalize(req, uid, actor, "approved")
+        await self._finalize_safe(req, uid, actor)
         user = await self._users.get(uid)
         return RequestOutcome(
             RequestKind.ISSUED, request=req, user=user, link=result.links.get(uid)
@@ -508,6 +508,21 @@ class RequestService:
             return base
         suffix = f" ({req.tg_id})"
         return base[: MAX_NAME - len(suffix)] + suffix
+
+    async def _finalize_safe(self, req: repo.AccessRequest, user_id: int, actor: str) -> None:
+        """Record the approval; a failure must never lose the link of a profile that exists.
+
+        The request then stays pending and the next approve/submit finds the user by Telegram ID
+        and closes it.
+        """
+        try:
+            await self._finalize(req, user_id, actor, "approved")
+        except Exception as exc:
+            log.warning(
+                "request %d: profile exists but approval was not recorded: %s",
+                req.id,
+                type(exc).__name__,
+            )
 
     async def _finalize(
         self, req: repo.AccessRequest, user_id: int, actor: str, status: str

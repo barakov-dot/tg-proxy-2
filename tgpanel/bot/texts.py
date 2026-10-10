@@ -104,7 +104,7 @@ def status_active(expires: str | None, *, imported: bool = False) -> str:
 
 # Default message templates (settings msg.* override them). Plain text, placeholders:
 # {name} {link} {tg_link} {expires} {days}; the whole text is HTML-escaped when sent.
-DEFAULT_LINK = f"{icons.LINK} " + "{intro}\n\n{link}\n\nЕсли кнопка не открывается: {tg_link}"
+DEFAULT_LINK = "{intro}\n\n{link}\n\nЕсли кнопка не открывается: {tg_link}"
 DEFAULT_APPROVED = (
     f"{icons.OK} "
     + "Ваша заявка одобрена. Ваша ссылка:\n\n{link}\n\nЕсли кнопка не открывается: {tg_link}"
@@ -122,6 +122,25 @@ DEFAULT_EXPIRED = (
 DEFAULT_BROADCAST = (
     f"{icons.HELLO} " + "Здравствуйте, {name}!\nВаша ссылка для подключения:\n{tg_link}"
 )
+
+LINK_NOT_DELIVERED = f"{icons.WARN} " + (
+    "Ссылка не доставлена пользователю. Отправьте её из карточки пользователя."
+)
+DEFAULT_LINK_PLAIN = DEFAULT_LINK.replace("{intro}", LINK_FROM_ADMIN)
+DELIVERY_LINES = {
+    "sent": f"{icons.OK} Ссылка отправлена пользователю.",
+    "pending": f"{icons.TERM} Бот не запущен у пользователя — "
+    "ссылка будет отправлена при первом /start.",
+    "blocked": f"{icons.WARN} Пользователь заблокировал бота — "
+    "ссылка будет отправлена после его /start.",
+    "error": f"{icons.WARN} Ошибка доставки: ссылка не отправлена, отправьте её из карточки.",
+    "skipped": "",
+}
+
+
+def delivery_line(status: str) -> str:
+    return DELIVERY_LINES.get(status, "")
+
 
 TOO_FAST = f"{icons.WARN} " + "Слишком часто, подождите секунду."
 BTN_BLACKLIST = f"{icons.BLACKLIST} " + "Чёрный список"

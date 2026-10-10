@@ -89,6 +89,10 @@ async def request_approve(request: Request, request_id: PathId) -> Response:
         return redirect(request, "/requests", ("err", T["bot_unavailable"]))
     if not res.ok:
         return redirect(request, "/requests", ("err", clean(res.error) or T["operation_failed"]))
+    if res.error:  # approved, but the user could not be told: show why
+        return redirect(
+            request, "/requests", ("err", f"{T['request_approved']}. {clean(res.error, 160)}")
+        )
     return redirect(request, "/requests", ("ok", T["request_approved"]))
 
 

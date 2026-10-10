@@ -10,7 +10,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, Message
 
 from tgpanel.bot import keyboards, texts
-from tgpanel.bot.delivery import send_link
+from tgpanel.bot.delivery import ack, send_link
 from tgpanel.bot.deps import BotDeps
 from tgpanel.bot.format import esc, fmt_dt
 from tgpanel.db import repo
@@ -60,7 +60,10 @@ async def cmd_start(message: Message, deps: BotDeps, state: FSMContext) -> None:
             await _status_text(deps, info.user) + suffix,
             reply_markup=keyboards.user_start(can_request=False, has_link=active),
         )
-        if info.first_start and active and message.bot is not None:
+        waiting = info.user.id in await deps.link_delivery.pending_ids()
+        if waiting:
+            await deps.link_delivery.take_pending(info.user.id)
+        if (info.first_start or waiting) and active and message.bot is not None:
             await send_link(message.bot, deps, uid, info.user, texts.LINK_FROM_ADMIN)
         return
     pending = await deps.db.run(repo.pending_request_for, uid)
@@ -82,15 +85,15 @@ async def cmd_start(message: Message, deps: BotDeps, state: FSMContext) -> None:
 async def cb_my_link(cb: CallbackQuery, deps: BotDeps, bot: Bot) -> None:
     user = await deps.db.run(repo.get_user_by_tg_id, cb.from_user.id)
     if user is None:
-        await cb.answer(texts.NO_ACCESS, show_alert=True)
+        await ack(cb, texts.NO_ACCESS, alert=True)
         return
     user = await deps.requests.adopt_telegram_display_name(
         user, cb.from_user.username, cb.from_user.full_name
     )
     if user.status is not UserStatus.ACTIVE:
-        await cb.answer(await _status_text(deps, user), show_alert=True)
+        await ack(cb, await _status_text(deps, user), alert=True)
         return
-    await cb.answer()
+    await ack(cb)
     if not await send_link(bot, deps, cb.from_user.id, user, texts.ACCESS_READY):
         await bot.send_message(cb.from_user.id, texts.LINK_UNAVAILABLE)
 
@@ -104,12 +107,20 @@ async def deliver_outcome(
     *,
     key: str = "msg.link",
     default: str = texts.DEFAULT_LINK,
-) -> None:
-    """Send the freshly issued link to the requester (only if the apply succeeded)."""
+) -> bool:
+    """Send the freshly issued link to the requester (only if the apply succeeded).
+
+    Never raises: returns whether the link reached the user.
+    """
     if out.user is None or out.link is None:
-        await bot.send_message(tg_id, texts.LINK_UNAVAILABLE)
-        return
-    await send_link(bot, deps, tg_id, out.user, intro, key=key, default=default)
+        return False
+    if await send_link(bot, deps, tg_id, out.user, intro, key=key, default=default):
+        return True
+    try:  # first /start or "Моя ссылка" will bring it
+        await deps.link_delivery.mark_pending(out.user.id)
+    except Exception as exc:
+        log.warning("pending link was not recorded: %s", type(exc).__name__)
+    return False
 
 
 @router.callback_query(F.data == "req")
@@ -120,7 +131,7 @@ async def cb_request(cb: CallbackQuery, deps: BotDeps, bot: Bot) -> None:
     async def preparing() -> None:
         await bot.send_message(chat, texts.PREPARING)
 
-    await cb.answer()
+    await ack(cb)
     out = await deps.requests.submit(
         tg_id, cb.from_user.username, cb.from_user.full_name, on_preparing=preparing
     )
@@ -141,7 +152,13 @@ async def cb_request(cb: CallbackQuery, deps: BotDeps, bot: Bot) -> None:
             reply_markup=keyboards.user_start(can_request=False, has_link=True),
         )
     elif kind is RequestKind.ISSUED:
-        await deliver_outcome(bot, deps, chat, out, texts.ACCESS_READY)
+        if not await deliver_outcome(bot, deps, chat, out, texts.ACCESS_READY):
+            # the profile exists; the user can fetch the link with the button at any time
+            await bot.send_message(
+                chat,
+                texts.LINK_UNAVAILABLE,
+                reply_markup=keyboards.user_start(can_request=False, has_link=True),
+            )
     else:  # FAILED and anything unexpected: no link
         await bot.send_message(chat, texts.PREPARE_FAILED)
 
@@ -149,4 +166,4 @@ async def cb_request(cb: CallbackQuery, deps: BotDeps, bot: Bot) -> None:
 @router.callback_query()
 async def cb_fallback(cb: CallbackQuery) -> None:
     """Unknown or not permitted callbacks (e.g. admin callbacks from a non-admin)."""
-    await cb.answer(texts.UNKNOWN_ACTION, show_alert=True)
+    await ack(cb, texts.UNKNOWN_ACTION, alert=True)
