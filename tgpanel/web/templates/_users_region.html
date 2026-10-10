@@ -34,11 +34,11 @@
 {% for c in cols %}{{ th(c) }}{% endfor %}
 <th><span class="sr-only">{{ t.actions }}</span></th></tr></thead>
 <tbody>
-{% for rv in rows %}{% set u = rv.user %}
+{% for rv in rows %}{% set u = rv.user %}{% set rownum = (q.page - 1) * q.per_page + loop.index %}
 <tr>
   <td><input type="checkbox" name="ids" value="{{ u.id }}" form="bulk-form" aria-label="{{ t.select_row.format(name=shown_name(u)) }}"></td>
   {% for c in cols %}<td{% if c in ('id', 'display_name', 'name', 'traffic', 'created_at', 'expires_at', 'first_seen_at', 'last_seen_at') %} class="nowrap"{% endif %}>
-  {%- if c == 'id' %}{{ u.id }}
+  {%- if c == 'id' %}{{ rownum }}
   {%- elif c == 'display_name' %}<a href="{{ url('/users/' ~ u.id) }}"{% if not u.display_name %} class="muted"{% endif %}>{{ shown_name(u) }}</a>
   {%- elif c == 'name' %}<a href="{{ url('/users/' ~ u.id) }}">{{ u.name }}</a>
   {%- elif c == 'comment' %}{% with error=none, saved=false %}{% include '_comment_cell.html' %}{% endwith %}

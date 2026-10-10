@@ -110,7 +110,7 @@ async def test_table_shows_display_name_first_then_profile_with_fallback(aw: Web
     await seed(aw)
     html = (await aw.client.get(aw.u("/users"))).text
     head = re.findall(r"<th><a [^>]*>([^<]+)</a>", html)
-    assert head[:3] == ["ID", "Имя", "Профиль"]
+    assert head[:3] == ["№", "Имя", "Профиль"]
     assert "Дмитрий Жабкин" in html
     assert "Инга Базанова 🐉" in html and "山田 太郎" in html
     # user 4 has no display name: the technical name is shown in muted style
@@ -160,7 +160,7 @@ async def test_display_name_column_can_be_hidden_and_name_stays(aw: Web) -> None
         await aw.client.get(aw.u("/users"), params={"cols_set": "1", "col": ["id", "name"]})
     ).text
     head = re.findall(r"<th><a [^>]*>([^<]+)</a>", html)
-    assert head == ["ID", "Профиль"]
+    assert head == ["№", "Профиль"]
 
 
 async def test_display_name_is_escaped_everywhere(aw: Web) -> None:
@@ -225,3 +225,16 @@ async def test_import_csv_display_names_never_replace_the_profile_name(owner_web
     # the preview of what remains never reflects the label unescaped either
     again = await w.post("/import/preview", {"regex": r"^user_(\d{5,15})$", "csv_text": csv})
     assert "<script>alert(1)</script>" not in again.text
+
+
+async def test_first_column_is_a_sequential_row_number_not_the_database_id(aw) -> None:  # type: ignore[no-untyped-def]
+    import re
+
+    for n in range(4):
+        r = await aw.post("/users/new", {"mode": "single", "name": f"u{n}", "term": "default"})
+        assert r.status_code == 200
+    await aw.post("/users/bulk", {"action": "delete", "ids": ["2"], "confirm": "удалить"})
+    r = await aw.client.get(aw.u("/users"))
+    body = r.text
+    numbers = re.findall(r'<td class="nowrap">\s*(\d+)\s*</td>', body)
+    assert numbers[:3] == ["1", "2", "3"], numbers  # no gap although database id 2 was deleted

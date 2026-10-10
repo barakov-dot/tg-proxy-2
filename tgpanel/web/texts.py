@@ -87,7 +87,7 @@ T: dict[str, str] = {
     "dash_cert": "Сертификат панели, осталось",
     "dash_cert_warn": "автопродление не работает?",
     # table columns
-    "col_id": "ID",
+    "col_id": "№",
     "col_display_name": "Имя",
     "col_name": "Профиль",
     "col_comment": "Комментарий",
